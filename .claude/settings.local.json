@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(python:*)",
+      "Bash(dir /b:*)",
+      "Bash(API_KEYS_CHANGE.md )",
+      "Bash(API_KEYS_SETUP.md )",
+      "Bash(ARBITRAGE_MONITORING_ONLY.md )",
+      "Bash(ARBITRAGE_TIMING_GUIDE.md )",
+      "Bash(CHANGELOG_MONITORING.md )",
+      "Bash(DRY_RUN_SETUP.md )",
+      "Bash(FINAL_SETUP.md )",
+      "Bash(INSTALLATION_COMPLETE.md )",
+      "Bash(MOCK_MODE_GUIDE.md )",
+      "Bash(MULTI_PAIR_GUIDE.md )",
+      "Bash(README_ARBITRAGE.md )",
+      "Bash(README_DEBUG.md )",
+      "Bash(RUN_TESTS.md )",
+      "Bash(check_config.py )",
+      "Bash(demo_tracking.py )",
+      "Bash(quick_test.py )",
+      "Bash(test_arbitrage_debug.py )",
+      "Bash(test_both_exchanges.py )",
+      "Bash(test_bybit_public_api.py )",
+      "Bash(test_multi_pair.py )",
+      "Bash(test_okx_api.py )",
+      "Bash(nul)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

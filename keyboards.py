@@ -53,6 +53,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📊 Курсы валют сейчас")],
             [KeyboardButton(text="📉 Пороговые значения")],
             [KeyboardButton(text="📈 Статистика")],
+            [KeyboardButton(text="🤖 Арбитраж OKX/Bybit")],
             [KeyboardButton(text="⚙ Настройки")]
         ],
         resize_keyboard=True

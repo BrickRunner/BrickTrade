@@ -11,3 +11,10 @@ class InlineThresholdForm(StatesGroup):
     choosing_currency = State()
     entering_value = State()
     entering_comment_manual = State()
+
+
+class ArbSettingsForm(StatesGroup):
+    """Конечный автомат для настроек арбитража"""
+    entering_spread = State()      # Минимальный спред (%)
+    entering_lifetime = State()    # Время стабильности (сек)
+    entering_interval = State()    # Интервал обновления (сек)

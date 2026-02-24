@@ -8,11 +8,11 @@ from aiogram.filters import Command
 from config import BOT_TOKEN
 from database import init_db
 from scheduler import scheduler_loop
-from states import DateForm, InlineThresholdForm
+from states import DateForm, InlineThresholdForm, ArbSettingsForm
 from api import close_session
 
 # Импорт обработчиков
-from handlers import basic, settings, thresholds, stats_handlers
+from handlers import basic, settings, thresholds, stats_handlers, arbitrage_handlers
 
 # Настройка логирования
 logging.basicConfig(
@@ -84,6 +84,32 @@ def register_handlers():
     dp.callback_query.register(stats_handlers.cb_stats, lambda c: c.data == "stats")
     dp.callback_query.register(stats_handlers.cb_stats_period, lambda c: c.data.startswith("stats_curr:"))
     dp.callback_query.register(stats_handlers.cb_show_graph, lambda c: c.data.startswith("stats_period:"))
+
+    # Арбитраж (только мониторинг)
+    dp.message.register(arbitrage_handlers.handle_arbitrage_menu, lambda m: m.text == "🤖 Арбитраж OKX/Bybit")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_multi_start, lambda c: c.data == "arb_multi_start")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_multi_stop, lambda c: c.data == "arb_multi_stop")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_scan_now, lambda c: c.data == "arb_scan_now")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_settings, lambda c: c.data == "arb_settings")
+    dp.callback_query.register(arbitrage_handlers.cb_back_main, lambda c: c.data == "back_main")
+
+    # Стратегии (5 стратегий)
+    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_menu, lambda c: c.data == "arb_strategies_menu")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_toggle_strategy, lambda c: c.data.startswith("arb_toggle_strategy:"))
+    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_start, lambda c: c.data == "arb_strategies_start")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_stop, lambda c: c.data == "arb_strategies_stop")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_scan, lambda c: c.data == "arb_strategies_scan")
+
+    # Настройки арбитража (редактирование параметров)
+    dp.callback_query.register(arbitrage_handlers.cb_arb_edit, lambda c: c.data.startswith("arb_edit:"))
+    dp.callback_query.register(arbitrage_handlers.cb_arb_cancel_edit, lambda c: c.data == "arb_cancel_edit")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_reset_settings, lambda c: c.data == "arb_reset_settings")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_back_menu, lambda c: c.data == "arb_back_menu")
+
+    # FSM для ввода значений настроек арбитража
+    dp.message.register(arbitrage_handlers.fsm_arb_entering_spread, ArbSettingsForm.entering_spread)
+    dp.message.register(arbitrage_handlers.fsm_arb_entering_lifetime, ArbSettingsForm.entering_lifetime)
+    dp.message.register(arbitrage_handlers.fsm_arb_entering_interval, ArbSettingsForm.entering_interval)
 
 
 async def shutdown(signal_name: str = None):
