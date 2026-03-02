@@ -1,22 +1,19 @@
 """
-Основные модули арбитражного бота
+Core modules for the arbitrage trading system.
 """
-from .state import BotState, OrderbookData, Position, ArbitrageOpportunity
+from .state import BotState, ActivePosition
 from .risk import RiskManager
-from .execution import ExecutionManager
-from .arbitrage import ArbitrageEngine
 from .notifications import NotificationManager
-from .multi_pair_arbitrage import MultiPairArbitrageEngine, PairSpread
+from .market_data import MarketDataEngine, TickerData, FundingData
+from .metrics import MetricsTracker
 
 __all__ = [
     'BotState',
-    'OrderbookData',
-    'Position',
-    'ArbitrageOpportunity',
+    'ActivePosition',
     'RiskManager',
-    'ExecutionManager',
-    'ArbitrageEngine',
     'NotificationManager',
-    'MultiPairArbitrageEngine',
-    'PairSpread'
+    'MarketDataEngine',
+    'TickerData',
+    'FundingData',
+    'MetricsTracker',
 ]

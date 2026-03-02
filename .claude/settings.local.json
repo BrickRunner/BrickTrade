@@ -25,7 +25,18 @@
       "Bash(test_bybit_public_api.py )",
       "Bash(test_multi_pair.py )",
       "Bash(test_okx_api.py )",
-      "Bash(nul)"
+      "Bash(nul)",
+      "Bash(pip install:*)",
+      "Bash(pkill:*)",
+      "Bash(curl -s \"https://api.telegram.org/bot8399322128:AAHEEO9D8y84piAT-FIoPNTpKIWVIrIuwJo/deleteWebhook\")",
+      "Bash(killall -9:*)",
+      "Bash(wc:*)",
+      "Bash(python3:*)",
+      "Bash(pip3 install:*)",
+      "Bash(ls:*)",
+      "Bash(/Users/macbookairdmitri/exchangerate_bot-2/venv/bin/python:*)",
+      "Bash(venv/bin/python:*)",
+      "Bash(source:*)"
     ],
     "deny": [],
     "ask": []

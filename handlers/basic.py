@@ -13,7 +13,16 @@ from states import DateForm
 async def cmd_start(m: types.Message):
     """Обработка команды /start"""
     await get_settings(m.from_user.id)
-    await m.answer("Привет! Я бот курсов по данным ЦБ РФ. Выберите действие:", reply_markup=main_menu())
+    await m.answer(
+        "👋 <b>Привет!</b>\n\n"
+        "Я бот с двумя режимами:\n\n"
+        "📊 <b>Курсы валют</b> — данные ЦБ РФ, уведомления, пороги, статистика\n"
+        "⚡ <b>Арбитраж OKX/HTX/Bybit</b> — 3-way арбитраж фьючерсами, "
+        "adaptive thresholds, funding rate учёт, per-pair статистика\n\n"
+        "Выберите действие:",
+        reply_markup=main_menu(),
+        parse_mode="HTML"
+    )
 
 
 async def handle_send_now(m: types.Message):

@@ -93,13 +93,11 @@ class HTXWebSocket:
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("HTX WebSocket connection closed")
                 if self.running:
-                    logger.info("Reconnecting in 3 seconds...")
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"HTX WebSocket error: {e}", exc_info=True)
+                logger.error(f"HTX WebSocket error: {e}")
                 if self.running:
-                    logger.info("Reconnecting in 5 seconds...")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
             finally:
                 self.ws = None
 
@@ -140,8 +138,8 @@ class HTXWebSocket:
             orderbook = {
                 "exchange": "htx",
                 "symbol": self.symbol,
-                "bids": [[float(p), float(q)] for p, q in bids_raw[:50]],
-                "asks": [[float(p), float(q)] for p, q in asks_raw[:50]],
+                "bids": [[float(p), float(q)] for p, q in bids_raw[:20]],
+                "asks": [[float(p), float(q)] for p, q in asks_raw[:20]],
                 "timestamp": int(data.get("ts", 0)),
             }
 

@@ -1,10 +1,10 @@
 """
-Управление состоянием арбитражного бота
+Global state for the arbitrage trading system.
+Tracks balances, positions, and statistics per strategy.
 """
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any
-from datetime import datetime
-import asyncio
+from typing import Dict, Optional, Any, List
 
 from arbitrage.utils import get_arbitrage_logger
 
@@ -12,224 +12,133 @@ logger = get_arbitrage_logger("state")
 
 
 @dataclass
-class OrderbookData:
-    """Данные стакана биржи"""
-    exchange: str
+class ActivePosition:
+    """A live arbitrage position (2 legs)."""
+    strategy: str
     symbol: str
-    bids: list
-    asks: list
-    timestamp: int
-    best_bid: float = 0.0
-    best_ask: float = 0.0
-
-    def __post_init__(self):
-        if self.bids:
-            self.best_bid = float(self.bids[0][0])
-        if self.asks:
-            self.best_ask = float(self.asks[0][0])
-
-
-@dataclass
-class Position:
-    """Информация о позиции"""
-    exchange: str
-    symbol: str
-    side: str  # LONG or SHORT
-    size: float
-    entry_price: float
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    order_id: Optional[str] = None
-
-
-@dataclass
-class ArbitrageOpportunity:
-    """Арбитражная возможность"""
-    spread: float
     long_exchange: str
     short_exchange: str
+    long_contracts: int
+    short_contracts: int
     long_price: float
     short_price: float
-    size: float
-    timestamp: datetime = field(default_factory=datetime.utcnow)
+    entry_spread: float
+    size_usd: float
+    entry_time: float = field(default_factory=time.time)
+    target_profit: float = 0.0
+    stop_loss: float = 0.0
+    accumulated_funding: float = 0.0
+    total_fees: float = 0.0
+    trade_id: int = 0
+    exit_threshold: float = 0.05
+
+    def duration(self) -> float:
+        return time.time() - self.entry_time
 
 
 class BotState:
-    """Состояние арбитражного бота"""
+    """Central state for the arbitrage bot."""
 
     def __init__(self):
-        # Orderbooks
-        self.okx_orderbook: Optional[OrderbookData] = None
-        self.htx_orderbook: Optional[OrderbookData] = None
-        self.orderbook_lock = asyncio.Lock()
-
-        # Positions
-        self.positions: Dict[str, Position] = {}
-        self.position_lock = asyncio.Lock()
-
-        # Trading state
-        self.is_in_position = False
-        self.current_opportunity: Optional[ArbitrageOpportunity] = None
-
-        # Balance
-        self.okx_balance: float = 0.0
-        self.htx_balance: float = 0.0
+        # Balances per exchange
+        self.balances: Dict[str, float] = {}
         self.total_balance: float = 0.0
 
-        # Statistics
-        self.total_trades = 0
-        self.successful_trades = 0
-        self.failed_trades = 0
-        self.total_pnl = 0.0
+        # Active positions: {(strategy, symbol): ActivePosition}
+        self.positions: Dict[tuple, ActivePosition] = {}
+
+        # Per-strategy stats
+        self.strategy_stats: Dict[str, Dict[str, Any]] = {}
+
+        # Global stats
+        self.total_trades: int = 0
+        self.successful_trades: int = 0
+        self.failed_trades: int = 0
+        self.total_pnl: float = 0.0
 
         # Running state
-        self.is_running = False
-        self.is_connected = {"okx": False, "htx": False}
+        self.is_running: bool = False
 
-    async def update_orderbook(self, orderbook: Dict[str, Any]) -> None:
-        """Обновить данные стакана"""
-        async with self.orderbook_lock:
-            exchange = orderbook.get("exchange")
+        # Legacy compat aliases
+        self.okx_balance: float = 0.0
+        self.htx_balance: float = 0.0
+        self.bybit_balance: float = 0.0
 
-            orderbook_data = OrderbookData(
-                exchange=exchange,
-                symbol=orderbook.get("symbol", ""),
-                bids=orderbook.get("bids", []),
-                asks=orderbook.get("asks", []),
-                timestamp=orderbook.get("timestamp", 0)
-            )
-
-            if exchange == "okx":
-                self.okx_orderbook = orderbook_data
-                self.is_connected["okx"] = True
-            elif exchange == "htx":
-                self.htx_orderbook = orderbook_data
-                self.is_connected["htx"] = True
-
-            logger.debug(
-                f"{exchange.upper()} orderbook updated: "
-                f"bid={orderbook_data.best_bid}, ask={orderbook_data.best_ask}"
-            )
-
-    async def add_position(self, position: Position) -> None:
-        """Добавить позицию"""
-        async with self.position_lock:
-            key = f"{position.exchange}_{position.symbol}"
-            self.positions[key] = position
-            self.is_in_position = True
-            logger.info(f"Position added: {position}")
-
-    async def remove_position(self, exchange: str, symbol: str) -> Optional[Position]:
-        """Удалить позицию"""
-        async with self.position_lock:
-            key = f"{exchange}_{symbol}"
-            position = self.positions.pop(key, None)
-
-            if not self.positions:
-                self.is_in_position = False
-                self.current_opportunity = None
-
-            if position:
-                logger.info(f"Position removed: {position}")
-
-            return position
-
-    async def get_position(self, exchange: str, symbol: str) -> Optional[Position]:
-        """Получить позицию"""
-        async with self.position_lock:
-            key = f"{exchange}_{symbol}"
-            return self.positions.get(key)
-
-    async def clear_positions(self) -> None:
-        """Очистить все позиции"""
-        async with self.position_lock:
-            self.positions.clear()
-            self.is_in_position = False
-            self.current_opportunity = None
-            logger.info("All positions cleared")
+    # ─── Balances ─────────────────────────────────────────────────────────
 
     def update_balance(self, exchange: str, balance: float) -> None:
-        """Обновить баланс биржи"""
+        self.balances[exchange] = balance
+        # Legacy aliases
         if exchange == "okx":
             self.okx_balance = balance
         elif exchange == "htx":
             self.htx_balance = balance
+        elif exchange == "bybit":
+            self.bybit_balance = balance
+        self.total_balance = sum(self.balances.values())
 
-        self.total_balance = self.okx_balance + self.htx_balance
-        logger.debug(f"{exchange.upper()} balance updated: {balance} USDT")
+    def get_balance(self, exchange: str) -> float:
+        return self.balances.get(exchange, 0.0)
 
-    def record_trade(self, success: bool, pnl: float = 0.0) -> None:
-        """Записать результат трейда"""
+    # ─── Positions ────────────────────────────────────────────────────────
+
+    def add_position(self, pos: ActivePosition) -> None:
+        key = (pos.strategy, pos.symbol)
+        self.positions[key] = pos
+        logger.info(f"Position added: {pos.strategy} {pos.symbol} "
+                    f"L:{pos.long_exchange} S:{pos.short_exchange}")
+
+    def remove_position(self, strategy: str, symbol: str) -> Optional[ActivePosition]:
+        key = (strategy, symbol)
+        pos = self.positions.pop(key, None)
+        if pos:
+            logger.info(f"Position removed: {strategy} {symbol}")
+        return pos
+
+    def get_position(self, strategy: str, symbol: str) -> Optional[ActivePosition]:
+        return self.positions.get((strategy, symbol))
+
+    def get_positions_by_strategy(self, strategy: str) -> List[ActivePosition]:
+        return [p for (s, _), p in self.positions.items() if s == strategy]
+
+    def get_all_positions(self) -> List[ActivePosition]:
+        return list(self.positions.values())
+
+    def position_count(self) -> int:
+        return len(self.positions)
+
+    def has_position_on_symbol(self, symbol: str) -> bool:
+        return any(sym == symbol for (_, sym) in self.positions)
+
+    # ─── Trade Recording ──────────────────────────────────────────────────
+
+    def record_trade(self, strategy: str, success: bool, pnl: float = 0.0) -> None:
         self.total_trades += 1
         if success:
             self.successful_trades += 1
-            self.total_pnl += pnl
         else:
             self.failed_trades += 1
+        self.total_pnl += pnl
 
-        logger.info(
-            f"Trade recorded: success={success}, pnl={pnl:.2f}, "
-            f"total_trades={self.total_trades}, total_pnl={self.total_pnl:.2f}"
-        )
+        # Per-strategy
+        if strategy not in self.strategy_stats:
+            self.strategy_stats[strategy] = {
+                "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0
+            }
+        stats = self.strategy_stats[strategy]
+        stats["trades"] += 1
+        if success:
+            stats["wins"] += 1
+        else:
+            stats["losses"] += 1
+        stats["pnl"] += pnl
 
-    def get_orderbooks(self) -> tuple[Optional[OrderbookData], Optional[OrderbookData]]:
-        """Получить текущие стаканы (OKX, HTX)"""
-        return self.okx_orderbook, self.htx_orderbook
+        logger.info(f"Trade [{strategy}]: ok={success} pnl={pnl:+.4f} "
+                    f"total={self.total_trades} total_pnl={self.total_pnl:+.4f}")
 
-    def is_both_connected(self) -> bool:
-        """Проверить подключение к обеим биржам"""
-        return self.is_connected["okx"] and self.is_connected["htx"]
-
-    def calculate_pnl(self) -> float:
-        """
-        Рассчитать текущий PnL на основе открытых позиций
-
-        Для арбитража PnL это разница между входом и текущим состоянием:
-        - LONG позиция: (current_price - entry_price) * size
-        - SHORT позиция: (entry_price - current_price) * size
-
-        Возвращает общий PnL в USDT
-        """
-        if not self.is_in_position or not self.current_opportunity:
-            return 0.0
-
-        # Простой расчет на основе entry opportunity
-        # В реальности PnL рассчитывается по закрытым позициям
-        # Здесь мы используем упрощенную оценку
-
-        # Получаем текущие цены
-        okx_ob, htx_ob = self.get_orderbooks()
-        if not okx_ob or not htx_ob:
-            return 0.0
-
-        try:
-            opportunity = self.current_opportunity
-            size = opportunity.size
-
-            # Расчет PnL для каждой стороны
-            if opportunity.long_exchange == "okx":
-                # LONG на OKX (закрываем по bid), SHORT на HTX (закрываем по ask)
-                long_pnl = (okx_ob.best_bid - opportunity.long_price) * size
-                short_pnl = (opportunity.short_price - htx_ob.best_ask) * size
-            else:
-                # LONG на HTX (закрываем по bid), SHORT на OKX (закрываем по ask)
-                long_pnl = (htx_ob.best_bid - opportunity.long_price) * size
-                short_pnl = (opportunity.short_price - okx_ob.best_ask) * size
-
-            total_pnl = long_pnl + short_pnl
-
-            # Учитываем комиссии (примерно 0.05% на каждую сторону, всего 0.2% за полный цикл)
-            fee_rate = 0.002  # 0.2%
-            avg_price = (opportunity.long_price + opportunity.short_price) / 2
-            fees = avg_price * size * fee_rate * 2  # 2 позиции
-
-            return total_pnl - fees
-
-        except Exception as e:
-            logger.error(f"Error calculating PnL: {e}", exc_info=True)
-            return 0.0
+    # ─── Stats ────────────────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, Any]:
-        """Получить статистику бота"""
         return {
             "total_trades": self.total_trades,
             "successful_trades": self.successful_trades,
@@ -240,12 +149,14 @@ class BotState:
             ),
             "total_pnl": self.total_pnl,
             "avg_pnl": (
-                self.total_pnl / self.successful_trades
-                if self.successful_trades > 0 else 0
+                self.total_pnl / self.total_trades
+                if self.total_trades > 0 else 0
             ),
+            "total_balance": self.total_balance,
+            "balances": dict(self.balances),
             "okx_balance": self.okx_balance,
             "htx_balance": self.htx_balance,
-            "total_balance": self.total_balance,
-            "in_position": self.is_in_position,
-            "positions_count": len(self.positions)
+            "bybit_balance": self.bybit_balance,
+            "open_positions": self.position_count(),
+            "strategy_stats": dict(self.strategy_stats),
         }

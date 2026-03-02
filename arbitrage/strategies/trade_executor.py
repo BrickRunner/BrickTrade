@@ -1,341 +1,420 @@
 """
-TradeExecutor — исполнение и отслеживание арбитражных сделок.
-Поддерживает несколько символов одновременно, dry_run и monitoring_only режимы.
+Atomic Execution Engine for arbitrage trades.
+
+Pipeline:
+    Pre-check → Slippage Estimation → Atomic Execution → Position Sync
+
+Leg execution order:
+    - If OKX is one leg: execute non-OKX first (risky), then OKX with IOC (safe)
+    - If neither is OKX: execute alphabetically first, then second
+
+On failure:
+    - First leg fails → no action (nothing opened)
+    - Second leg fails → hedge first leg with 3 retries
+    - Hedge fails → create partial position for auto-retry on next cycle
 """
 import asyncio
-import time
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Tuple
-from datetime import datetime
+from typing import Dict, Any, Tuple
 
 from arbitrage.utils import get_arbitrage_logger, ArbitrageConfig
-from arbitrage.exchanges import OKXRestClient, HTXRestClient
+from arbitrage.core.market_data import MarketDataEngine
+from arbitrage.core.state import BotState, ActivePosition
+from arbitrage.strategies.base import Opportunity
 
 logger = get_arbitrage_logger("trade_executor")
 
-# Комиссии по умолчанию (перп-фьючерсы)
-DEFAULT_FEE_RATE = 0.0006   # 0.06% taker за одну ногу
-ROUND_TRIP_FEE_RATE = DEFAULT_FEE_RATE * 4  # 4 ноги = 0.24%
-
-
-@dataclass
-class TradeRecord:
-    """Запись об одной арбитражной сделке"""
-    # Идентификация
-    strategy: str
-    symbol: str
-    long_exchange: str
-    short_exchange: str
-
-    # Параметры входа
-    entry_time: float = field(default_factory=time.time)
-    entry_long_price: float = 0.0
-    entry_short_price: float = 0.0
-    size: float = 0.0
-    entry_spread_pct: float = 0.0
-
-    # Параметры выхода
-    exit_time: Optional[float] = None
-    exit_long_price: float = 0.0
-    exit_short_price: float = 0.0
-    exit_spread_pct: float = 0.0
-
-    # Результаты
-    gross_pnl: float = 0.0          # До комиссий
-    total_fees: float = 0.0         # Суммарные комиссии в USDT
-    net_pnl: float = 0.0            # Чистый P&L
-    is_open: bool = True
-    dry_run: bool = False           # Была ли сделка реальной
-
-    # ID ордеров
-    long_order_id: Optional[str] = None
-    short_order_id: Optional[str] = None
-
-    def duration_seconds(self) -> float:
-        end = self.exit_time or time.time()
-        return end - self.entry_time
-
-    def duration_str(self) -> str:
-        secs = int(self.duration_seconds())
-        if secs < 60:
-            return f"{secs}с"
-        elif secs < 3600:
-            return f"{secs // 60}м {secs % 60}с"
-        else:
-            return f"{secs // 3600}ч {(secs % 3600) // 60}м"
-
-    def entry_time_str(self) -> str:
-        return datetime.fromtimestamp(self.entry_time).strftime("%H:%M:%S")
-
-    def exit_time_str(self) -> str:
-        if self.exit_time:
-            return datetime.fromtimestamp(self.exit_time).strftime("%H:%M:%S")
-        return "—"
-
 
 class TradeExecutor:
-    """
-    Исполняет и отслеживает арбитражные сделки.
-
-    Поддерживает:
-    - monitoring_only = True: НЕ торгует, только логирует
-    - dry_run_mode = True: симулирует сделки, реальных ордеров нет
-    - Реальный режим: размещает ордера на обеих биржах одновременно
-    """
+    """Executes atomic 2-leg arbitrage trades across exchanges."""
 
     def __init__(
         self,
         config: ArbitrageConfig,
-        okx_client: OKXRestClient,
-        htx_client: HTXRestClient,
+        exchanges: Dict[str, Any],
     ):
         self.config = config
-        self.okx_client = okx_client
-        self.htx_client = htx_client
-        self.order_timeout = config.order_timeout_ms / 1000
+        self.exchanges = exchanges
+        self._contract_sizes: Dict[str, Dict[str, float]] = {}
 
-    async def open_trade(
-        self,
-        strategy: str,
-        symbol: str,
-        long_exchange: str,
-        short_exchange: str,
-        long_price: float,
-        short_price: float,
-        size: float,
-        spread_pct: float,
-    ) -> Tuple[bool, Optional[TradeRecord], str]:
-        """
-        Открыть арбитражную позицию.
+    def set_contract_sizes(self, sizes: Dict[str, Dict[str, float]]) -> None:
+        self._contract_sizes = sizes
 
-        Returns:
-            (success, trade_record, message)
-        """
-        # В режиме monitoring_only торговля отключена
+    # ─── Entry ────────────────────────────────────────────────────────────
+
+    async def execute_entry(
+        self, opp: Opportunity, state: BotState, market_data: MarketDataEngine
+    ) -> bool:
+        """Open a 2-leg arbitrage position atomically."""
         if self.config.monitoring_only:
-            return False, None, "monitoring_only mode — trading disabled"
+            return False
 
-        logger.info(
-            f"[{strategy}] Opening trade {symbol}: "
-            f"LONG {long_exchange} @ {long_price:.4f}, "
-            f"SHORT {short_exchange} @ {short_price:.4f}, "
-            f"size={size}, spread={spread_pct:.3f}%"
+        symbol = opp.symbol
+        long_ex = opp.long_exchange
+        short_ex = opp.short_exchange
+        leverage = self.config.leverage
+
+        first_ex, first_side, second_ex, second_side = self._determine_leg_order(
+            long_ex, short_ex
         )
 
-        # Создаём запись
-        trade = TradeRecord(
-            strategy=strategy,
-            symbol=symbol,
-            long_exchange=long_exchange,
-            short_exchange=short_exchange,
-            entry_long_price=long_price,
-            entry_short_price=short_price,
-            size=size,
-            entry_spread_pct=spread_pct,
-            dry_run=self.config.dry_run_mode,
+        per_side_usd = self._calculate_position_size(state, long_ex, short_ex)
+        if per_side_usd < 4.0:
+            return False
+
+        avg_price = (opp.long_price + opp.short_price) / 2
+        first_contracts = self._calculate_contracts(first_ex, symbol, per_side_usd, avg_price)
+        second_contracts = self._calculate_contracts(second_ex, symbol, per_side_usd, avg_price)
+        if first_contracts < 1 or second_contracts < 1:
+            return False
+
+        await asyncio.gather(
+            self._set_leverage(first_ex, symbol, leverage),
+            self._set_leverage(second_ex, symbol, leverage),
         )
 
-        if self.config.dry_run_mode:
-            # DRY RUN: симулируем успешное открытие
-            trade.long_order_id = f"dry_{long_exchange}_{int(time.time())}"
-            trade.short_order_id = f"dry_{short_exchange}_{int(time.time())}"
-            logger.warning(
-                f"[DRY RUN] Trade opened (simulated): {symbol} "
-                f"LONG {long_exchange} @ {long_price:.4f}, "
-                f"SHORT {short_exchange} @ {short_price:.4f}"
-            )
-            return True, trade, "DRY RUN: simulated entry"
-
-        # Реальное размещение ордеров — одновременно на обе биржи
         try:
-            long_task = self._place_order(long_exchange, symbol, "buy", long_price, size)
-            short_task = self._place_order(short_exchange, symbol, "sell", short_price, size)
-            results = await asyncio.gather(long_task, short_task, return_exceptions=True)
+            if self.config.dry_run_mode:
+                return self._dry_run_entry(
+                    opp, state, per_side_usd, first_contracts, second_contracts
+                )
 
-            long_result, short_result = results
-            long_ok = not isinstance(long_result, Exception) and long_result.get("success", False)
-            short_ok = not isinstance(short_result, Exception) and short_result.get("success", False)
+            # Step 1: First leg (risky)
+            first_result = await self._place_order(
+                first_ex, symbol, first_side, first_contracts,
+                self._get_order_type(first_ex), offset="open", leverage=leverage
+            )
+            if not self._check_result(first_ex, first_result):
+                logger.warning(f"First leg ({first_ex}) failed for {symbol}")
+                return False
 
-            if long_ok and short_ok:
-                trade.long_order_id = long_result.get("order_id")
-                trade.short_order_id = short_result.get("order_id")
-                logger.info(f"[{strategy}] Both legs opened for {symbol}")
-                return True, trade, "Both positions opened"
+            await asyncio.sleep(0.5)
+            first_actual, first_fill = await self._verify_position(first_ex, symbol)
+            if first_actual == 0:
+                logger.warning(f"{first_ex.upper()} no position for {symbol}")
+                return False
+            first_contracts = int(first_actual)
 
-            elif long_ok and not short_ok:
-                # Аварийное закрытие открытой ноги
-                logger.error(f"[{strategy}] Short leg failed for {symbol}, emergency close")
-                await self._place_order(long_exchange, symbol, "sell", long_price, size, market=True)
-                return False, None, f"Short leg failed: {short_result}"
-
-            elif short_ok and not long_ok:
-                logger.error(f"[{strategy}] Long leg failed for {symbol}, emergency close")
-                await self._place_order(short_exchange, symbol, "buy", short_price, size, market=True)
-                return False, None, f"Long leg failed: {long_result}"
-
+            # Step 2: Second leg
+            if second_ex == "okx":
+                slippage = 0.0015
+                px = round(
+                    (opp.long_price * (1 + slippage)) if second_side == "buy"
+                    else (opp.short_price * (1 - slippage)),
+                    10,
+                )
+                second_result = await self._place_order(
+                    second_ex, symbol, second_side, second_contracts,
+                    "limit", price=px, offset="open", leverage=leverage
+                )
             else:
-                return False, None, "Both legs failed"
+                second_result = await self._place_order(
+                    second_ex, symbol, second_side, second_contracts,
+                    self._get_order_type(second_ex), offset="open", leverage=leverage
+                )
 
-        except Exception as e:
-            logger.error(f"[{strategy}] Entry error for {symbol}: {e}", exc_info=True)
-            return False, None, f"Entry error: {str(e)}"
+            second_ok = self._check_result(second_ex, second_result)
+            second_fill = 0.0
+            if second_ok:
+                await asyncio.sleep(0.5)
+                second_actual, second_fill = await self._verify_position(second_ex, symbol)
+                if second_actual == 0:
+                    second_ok = False
+                else:
+                    second_contracts = int(second_actual)
 
-    async def close_trade(
-        self,
-        trade: TradeRecord,
-        exit_long_price: float,
-        exit_short_price: float,
-        exit_spread_pct: float,
-        reason: str = "exit_threshold_reached",
-    ) -> Tuple[bool, str]:
-        """
-        Закрыть арбитражную позицию и рассчитать P&L.
+            if second_ok:
+                if first_ex == long_ex:
+                    lc, sc = first_contracts, second_contracts
+                    lf, sf = first_fill, second_fill
+                else:
+                    lc, sc = second_contracts, first_contracts
+                    lf, sf = second_fill, first_fill
 
-        Returns:
-            (success, message)
-        """
-        if not trade.is_open:
-            return False, "Trade already closed"
-
-        logger.info(
-            f"[{trade.strategy}] Closing trade {trade.symbol}: "
-            f"exit LONG {trade.long_exchange} @ {exit_long_price:.4f}, "
-            f"exit SHORT {trade.short_exchange} @ {exit_short_price:.4f}, "
-            f"reason={reason}"
-        )
-
-        if self.config.dry_run_mode:
-            # DRY RUN: симулируем закрытие
-            self._finalize_trade(trade, exit_long_price, exit_short_price, exit_spread_pct)
-            logger.warning(
-                f"[DRY RUN] Trade closed (simulated): {trade.symbol} "
-                f"net_pnl={trade.net_pnl:.4f} USDT"
-            )
-            return True, f"DRY RUN: simulated exit, net PnL={trade.net_pnl:.4f} USDT"
-
-        # Реальное закрытие — закрываем обе ноги одновременно
-        try:
-            # LONG нужно продать (sell), SHORT нужно выкупить (buy)
-            close_long = self._place_order(
-                trade.long_exchange, trade.symbol, "sell", exit_long_price, trade.size, market=True
-            )
-            close_short = self._place_order(
-                trade.short_exchange, trade.symbol, "buy", exit_short_price, trade.size, market=True
-            )
-            results = await asyncio.gather(close_long, close_short, return_exceptions=True)
-
-            long_ok = not isinstance(results[0], Exception) and results[0].get("success", False)
-            short_ok = not isinstance(results[1], Exception) and results[1].get("success", False)
-
-            if long_ok and short_ok:
-                self._finalize_trade(trade, exit_long_price, exit_short_price, exit_spread_pct)
+                pos = ActivePosition(
+                    strategy=opp.strategy.value,
+                    symbol=symbol,
+                    long_exchange=long_ex,
+                    short_exchange=short_ex,
+                    long_contracts=lc,
+                    short_contracts=sc,
+                    long_price=lf if lf > 0 else opp.long_price,
+                    short_price=sf if sf > 0 else opp.short_price,
+                    entry_spread=opp.expected_profit_pct,
+                    size_usd=per_side_usd * 2,
+                    target_profit=opp.expected_profit_pct,
+                )
+                state.add_position(pos)
                 logger.info(
-                    f"[{trade.strategy}] Trade closed: {trade.symbol} "
-                    f"net_pnl={trade.net_pnl:.4f} USDT"
+                    f"ENTRY OK: {symbol} L:{long_ex} S:{short_ex} "
+                    f"spread={opp.expected_profit_pct:.3f}%"
                 )
-                return True, f"Closed, net PnL={trade.net_pnl:.4f} USDT"
+                return True
             else:
-                logger.error(
-                    f"[{trade.strategy}] Partial close for {trade.symbol}: "
-                    f"long_ok={long_ok}, short_ok={short_ok}"
+                # Second leg failed — hedge first leg
+                close_side = "sell" if first_side == "buy" else "buy"
+                logger.warning(f"Second leg ({second_ex}) failed — hedging {first_ex}")
+                hedge_ok = await self._close_with_retries(
+                    first_ex, symbol, close_side, first_contracts, leverage
                 )
-                return False, "Partial close — manual intervention needed"
+                if not hedge_ok:
+                    if first_ex == long_ex:
+                        lc, sc = first_contracts, 0
+                    else:
+                        lc, sc = 0, first_contracts
+                    pos = ActivePosition(
+                        strategy=opp.strategy.value,
+                        symbol=symbol,
+                        long_exchange=long_ex,
+                        short_exchange=short_ex,
+                        long_contracts=lc,
+                        short_contracts=sc,
+                        long_price=opp.long_price,
+                        short_price=opp.short_price,
+                        entry_spread=0,
+                        size_usd=per_side_usd,
+                        exit_threshold=0,
+                    )
+                    state.add_position(pos)
+                    logger.error(f"HEDGE FAILED {first_ex} {symbol}")
+                return False
 
         except Exception as e:
-            logger.error(f"[{trade.strategy}] Exit error for {trade.symbol}: {e}", exc_info=True)
-            return False, f"Exit error: {str(e)}"
+            logger.error(f"Entry error {symbol}: {e}", exc_info=True)
+            return False
 
-    def _finalize_trade(
-        self,
-        trade: TradeRecord,
-        exit_long_price: float,
-        exit_short_price: float,
-        exit_spread_pct: float,
-    ) -> None:
-        """Записать результаты и рассчитать P&L"""
-        trade.exit_time = time.time()
-        trade.exit_long_price = exit_long_price
-        trade.exit_short_price = exit_short_price
-        trade.exit_spread_pct = exit_spread_pct
-        trade.is_open = False
+    # ─── Exit ─────────────────────────────────────────────────────────────
 
-        # P&L от LONG ноги: (exit - entry) * size
-        long_pnl = (exit_long_price - trade.entry_long_price) * trade.size
-        # P&L от SHORT ноги: (entry - exit) * size
-        short_pnl = (trade.entry_short_price - exit_short_price) * trade.size
+    async def execute_exit(
+        self, pos: ActivePosition, state: BotState,
+        market_data: MarketDataEngine, reason: str
+    ) -> Tuple[bool, float]:
+        """Close a 2-leg position. Returns (success, pnl_usd)."""
+        if self.config.dry_run_mode:
+            return self._dry_run_exit(pos, state, reason)
 
-        trade.gross_pnl = long_pnl + short_pnl
+        symbol = pos.symbol
+        leverage = self.config.leverage
 
-        # Комиссии: 4 ноги × fee_rate × avg_price × size
-        avg_price = (trade.entry_long_price + trade.entry_short_price) / 2
-        trade.total_fees = avg_price * trade.size * ROUND_TRIP_FEE_RATE
-        trade.net_pnl = trade.gross_pnl - trade.total_fees
+        long_closed = pos.long_contracts == 0
+        short_closed = pos.short_contracts == 0
+
+        if not long_closed and not short_closed:
+            long_closed = await self._close_with_retries(
+                pos.long_exchange, symbol, "sell", pos.long_contracts, leverage
+            )
+            short_closed = await self._close_with_retries(
+                pos.short_exchange, symbol, "buy", pos.short_contracts, leverage
+            )
+        elif not long_closed:
+            long_closed = await self._close_with_retries(
+                pos.long_exchange, symbol, "sell", pos.long_contracts, leverage
+            )
+            short_closed = True
+        elif not short_closed:
+            short_closed = await self._close_with_retries(
+                pos.short_exchange, symbol, "buy", pos.short_contracts, leverage
+            )
+            long_closed = True
+        else:
+            long_closed = short_closed = True
+
+        if not long_closed or not short_closed:
+            if long_closed:
+                pos.long_contracts = 0
+            if short_closed:
+                pos.short_contracts = 0
+            return False, 0.0
+
+        pnl = self._estimate_pnl(pos)
+        state.remove_position(pos.strategy, pos.symbol)
+        logger.info(f"EXIT OK: {symbol} pnl=${pnl:+.4f} reason={reason}")
+        return True, pnl
+
+    # ─── Helpers ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _determine_leg_order(long_ex: str, short_ex: str):
+        if long_ex == "okx":
+            return short_ex, "sell", long_ex, "buy"
+        elif short_ex == "okx":
+            return long_ex, "buy", short_ex, "sell"
+        else:
+            first = min(long_ex, short_ex)
+            if first == long_ex:
+                return long_ex, "buy", short_ex, "sell"
+            return short_ex, "sell", long_ex, "buy"
+
+    def _calculate_position_size(
+        self, state: BotState, long_ex: str, short_ex: str
+    ) -> float:
+        long_bal = state.get_balance(long_ex)
+        short_bal = state.get_balance(short_ex)
+        pct = self.config.max_position_pct
+        long_side = max(4.0, long_bal * pct)
+        short_side = max(4.0, short_bal * pct)
+        if long_side > long_bal or short_side > short_bal:
+            return 0.0
+        return min(long_side, short_side)
+
+    def _calculate_contracts(
+        self, exchange: str, symbol: str, usd: float, price: float
+    ) -> int:
+        ct = self._contract_sizes.get(exchange, {}).get(symbol, 1.0)
+        if price <= 0 or ct <= 0:
+            return 0
+        return max(1, int(usd / (price * ct)))
+
+    @staticmethod
+    def _get_order_type(exchange: str) -> str:
+        if exchange == "htx":
+            return "optimal_5"
+        return "market"
+
+    @staticmethod
+    def _estimate_pnl(pos: ActivePosition) -> float:
+        fee_pct = 0.18
+        pnl = pos.size_usd * (pos.entry_spread - fee_pct) / 100
+        pnl -= pos.total_fees
+        pnl += pos.accumulated_funding
+        return pnl
+
+    def _dry_run_entry(self, opp, state, per_side_usd, first_c, second_c) -> bool:
+        pos = ActivePosition(
+            strategy=opp.strategy.value,
+            symbol=opp.symbol,
+            long_exchange=opp.long_exchange,
+            short_exchange=opp.short_exchange,
+            long_contracts=first_c,
+            short_contracts=second_c,
+            long_price=opp.long_price,
+            short_price=opp.short_price,
+            entry_spread=opp.expected_profit_pct,
+            size_usd=per_side_usd * 2,
+        )
+        state.add_position(pos)
+        logger.info(f"[DRY RUN] ENTRY: {opp.symbol} L:{opp.long_exchange} S:{opp.short_exchange}")
+        return True
+
+    def _dry_run_exit(self, pos, state, reason) -> Tuple[bool, float]:
+        pnl = self._estimate_pnl(pos)
+        state.remove_position(pos.strategy, pos.symbol)
+        logger.info(f"[DRY RUN] EXIT: {pos.symbol} pnl=${pnl:+.4f} reason={reason}")
+        return True, pnl
+
+    # ─── Exchange Operations ──────────────────────────────────────────────
 
     async def _place_order(
-        self,
-        exchange: str,
-        symbol: str,
-        side: str,
-        price: float,
-        size: float,
-        market: bool = False,
-    ) -> Dict[str, Any]:
-        """Разместить ордер на бирже"""
-        order_type = "market" if market else "limit"
-        tif = None if market else "ioc"
+        self, exchange: str, symbol: str, side: str, contracts: int,
+        order_type: str, price: float = 0, offset: str = "open", leverage: int = 1
+    ) -> Dict:
+        client = self.exchanges[exchange]
+        if exchange == "okx":
+            tif = "ioc" if order_type == "limit" else ""
+            return await client.place_order(symbol, side, contracts, order_type, price, tif)
+        elif exchange == "htx":
+            return await client.place_order(
+                symbol, side, contracts, order_type, offset=offset, lever_rate=leverage
+            )
+        elif exchange == "bybit":
+            return await client.place_order(
+                symbol, side, contracts, order_type, price=price,
+                offset=offset, lever_rate=leverage
+            )
+        return {"error": f"Unknown exchange: {exchange}"}
 
+    @staticmethod
+    def _check_result(exchange: str, result) -> bool:
+        if isinstance(result, Exception):
+            return False
+        if exchange == "okx":
+            return result.get("code") == "0" and bool(result.get("data"))
+        elif exchange == "htx":
+            return result.get("status") == "ok" and bool(result.get("data"))
+        elif exchange == "bybit":
+            return result.get("retCode") == 0 and bool(result.get("result"))
+        return False
+
+    async def _verify_position(
+        self, exchange: str, symbol: str
+    ) -> Tuple[float, float]:
+        """Returns (size, avg_price)."""
         try:
+            client = self.exchanges[exchange]
             if exchange == "okx":
-                # OKX: symbol формат BTC-USDT-SWAP
-                okx_symbol = _to_okx_symbol(symbol)
-                kwargs: Dict[str, Any] = dict(
-                    symbol=okx_symbol, side=side, size=size, order_type=order_type
-                )
-                if not market:
-                    kwargs["price"] = price
-                    kwargs["time_in_force"] = "ioc"
-
-                result = await asyncio.wait_for(
-                    self.okx_client.place_order(**kwargs),
-                    timeout=self.order_timeout
-                )
-                if result.get("code") == "0" and result.get("data"):
-                    return {"success": True, "order_id": result["data"][0].get("ordId")}
-                return {"success": False, "error": result}
-
+                result = await client.get_cross_position(symbol)
+                if result.get("code") == "0":
+                    for pos in result.get("data", []):
+                        sym = (
+                            pos.get("instId", "")
+                            .replace("-USDT-SWAP", "")
+                            .replace("-", "") + "USDT"
+                        )
+                        if sym == symbol and float(pos.get("pos", 0)) != 0:
+                            return abs(float(pos["pos"])), float(pos.get("avgPx", 0) or 0)
             elif exchange == "htx":
-                kwargs = dict(
-                    symbol=symbol, side=side,
-                    size=size, order_type="opponent" if market else "limit",
-                    offset="open",
-                )
-                if not market:
-                    kwargs["price"] = price
-
-                result = await asyncio.wait_for(
-                    self.htx_client.place_order(**kwargs),
-                    timeout=self.order_timeout
-                )
-                if result.get("status") == "ok" and result.get("data"):
-                    return {"success": True, "order_id": str(result["data"].get("order_id", ""))}
-                return {"success": False, "error": result}
-
-            else:
-                return {"success": False, "error": f"Unknown exchange: {exchange}"}
-
-        except asyncio.TimeoutError:
-            logger.error(f"Order timeout: {exchange} {symbol} {side}")
-            return {"success": False, "error": "Timeout"}
+                result = await client.get_cross_position(symbol)
+                if result.get("status") == "ok":
+                    for pos in result.get("data", []):
+                        vol = float(pos.get("volume", 0))
+                        if vol > 0:
+                            return vol, float(pos.get("cost_open", 0) or 0)
+            elif exchange == "bybit":
+                result = await client.get_cross_position(symbol)
+                if result.get("retCode") == 0:
+                    for pos in result.get("result", {}).get("list", []):
+                        size = float(pos.get("size", 0) or 0)
+                        if size > 0:
+                            return size, float(pos.get("avgPrice", 0) or 0)
         except Exception as e:
-            logger.error(f"Order error: {exchange} {symbol} {side}: {e}")
-            return {"success": False, "error": str(e)}
+            logger.error(f"Verify position error ({exchange} {symbol}): {e}")
+        return 0, 0
 
+    async def _close_with_retries(
+        self, exchange: str, symbol: str, side: str, contracts: int, leverage: int
+    ) -> bool:
+        """Close position with 3 retries and verification."""
+        order_type = "opponent" if exchange == "htx" else "market"
+        for attempt in range(3):
+            try:
+                result = await self._place_order(
+                    exchange, symbol, side, contracts,
+                    order_type, offset="close", leverage=leverage
+                )
+                if self._check_result(exchange, result):
+                    await asyncio.sleep(0.5)
+                    remaining, _ = await self._verify_position(exchange, symbol)
+                    if remaining == 0:
+                        return True
+                    if remaining < contracts:
+                        contracts = int(remaining)
+                        logger.warning(
+                            f"{exchange.upper()} {symbol}: partial, {remaining} left"
+                        )
+                else:
+                    logger.warning(f"{exchange.upper()} close attempt {attempt + 1} failed")
+            except Exception as e:
+                logger.error(f"{exchange.upper()} close attempt {attempt + 1}: {e}")
+            if attempt < 2:
+                await asyncio.sleep(1)
+        logger.error(f"FAILED to close {exchange.upper()} {symbol} after 3 attempts!")
+        return False
 
-def _to_okx_symbol(symbol: str) -> str:
-    """Конвертировать BTCUSDT → BTC-USDT-SWAP"""
-    if "-" in symbol:
-        return symbol  # уже в формате OKX
-    if symbol.endswith("USDT"):
-        base = symbol[:-4]
-        return f"{base}-USDT-SWAP"
-    return symbol
+    async def _set_leverage(self, exchange: str, symbol: str, leverage: int) -> None:
+        try:
+            client = self.exchanges[exchange]
+            if exchange == "okx":
+                await client.set_leverage(symbol, leverage)
+            elif exchange == "htx":
+                r = await client.set_leverage(symbol, leverage)
+                if isinstance(r, dict) and r.get("status") == "error":
+                    err = r.get("err-msg", "")
+                    if "already" not in err.lower() and "same" not in err.lower():
+                        logger.warning(f"HTX leverage: {err}")
+            elif exchange == "bybit":
+                r = await client.set_leverage(symbol, leverage)
+                if isinstance(r, dict) and r.get("retCode") != 0:
+                    msg = r.get("retMsg", "")
+                    if "not modified" not in msg.lower() and "pm mode" not in msg.lower():
+                        logger.warning(f"Bybit leverage: {msg}")
+        except Exception:
+            pass

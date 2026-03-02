@@ -77,7 +77,8 @@ class OKXRestClient:
             async with session.request(
                 method=method,
                 url=url,
-                params=params
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
                 result = await response.json()
 
@@ -87,7 +88,7 @@ class OKXRestClient:
                 return result
 
         except Exception as e:
-            logger.error(f"OKX public request error: {e}", exc_info=True)
+            logger.error(f"OKX public request error: {e}")
             raise
 
     async def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
@@ -114,7 +115,8 @@ class OKXRestClient:
                 url=url,
                 params=params if method == "GET" else None,
                 data=body if method == "POST" else None,
-                headers=headers
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
                 result = await response.json()
 

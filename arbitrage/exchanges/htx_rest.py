@@ -116,17 +116,22 @@ class HTXRestClient:
         endpoint: str,
         params: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Публичный HTTP запрос"""
-        session = await self._get_session()
+        """Публичный HTTP запрос с retry"""
         url = f"{base_url}{endpoint}"
-        try:
-            async with session.request(
-                method=method, url=url, params=params or {}, timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                return await resp.json(content_type=None)
-        except Exception as e:
-            logger.error(f"Public request error {endpoint}: {e}")
-            return {}
+        for attempt in range(3):
+            try:
+                session = await self._get_session()
+                async with session.request(
+                    method=method, url=url, params=params or {},
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as resp:
+                    return await resp.json(content_type=None)
+            except Exception as e:
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.error(f"Public request error {endpoint}: {e}")
+                    return {}
 
     # ─── Private Request ─────────────────────────────────────────────────────
 
@@ -138,49 +143,60 @@ class HTXRestClient:
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Приватный HTTP запрос с подписью"""
+        """Приватный HTTP запрос с подписью и retry"""
         if self.public_only:
             logger.warning(f"Cannot make private request without API keys: {endpoint}")
             return {"status": "error", "err-msg": "No API keys configured"}
 
-        host = urllib.parse.urlparse(base_url).hostname or ""
-        get_params = dict(params or {})
-
-        signed = self._sign_request(method.upper(), host, endpoint, get_params)
-        session = await self._get_session()
         url = f"{base_url}{endpoint}"
+        host = urllib.parse.urlparse(base_url).hostname or ""
 
-        try:
-            if method.upper() == "GET":
-                async with session.get(url, params=signed, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    return await resp.json(content_type=None)
-            else:
-                # POST: подпись в query string, тело — JSON
-                qs = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in signed.items())
-                async with session.post(
-                    f"{url}?{qs}",
-                    json=data or {},
-                    headers={"Content-Type": "application/json"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    return await resp.json(content_type=None)
-        except Exception as e:
-            logger.error(f"Private request error {endpoint}: {e}")
-            return {"status": "error", "err-msg": str(e)}
+        for attempt in range(3):
+            try:
+                # Пересоздаём подпись на каждой попытке (timestamp меняется)
+                get_params = dict(params or {})
+                signed = self._sign_request(method.upper(), host, endpoint, get_params)
+                session = await self._get_session()
+
+                if method.upper() == "GET":
+                    async with session.get(url, params=signed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        return await resp.json(content_type=None)
+                else:
+                    # POST: подпись в query string, тело — JSON
+                    qs = "&".join(f"{k}={urllib.parse.quote(str(v), safe='')}" for k, v in signed.items())
+                    async with session.post(
+                        f"{url}?{qs}",
+                        json=data or {},
+                        headers={"Content-Type": "application/json"},
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
+                        return await resp.json(content_type=None)
+            except Exception as e:
+                if attempt < 2:
+                    logger.warning(f"Private request attempt {attempt+1} failed {endpoint}: {e}")
+                    await asyncio.sleep(0.5 * (attempt + 1))
+                else:
+                    logger.error(f"Private request error {endpoint} after 3 attempts: {e}")
+                    return {"status": "error", "err-msg": str(e)}
 
     # ─── Market Data (Public) ────────────────────────────────────────────────
 
     async def get_instruments(self) -> Dict[str, Any]:
         """Получить список линейных свопов (USDT-margined)"""
+        # HTX API v1 endpoint для получения информации о контрактах
         return await self._public_request(
-            "GET", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_contract_info"
+            "GET", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_contract_info"
         )
 
     async def get_tickers(self, inst_type: str = "SWAP") -> Dict[str, Any]:
         """
         Получить котировки (bid/ask) для всех линейных свопов.
         inst_type игнорируется — HTX использует единственный эндпоинт.
+
+        Returns:
+            {"status": "ok", "ticks": [...]}
         """
+        # Правильный endpoint для HTX batch market tickers
         return await self._public_request(
             "GET", FUTURES_BASE_URL, "/linear-swap-ex/market/detail/batch_merged"
         )
@@ -222,23 +238,33 @@ class HTXRestClient:
     # ─── Account / Trading (Private) ────────────────────────────────────────
 
     async def get_balance(self) -> Dict[str, Any]:
-        """Получить баланс аккаунта (линейные свопы)"""
+        """Получить баланс аккаунта (unified account — merged cross/isolated)"""
         return await self._request(
-            "GET", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_account_info"
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/unified_account_info",
+            data={}
         )
 
     async def get_positions(self) -> Dict[str, Any]:
         """Получить открытые позиции"""
         return await self._request(
-            "GET", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_position_info"
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_position_info",
+            data={}
+        )
+
+    async def get_cross_position(self, symbol: str) -> Dict[str, Any]:
+        """Получить cross-margin позицию по конкретному контракту"""
+        contract_code = _usdt_to_htx(symbol)
+        return await self._request(
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_cross_position_info",
+            data={"contract_code": contract_code}
         )
 
     async def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
-        """Установить плечо"""
+        """Установить плечо (cross-margin)"""
         contract_code = _usdt_to_htx(symbol)
         return await self._request(
-            "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_switch_lever_rate",
-            data={"contract_code": contract_code, "lever_rate": leverage},
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_cross_switch_lever_rate",
+            data={"contract_code": contract_code, "lever_rate": leverage, "margin_account": "USDT"},
         )
 
     async def place_order(
@@ -250,7 +276,7 @@ class HTXRestClient:
         price: float = 0.0,
         time_in_force: str = "",
         offset: str = "open",
-        lever_rate: int = 3,
+        lever_rate: int = 1,
     ) -> Dict[str, Any]:
         """
         Разместить ордер на линейный своп.
@@ -275,27 +301,30 @@ class HTXRestClient:
             "lever_rate": lever_rate,
             "order_price_type": htx_order_type,
             "volume": size,
+            "margin_account": "USDT",
         }
         if price > 0 and htx_order_type == "limit":
             body["price"] = price
 
+        # Используем cross-margin endpoint (swap_cross_order)
+        # swap_order = isolated, swap_cross_order = cross margin
         return await self._request(
-            "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_order", data=body
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_cross_order", data=body
         )
 
     async def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
-        """Отменить ордер"""
+        """Отменить ордер (cross-margin)"""
         contract_code = _usdt_to_htx(symbol)
         return await self._request(
-            "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_cancel",
-            data={"contract_code": contract_code, "order_id": order_id},
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_cross_cancel",
+            data={"contract_code": contract_code, "order_id": order_id, "margin_account": "USDT"},
         )
 
     async def get_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
         """Получить статус ордера"""
         contract_code = _usdt_to_htx(symbol)
         return await self._request(
-            "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/swap_order_info",
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_order_info",
             data={"contract_code": contract_code, "order_id": order_id},
         )
 

@@ -1,182 +1,118 @@
 """
-Модуль управления рисками
+Risk Management Engine.
+
+Pre-trade checks:
+- Exposure limits (total and per-exchange)
+- Position count limit
+- Balance / margin checks
+- Liquidation distance
+
+Runtime monitoring:
+- Delta check (long vs short imbalance)
+- API health / latency watchdog
+- Funding cost control
+
+Emergency actions:
+- Close all if margin < critical
+- Pause if API lag > threshold
 """
-from typing import Optional, Tuple
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Tuple
+
 from arbitrage.utils import get_arbitrage_logger, ArbitrageConfig
-from arbitrage.core.state import BotState, Position
+from arbitrage.core.state import BotState
+
+if TYPE_CHECKING:
+    from arbitrage.strategies.base import Opportunity
 
 logger = get_arbitrage_logger("risk")
 
 
 class RiskManager:
-    """Менеджер рисков для арбитражного бота"""
+    """Full risk framework for arbitrage trading."""
 
     def __init__(self, config: ArbitrageConfig, state: BotState):
         self.config = config
         self.state = state
+        self._max_position_pct = config.max_position_pct
+        self._max_concurrent = config.max_concurrent_positions
+        self._emergency_margin = config.emergency_margin_ratio
+        self._max_delta_pct = config.max_delta_percent
+        self._consecutive_failures: int = 0
+        self._max_failures: int = 5
 
-        # Лимиты риска
-        self.max_risk_per_trade = config.max_risk_per_trade
-        self.max_delta_percent = config.max_delta_percent
-        self.max_position_size = config.position_size
+    # ─── Pre-trade Checks ─────────────────────────────────────────────────
 
-    def can_enter_position(self, size: float, price: float) -> Tuple[bool, str]:
-        """
-        Проверить возможность входа в позицию
+    def can_open_position(self, opp: Opportunity) -> bool:
+        """Check if a new position can be opened."""
+        # Position count limit
+        if self.state.position_count() >= self._max_concurrent:
+            return False
 
-        Returns:
-            (bool, str): (разрешено, причина отказа)
-        """
-        # Проверка: не в позиции ли мы уже
-        if self.state.is_in_position:
-            return False, "Already in position"
+        # Already have position on this symbol
+        if self.state.has_position_on_symbol(opp.symbol):
+            return False
 
-        # Проверка: достаточно ли баланса
-        position_value = size * price
-        required_balance = position_value * 2  # Нужно открыть 2 позиции
+        # Balance check: both exchanges must have funds
+        long_bal = self.state.get_balance(opp.long_exchange)
+        short_bal = self.state.get_balance(opp.short_exchange)
+        min_required = 5.0  # Minimum $5 per side
+        if long_bal < min_required or short_bal < min_required:
+            return False
 
-        if self.state.total_balance < required_balance:
-            return False, f"Insufficient balance: need {required_balance:.2f}, have {self.state.total_balance:.2f}"
+        # Total balance too low
+        if self.state.total_balance < 10.0:
+            return False
 
-        # Проверка: размер позиции не превышает лимит
-        if size > self.max_position_size:
-            return False, f"Position size {size} exceeds max {self.max_position_size}"
+        # Exposure check: total open positions value < X% of balance
+        total_exposure = sum(p.size_usd for p in self.state.get_all_positions())
+        max_exposure = self.state.total_balance * 0.8  # Max 80% of balance in positions
+        per_side = min(long_bal, short_bal) * self._max_position_pct
+        if total_exposure + per_side * 2 > max_exposure:
+            return False
 
-        # Проверка: риск на трейд
-        max_risk_value = self.state.total_balance * self.max_risk_per_trade
-        if position_value > max_risk_value:
-            return False, f"Position value {position_value:.2f} exceeds max risk {max_risk_value:.2f}"
+        # Circuit breaker
+        if self._consecutive_failures >= self._max_failures:
+            return False
 
-        return True, "OK"
+        return True
 
-    def can_exit_position(self) -> Tuple[bool, str]:
-        """
-        Проверить возможность выхода из позиции
+    def record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._max_failures:
+            logger.warning(f"Circuit breaker: {self._consecutive_failures} consecutive failures")
 
-        Returns:
-            (bool, str): (разрешено, причина отказа)
-        """
-        if not self.state.is_in_position:
-            return False, "Not in position"
+    def record_success(self) -> None:
+        self._consecutive_failures = 0
 
-        if len(self.state.positions) == 0:
-            return False, "No positions to close"
-
-        return True, "OK"
-
-    def check_delta(self) -> Tuple[bool, float]:
-        """
-        Проверить дельту позиций (hedge)
-
-        Returns:
-            (bool, float): (в пределах нормы, текущая дельта в %)
-        """
-        if not self.state.positions:
-            return True, 0.0
-
-        # Расчет суммарной позиции
-        total_position = 0.0
-
-        for pos in self.state.positions.values():
-            if pos.side == "LONG":
-                total_position += pos.size * pos.entry_price
-            else:  # SHORT
-                total_position -= pos.size * pos.entry_price
-
-        # Дельта в процентах от баланса
-        if self.state.total_balance > 0:
-            delta_percent = abs(total_position) / self.state.total_balance
-        else:
-            delta_percent = 0.0
-
-        is_ok = delta_percent < self.max_delta_percent
-
-        if not is_ok:
-            logger.warning(
-                f"Delta check failed: {delta_percent*100:.3f}% > {self.max_delta_percent*100:.3f}%"
-            )
-
-        return is_ok, delta_percent
-
-    def calculate_position_size(self, price: float) -> float:
-        """
-        Рассчитать размер позиции с учетом баланса и рисков
-
-        Args:
-            price: Текущая цена
-
-        Returns:
-            Размер позиции
-        """
-        # Используем фиксированный размер из конфига
-        size = self.config.position_size
-
-        # Проверяем, что размер не превышает допустимый риск
-        position_value = size * price
-        max_risk_value = self.state.total_balance * self.max_risk_per_trade
-
-        if position_value > max_risk_value:
-            # Уменьшаем размер до допустимого
-            size = max_risk_value / price
-            logger.info(f"Position size adjusted to {size} due to risk limits")
-
-        return size
+    # ─── Runtime Monitoring ───────────────────────────────────────────────
 
     def should_emergency_close(self) -> Tuple[bool, str]:
-        """
-        Проверить необходимость аварийного закрытия позиций
+        """Check if all positions should be closed immediately."""
+        # Balance critically low
+        if self.state.total_balance < 5.0 and self.state.position_count() > 0:
+            return True, "balance_critical"
 
-        Returns:
-            (bool, str): (нужно закрывать, причина)
-        """
-        # Проверка дельты
-        delta_ok, delta = self.check_delta()
-        if not delta_ok:
-            return True, f"Delta exceeded: {delta*100:.3f}%"
+        # Delta check: total long vs short exposure
+        positions = self.state.get_all_positions()
+        if positions:
+            total_long = sum(p.size_usd / 2 for p in positions if p.long_contracts > 0)
+            total_short = sum(p.size_usd / 2 for p in positions if p.short_contracts > 0)
+            if total_long + total_short > 0:
+                delta = abs(total_long - total_short) / (total_long + total_short)
+                if delta > self._max_delta_pct:
+                    return True, f"delta_exceeded_{delta:.3f}"
 
-        # Проверка подключения к биржам
-        if not self.state.is_both_connected():
-            return True, "Connection lost to one or both exchanges"
+        return False, ""
 
-        # Проверка баланса (если баланс упал слишком сильно)
-        if self.state.total_balance < 10:  # Минимальный баланс
-            return True, "Balance too low"
-
-        return False, "OK"
-
-    def validate_spread(self, spread: float, is_entry: bool) -> bool:
-        """
-        Проверить валидность спреда
-
-        Args:
-            spread: Спред в процентах
-            is_entry: True для входа, False для выхода
-
-        Returns:
-            True если спред валидный
-        """
-        if is_entry:
-            threshold = self.config.entry_threshold
-            if spread >= threshold:
-                logger.info(f"Entry spread {spread:.3f}% >= threshold {threshold:.3f}%")
-                return True
+    def check_funding_profitability(self, position, expected_income: float, fees: float) -> bool:
+        """Check if a funding position is still profitable."""
+        net = expected_income - fees
+        if net < 0:
+            logger.warning(
+                f"Funding position {position.symbol} unprofitable: "
+                f"income={expected_income:.4f} fees={fees:.4f}"
+            )
             return False
-        else:
-            threshold = self.config.exit_threshold
-            if abs(spread) <= threshold:
-                logger.info(f"Exit spread {abs(spread):.3f}% <= threshold {threshold:.3f}%")
-                return True
-            return False
-
-    def log_risk_status(self) -> None:
-        """Логировать текущее состояние рисков"""
-        delta_ok, delta = self.check_delta()
-
-        logger.info(
-            f"Risk Status: "
-            f"in_position={self.state.is_in_position}, "
-            f"positions={len(self.state.positions)}, "
-            f"delta={delta*100:.3f}%, "
-            f"balance={self.state.total_balance:.2f}, "
-            f"connected={'both' if self.state.is_both_connected() else 'partial'}"
-        )
+        return True

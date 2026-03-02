@@ -1,43 +1,49 @@
 """
 Cross-Exchange Perpetual Futures Arbitrage Bot
-OKX <-> HTX
+OKX <-> HTX <-> Bybit
 
-Профессиональный торговый бот для арбитража между фьючерсами OKX и HTX
+Professional multi-strategy arbitrage trading system.
 """
 
-__version__ = "1.0.0"
-__author__ = "Arbitrage Bot Team"
+__version__ = "2.0.0"
 
 from .core import (
     BotState,
+    ActivePosition,
     RiskManager,
-    ExecutionManager,
-    ArbitrageEngine
+    NotificationManager,
+    MarketDataEngine,
 )
 
 from .exchanges import (
-    OKXWebSocket,
     OKXRestClient,
-    HTXWebSocket,
-    HTXRestClient
+    HTXRestClient,
+    BybitRestClient,
 )
 
 from .utils import (
     ArbitrageConfig,
     init_arbitrage_logger,
-    get_arbitrage_logger
+    get_arbitrage_logger,
+)
+
+from .strategies import (
+    StrategyRouter,
+    TradeExecutor,
 )
 
 __all__ = [
     'BotState',
+    'ActivePosition',
     'RiskManager',
-    'ExecutionManager',
-    'ArbitrageEngine',
-    'OKXWebSocket',
+    'NotificationManager',
+    'MarketDataEngine',
     'OKXRestClient',
-    'HTXWebSocket',
     'HTXRestClient',
+    'BybitRestClient',
     'ArbitrageConfig',
     'init_arbitrage_logger',
-    'get_arbitrage_logger'
+    'get_arbitrage_logger',
+    'StrategyRouter',
+    'TradeExecutor',
 ]

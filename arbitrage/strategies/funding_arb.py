@@ -1,207 +1,208 @@
 """
-Стратегия 3: Funding Rate Arbitrage
+Strategy A: Funding Rate Arbitrage
 
-Суть: Зарабатываем на разнице ставок финансирования.
-Логика:
-  - SHORT там, где funding ПОЛОЖИТЕЛЬНЫЙ (лонги платят шортам → нам платят)
-  - LONG там, где funding ОТРИЦАТЕЛЬНЫЙ (шорты платят лонгам → нам платят)
-  - Net profit = short_funding - long_funding (8ч интервал)
+Market-neutral profit from funding rate differences across exchanges.
 
-Формула: Profit = funding_short - funding_long - entry_fees
+Logic:
+- For each symbol, find the exchange pair with the largest funding rate spread
+- LONG on exchange with lowest funding (we receive or pay less)
+- SHORT on exchange with highest funding (we receive more)
+- Hold until accumulated funding profit >= target OR spread collapses
+
+Detection:
+    funding_spread = max_funding - min_funding (across 3 exchanges)
+    if funding_spread > dynamic_threshold → opportunity
+
+Dynamic thresholds:
+    BTC: 0.02%
+    ETH: 0.03%
+    ALT: 0.05%
+
+Exit conditions:
+    1. accumulated_funding >= target_profit
+    2. funding_spread < exit_threshold (spread collapsed)
+    3. Risk engine triggers exit
 """
-import asyncio
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
-from arbitrage.utils import get_arbitrage_logger
-from arbitrage.strategies.base import FundingArbitrageOpportunity, StrategyType
+from arbitrage.utils import get_arbitrage_logger, ArbitrageConfig
+from arbitrage.core.market_data import MarketDataEngine
+from arbitrage.core.state import ActivePosition
+from arbitrage.strategies.base import BaseStrategy, Opportunity, StrategyType
 
 logger = get_arbitrage_logger("funding_arb")
 
-# Типичные комиссии за вход+выход позиции (maker/taker mix)
-ENTRY_FEE_PCT = 0.04   # 0.04% за открытие (2 ноги × 0.02%)
-EXIT_FEE_PCT = 0.04    # 0.04% за закрытие
-TOTAL_ROUND_TRIP_FEE = ENTRY_FEE_PCT + EXIT_FEE_PCT  # 0.08%
-
-# Минимальное количество интервалов для окупаемости комиссий
-MIN_INTERVALS_TO_PROFIT = 2  # позиция должна держаться хотя бы 2 интервала
+# Round-trip fees (open + close, both legs)
+ROUND_TRIP_FEE_PCT = 0.08  # 4 legs × 0.02% maker ≈ 0.08%
 
 
-def okx_inst_id(symbol: str) -> str:
-    """BTCUSDT → BTC-USDT-SWAP"""
-    if symbol.endswith("USDT"):
-        base = symbol[:-4]
-        return f"{base}-USDT-SWAP"
-    return symbol
+class FundingArbStrategy(BaseStrategy):
 
+    def __init__(self, config: ArbitrageConfig, market_data: MarketDataEngine):
+        self.config = config
+        self.market_data = market_data
+        self._btc_thr = config.funding_btc_threshold
+        self._eth_thr = config.funding_eth_threshold
+        self._alt_thr = config.funding_alt_threshold
+        self._target_profit = config.funding_target_profit
+        self._exit_factor = 0.5  # Exit when spread < entry_threshold * factor
 
-class FundingArbitrageMonitor:
-    """
-    Мониторинг Funding Rate арбитража между OKX и HTX.
+    @property
+    def name(self) -> str:
+        return "funding_arb"
 
-    Алгоритм:
-    1. Получаем funding rates со всех торговых пар OKX и HTX
-    2. Для каждой общей пары находим разницу funding rates
-    3. Если разница > threshold → это возможность
+    @property
+    def strategy_type(self) -> StrategyType:
+        return StrategyType.FUNDING_ARB
 
-    Примечание:
-    - OKX: funding rate в поле 'fundingRate' в тикерах SWAP
-      Интервал: каждые 8 часов (00:00, 08:00, 16:00 UTC)
-    - HTX: funding rate в поле 'funding_rate' в /swap-api/v3/swap_batch_funding_rate
-      Интервал: каждые 8 часов (00:00, 08:00, 16:00 UTC)
-    - Ставки указаны как доля (не %). Например 0.0001 = 0.01%
-    """
+    def get_threshold(self, symbol: str) -> float:
+        if symbol.startswith("BTC"):
+            return self._btc_thr
+        elif symbol.startswith("ETH"):
+            return self._eth_thr
+        return self._alt_thr
 
-    def __init__(self, okx_client, htx_client, min_net_funding_pct: float = 0.02):
-        self.okx_client = okx_client
-        self.htx_client = htx_client
-        # Минимальная суммарная ставка за 8ч после вычета комиссий
-        self.min_net_funding_pct = min_net_funding_pct
-
-        # Кэш ставок {symbol: funding_rate_float}  (уже в %)
-        self.okx_funding: Dict[str, float] = {}
-        self.htx_funding: Dict[str, float] = {}
-
-        # Следующее время funding {symbol: timestamp_ms}
-        self.okx_next_funding: Dict[str, int] = {}
-        self.htx_next_funding: Dict[str, int] = {}
-
-    async def update_funding_rates(self) -> Tuple[int, int]:
+    async def detect_opportunities(self, market_data: MarketDataEngine) -> List[Opportunity]:
         """
-        Обновить ставки финансирования с обеих бирж.
-        OKX: тикеры SWAP содержат fundingRate
-        HTX: /swap-api/v3/swap_batch_funding_rate
+        For each symbol present on >= 2 exchanges, find the max funding spread.
         """
-        try:
-            okx_result, htx_result = await asyncio.gather(
-                self.okx_client.get_funding_rates_all(),
-                self.htx_client.get_funding_rates(),
-                return_exceptions=True
-            )
+        opportunities: List[Opportunity] = []
+        exchanges = market_data.get_exchange_names()
 
-            okx_count = 0
-            if not isinstance(okx_result, Exception) and okx_result.get("code") == "0":
-                for t in okx_result.get("data", []):
-                    inst_id = t.get("instId", "")
-                    if "-USDT-SWAP" not in inst_id:
-                        continue
-                    sym = inst_id.replace("-USDT-SWAP", "").replace("-", "") + "USDT"
-                    try:
-                        rate_str = t.get("fundingRate") or t.get("nextFundingRate")
-                        if rate_str is None:
-                            continue
-                        rate = float(rate_str) * 100  # конвертируем в %
-                        self.okx_funding[sym] = rate
-                        next_ts = t.get("nextFundingTime")
-                        if next_ts:
-                            self.okx_next_funding[sym] = int(next_ts)
-                        okx_count += 1
-                    except (ValueError, TypeError):
-                        pass
+        # Collect all symbols with funding data on >= 2 exchanges
+        symbol_rates = {}  # {symbol: [(exchange, rate_pct), ...]}
+        for ex in exchanges:
+            rates = market_data.funding_rates.get(ex, {})
+            for sym, fd in rates.items():
+                symbol_rates.setdefault(sym, []).append((ex, fd.rate_pct))
 
-            # HTX funding: data[] with contract_code, funding_rate (decimal string)
-            htx_count = 0
-            if not isinstance(htx_result, Exception) and htx_result.get("status") == "ok":
-                for t in htx_result.get("data", []):
-                    cc = t.get("contract_code", "")
-                    if not cc.endswith("-USDT"):
-                        continue
-                    sym = cc.replace("-", "")  # BTC-USDT → BTCUSDT
-                    try:
-                        rate_str = t.get("funding_rate")
-                        if rate_str is None:
-                            continue
-                        rate = float(rate_str) * 100  # конвертируем в %
-                        self.htx_funding[sym] = rate
-                        next_ts = t.get("settlement_time")
-                        if next_ts:
-                            self.htx_next_funding[sym] = int(next_ts)
-                        htx_count += 1
-                    except (ValueError, TypeError):
-                        pass
-
-            logger.debug(
-                f"Funding rates updated: OKX={okx_count}, HTX={htx_count}"
-            )
-            return okx_count, htx_count
-
-        except Exception as e:
-            logger.error(f"FundingArbitrage update error: {e}", exc_info=True)
-            return 0, 0
-
-    def calculate_opportunities(self) -> List[FundingArbitrageOpportunity]:
-        """
-        Найти возможности для funding арбитража.
-
-        Логика:
-        - Если okx_funding > htx_funding:
-            SHORT OKX (получаем okx_funding) + LONG HTX (платим htx_funding)
-            net = okx_funding - htx_funding
-        - Если htx_funding > okx_funding:
-            SHORT HTX + LONG OKX
-            net = htx_funding - okx_funding
-        """
-        results: List[FundingArbitrageOpportunity] = []
-
-        common = set(self.okx_funding.keys()) & set(self.htx_funding.keys())
-
-        for sym in common:
-            okx_rate = self.okx_funding[sym]    # %
-            htx_rate = self.htx_funding[sym]    # %
-
-            diff = abs(okx_rate - htx_rate)
-
-            if diff < self.min_net_funding_pct:
+        for sym, rate_list in symbol_rates.items():
+            if len(rate_list) < 2:
                 continue
 
-            if okx_rate > htx_rate:
-                # SHORT OKX (высокий positive funding → лонги платят нам)
-                # LONG HTX (низкий или negative funding)
-                long_ex = "htx"
-                short_ex = "okx"
-                long_rate = htx_rate
-                short_rate = okx_rate
-            else:
-                long_ex = "okx"
-                short_ex = "htx"
-                long_rate = okx_rate
-                short_rate = htx_rate
+            # Find max and min funding rate
+            rate_list.sort(key=lambda x: x[1])
+            min_ex, min_rate = rate_list[0]
+            max_ex, max_rate = rate_list[-1]
 
-            net_8h = short_rate - long_rate
+            funding_spread = max_rate - min_rate
+            threshold = self.get_threshold(sym)
 
-            # Строим описание следующего funding time
-            next_ts = self.htx_next_funding.get(sym) or self.okx_next_funding.get(sym)
-            next_funding_str = None
-            if next_ts:
-                from datetime import datetime, timezone
-                dt = datetime.fromtimestamp(next_ts / 1000, tz=timezone.utc)
-                next_funding_str = dt.strftime("%H:%M UTC")
+            if funding_spread < threshold:
+                continue
 
-            results.append(FundingArbitrageOpportunity(
+            # Net funding per 8h interval = what we earn
+            # SHORT on max_rate exchange (positive funding → shorts receive)
+            # LONG on min_rate exchange (low/negative funding → longs pay less)
+            net_8h = funding_spread  # % per 8h
+
+            # Must cover fees within reasonable time
+            intervals_to_cover_fees = ROUND_TRIP_FEE_PCT / net_8h if net_8h > 0 else 999
+            if intervals_to_cover_fees > 6:  # > 2 days → skip
+                continue
+
+            # Check that both exchanges have futures prices (can actually trade)
+            p_long = market_data.get_futures_price(min_ex, sym)
+            p_short = market_data.get_futures_price(max_ex, sym)
+            if not p_long or not p_short:
+                continue
+
+            annualized = net_8h * 3 * 365  # 3 intervals per day
+
+            opportunities.append(Opportunity(
                 strategy=StrategyType.FUNDING_ARB,
                 symbol=sym,
-                profit_pct=net_8h,
-                long_exchange=long_ex,
-                short_exchange=short_ex,
-                long_funding_rate=long_rate,
-                short_funding_rate=short_rate,
-                net_funding_8h=net_8h,
-                next_funding_time=next_funding_str,
+                long_exchange=min_ex,
+                short_exchange=max_ex,
+                expected_profit_pct=net_8h,
+                long_price=p_long.ask,
+                short_price=p_short.bid,
+                confidence=min(1.0, funding_spread / threshold),
+                metadata={
+                    "long_funding": min_rate,
+                    "short_funding": max_rate,
+                    "funding_spread": funding_spread,
+                    "annualized": annualized,
+                    "intervals_to_profit": intervals_to_cover_fees,
+                },
             ))
 
-        results.sort(key=lambda x: x.profit_pct, reverse=True)
-        return results
+        opportunities.sort(key=lambda o: o.expected_profit_pct, reverse=True)
+        return opportunities
 
-    def get_all_spreads(self) -> List[dict]:
-        """Все фандинг-спреды для отображения в Scan."""
+    async def should_exit(
+        self, position: ActivePosition, market_data: MarketDataEngine
+    ) -> Tuple[bool, str]:
+        """
+        Exit when:
+        1. Accumulated funding profit >= target
+        2. Funding spread collapsed below exit threshold
+        3. Position held > 48h with no profit
+        """
+        sym = position.symbol
+        long_ex = position.long_exchange
+        short_ex = position.short_exchange
+
+        # Check accumulated funding
+        if position.accumulated_funding >= self._target_profit * position.size_usd / 100:
+            return True, "funding_target_reached"
+
+        # Check current funding spread
+        long_fd = market_data.get_funding(long_ex, sym)
+        short_fd = market_data.get_funding(short_ex, sym)
+
+        if long_fd and short_fd:
+            current_spread = short_fd.rate_pct - long_fd.rate_pct
+            threshold = self.get_threshold(sym)
+            exit_thr = threshold * self._exit_factor
+
+            if current_spread < exit_thr:
+                return True, "funding_spread_collapsed"
+
+            # Funding reversed — now we're paying instead of earning
+            if current_spread < 0:
+                return True, "funding_reversed"
+
+        # Timeout: 48h without meeting target
+        if position.duration() > 48 * 3600:
+            return True, "timeout_48h"
+
+        return False, ""
+
+    def estimate_funding_profit(
+        self, position: ActivePosition, market_data: MarketDataEngine
+    ) -> float:
+        """Estimate funding income per 8h for a position (in USDT)."""
+        fd_long = market_data.get_funding(position.long_exchange, position.symbol)
+        fd_short = market_data.get_funding(position.short_exchange, position.symbol)
+        if not fd_long or not fd_short:
+            return 0.0
+        net_rate = fd_short.rate_pct - fd_long.rate_pct
+        return position.size_usd * net_rate / 100
+
+    def get_all_spreads(self, market_data: MarketDataEngine) -> list:
+        """Return all funding spreads for display."""
+        exchanges = market_data.get_exchange_names()
         items = []
-        common = set(self.okx_funding.keys()) & set(self.htx_funding.keys())
-        for sym in common:
-            diff = abs(self.okx_funding[sym] - self.htx_funding[sym])
+        symbol_rates = {}
+        for ex in exchanges:
+            for sym, fd in market_data.funding_rates.get(ex, {}).items():
+                symbol_rates.setdefault(sym, {})[ex] = fd.rate_pct
+
+        for sym, rates in symbol_rates.items():
+            if len(rates) < 2:
+                continue
+            sorted_rates = sorted(rates.items(), key=lambda x: x[1])
+            min_ex, min_rate = sorted_rates[0]
+            max_ex, max_rate = sorted_rates[-1]
+            spread = max_rate - min_rate
             items.append({
                 "symbol": sym,
-                "okx_rate": self.okx_funding[sym],
-                "htx_rate": self.htx_funding[sym],
-                "diff_pct": diff,
+                "funding_spread": spread,
+                "long_exchange": min_ex,
+                "short_exchange": max_ex,
+                "rates": rates,
+                "annualized": spread * 3 * 365,
             })
-        items.sort(key=lambda x: x["diff_pct"], reverse=True)
+        items.sort(key=lambda x: x["funding_spread"], reverse=True)
         return items

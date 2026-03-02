@@ -1,274 +1,215 @@
 """
-Стратегия 4: Basis Arbitrage (Фьючерсы vs Спот)
+Strategy B: Basis Arbitrage (Cash & Carry)
 
-Суть: Игра на разнице цены фьючерса и спота.
-Примеры:
-  Cash & Carry: futures > spot
-    → Покупаем BTC спот + SHORT BTC perpetual
-    → Ждём схождения (фьючерс приближается к споту)
-    → Профит = basis - fees
+Captures futures premium relative to spot price.
 
-  Reverse Cash & Carry: futures < spot
-    → Продаём BTC спот (или шортим) + LONG BTC perpetual
-    → Профит = |basis| - fees
+Detection:
+    basis = (futures_price - spot_price) / spot_price * 100
 
-Формула: Basis = (futures_price - spot_price) / spot_price × 100
+Entry condition:
+    basis > fees + slippage + safety_buffer
+
+Execution:
+    Cash & Carry (basis > 0):
+        - Buy equivalent on low-premium exchange (long leg)
+        - Sell on high-premium exchange (short leg)
+    Reverse (basis < 0):
+        - Opposite direction
+
+Since we use perpetual futures (no expiry), basis profit comes from
+the premium converging, which typically happens within hours/days.
+
+Exit:
+    - basis < close_threshold
+    - timeout
+    - risk trigger
+
+Supported combinations (per symbol):
+    - OKX spot vs OKX futures
+    - HTX spot vs HTX futures
+    - Bybit spot vs Bybit futures
+    - Cross-exchange: OKX spot vs HTX futures, etc.
 """
-import asyncio
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Tuple, Dict
 
-from arbitrage.utils import get_arbitrage_logger
-from arbitrage.strategies.base import BasisArbitrageOpportunity, StrategyType
+from arbitrage.utils import get_arbitrage_logger, ArbitrageConfig
+from arbitrage.core.market_data import MarketDataEngine
+from arbitrage.core.state import ActivePosition
+from arbitrage.strategies.base import BaseStrategy, Opportunity, StrategyType
 
 logger = get_arbitrage_logger("basis_arb")
 
-# Комиссии: спот taker 0.1% + перп taker 0.06% = 0.16% за открытие
-# Итого round-trip ≈ 0.32%
+# Round-trip fees: spot taker 0.1% + perp taker 0.06% ≈ 0.16% per side
 ROUND_TRIP_FEE_PCT = 0.32
-
-# Минимальный базис для входа (после комиссий должно что-то остаться)
-MIN_BASIS_PCT = 0.15
+SAFETY_BUFFER_PCT = 0.05
 
 
-def okx_inst_id(symbol: str) -> str:
-    """BTCUSDT → BTC-USDT-SWAP"""
-    if symbol.endswith("USDT"):
-        return f"{symbol[:-4]}-USDT-SWAP"
-    return symbol
+class BasisArbStrategy(BaseStrategy):
 
+    def __init__(self, config: ArbitrageConfig, market_data: MarketDataEngine):
+        self.config = config
+        self.market_data = market_data
+        self._min_basis = config.min_basis
+        self._close_threshold = config.basis_close_threshold
 
-def okx_spot_id(symbol: str) -> str:
-    """BTCUSDT → BTC-USDT"""
-    if symbol.endswith("USDT"):
-        return f"{symbol[:-4]}-USDT"
-    return symbol
+    @property
+    def name(self) -> str:
+        return "basis_arb"
 
+    @property
+    def strategy_type(self) -> StrategyType:
+        return StrategyType.BASIS_ARB
 
-class BasisArbitrageMonitor:
-    """
-    Мониторинг Basis арбитража.
+    def get_threshold(self, _symbol: str) -> float:
+        return self._min_basis
 
-    Для каждой пары сравниваем:
-    - Спотовую цену (spot_mid = (bid + ask) / 2)
-    - Цену перп-фьючерса (perp_mid)
-    Basis = (perp - spot) / spot * 100
+    async def detect_opportunities(self, market_data: MarketDataEngine) -> List[Opportunity]:
+        """
+        For each symbol, compare spot vs futures across all exchange combinations.
+        Return opportunities where basis > min_threshold.
+        """
+        opportunities: List[Opportunity] = []
+        exchanges = market_data.get_exchange_names()
 
-    Поддерживаемые комбинации:
-    - OKX спот + OKX фьючерс
-    - HTX спот + HTX фьючерс
-    - OKX спот + HTX фьючерс (межбиржевой basis)
-    - HTX спот + OKX фьючерс
-    """
+        for ex in exchanges:
+            for sym in market_data.common_pairs:
+                spot = market_data.get_spot_price(ex, sym)
+                futures = market_data.get_futures_price(ex, sym)
+                if not spot or not futures:
+                    continue
 
-    def __init__(self, okx_client, htx_client, min_basis_pct: float = MIN_BASIS_PCT):
-        self.okx_client = okx_client
-        self.htx_client = htx_client
-        self.min_basis_pct = min_basis_pct
+                opp = self._check_basis(sym, spot, futures.ask, futures.bid, ex, ex)
+                if opp:
+                    opportunities.append(opp)
 
-        # Спотовые цены {symbol: mid_price}
-        self.okx_spot: Dict[str, float] = {}
-        self.htx_spot: Dict[str, float] = {}
+        # Cross-exchange basis: spot on ex1, futures on ex2
+        for i, ex1 in enumerate(exchanges):
+            for ex2 in exchanges[i + 1:]:
+                for sym in market_data.common_pairs:
+                    # ex1 spot vs ex2 futures
+                    spot1 = market_data.get_spot_price(ex1, sym)
+                    fut2 = market_data.get_futures_price(ex2, sym)
+                    if spot1 and fut2:
+                        opp = self._check_basis(sym, spot1, fut2.ask, fut2.bid, ex1, ex2)
+                        if opp:
+                            opportunities.append(opp)
 
-        # Фьючерсные цены {symbol: mid_price}
-        self.okx_perp: Dict[str, float] = {}
-        self.htx_perp: Dict[str, float] = {}
+                    # ex2 spot vs ex1 futures
+                    spot2 = market_data.get_spot_price(ex2, sym)
+                    fut1 = market_data.get_futures_price(ex1, sym)
+                    if spot2 and fut1:
+                        opp = self._check_basis(sym, spot2, fut1.ask, fut1.bid, ex2, ex1)
+                        if opp:
+                            opportunities.append(opp)
 
-        # Общие пары
-        self.common_pairs: Set[str] = set()
+        # Deduplicate: keep best per symbol
+        best: Dict[str, Opportunity] = {}
+        for opp in opportunities:
+            key = f"{opp.symbol}_{opp.long_exchange}_{opp.short_exchange}"
+            if key not in best or opp.expected_profit_pct > best[key].expected_profit_pct:
+                best[key] = opp
 
-    async def initialize(self) -> None:
-        """Инициализация: получение пар"""
-        try:
-            okx_perp_res, htx_perp_res = await asyncio.gather(
-                self.okx_client.get_instruments(inst_type="SWAP"),
-                self.htx_client.get_instruments(),
-                return_exceptions=True
-            )
+        result = sorted(best.values(), key=lambda o: o.expected_profit_pct, reverse=True)
+        return result
 
-            okx_perp_syms: Set[str] = set()
-            if not isinstance(okx_perp_res, Exception) and okx_perp_res.get("code") == "0":
-                for inst in okx_perp_res.get("data", []):
-                    inst_id = inst.get("instId", "")
-                    if "-USDT-SWAP" in inst_id:
-                        sym = inst_id.replace("-USDT-SWAP", "").replace("-", "") + "USDT"
-                        okx_perp_syms.add(sym)
-
-            # HTX instruments: data[] with contract_code like "BTC-USDT"
-            htx_perp_syms: Set[str] = set()
-            if not isinstance(htx_perp_res, Exception) and htx_perp_res.get("status") == "ok":
-                for inst in htx_perp_res.get("data", []):
-                    cc = inst.get("contract_code", "")
-                    if cc.endswith("-USDT"):
-                        sym = cc.replace("-", "")  # BTC-USDT → BTCUSDT
-                        htx_perp_syms.add(sym)
-
-            self.common_pairs = okx_perp_syms & htx_perp_syms
-            logger.info(f"Basis arb: monitoring {len(self.common_pairs)} pairs")
-
-        except Exception as e:
-            logger.error(f"BasisArbitrage init error: {e}", exc_info=True)
-            self.common_pairs = {
-                "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-                "ADAUSDT", "DOGEUSDT", "AVAXUSDT", "DOTUSDT", "MATICUSDT"
-            }
-
-    async def update_prices(self) -> None:
-        """Обновить спот и фьючерсные цены"""
-        try:
-            results = await asyncio.gather(
-                self.okx_client.get_spot_tickers(),
-                self.htx_client.get_spot_tickers(),
-                self.okx_client.get_tickers(inst_type="SWAP"),
-                self.htx_client.get_tickers(),
-                return_exceptions=True
-            )
-            okx_spot_r, htx_spot_r, okx_perp_r, htx_perp_r = results
-
-            # OKX спот
-            if not isinstance(okx_spot_r, Exception) and okx_spot_r.get("code") == "0":
-                for t in okx_spot_r.get("data", []):
-                    inst_id = t.get("instId", "")
-                    if not inst_id.endswith("-USDT"):
-                        continue
-                    sym = inst_id.replace("-", "")
-                    try:
-                        bid = float(t.get("bidPx") or 0)
-                        ask = float(t.get("askPx") or 0)
-                        if bid > 0 and ask > 0:
-                            self.okx_spot[sym] = (bid + ask) / 2
-                    except (ValueError, TypeError):
-                        pass
-
-            # HTX спот: data[] with symbol (lowercase), bid, ask
-            if not isinstance(htx_spot_r, Exception) and htx_spot_r.get("status") == "ok":
-                for t in htx_spot_r.get("data", []):
-                    sym = t.get("symbol", "").upper()  # "btcusdt" → "BTCUSDT"
-                    try:
-                        bid = float(t.get("bid") or 0)
-                        ask = float(t.get("ask") or 0)
-                        if bid > 0 and ask > 0:
-                            self.htx_spot[sym] = (bid + ask) / 2
-                    except (ValueError, TypeError):
-                        pass
-
-            # OKX перп
-            if not isinstance(okx_perp_r, Exception) and okx_perp_r.get("code") == "0":
-                for t in okx_perp_r.get("data", []):
-                    inst_id = t.get("instId", "")
-                    if "-USDT-SWAP" not in inst_id:
-                        continue
-                    sym = inst_id.replace("-USDT-SWAP", "").replace("-", "") + "USDT"
-                    try:
-                        bid = float(t.get("bidPx") or 0)
-                        ask = float(t.get("askPx") or 0)
-                        if bid > 0 and ask > 0:
-                            self.okx_perp[sym] = (bid + ask) / 2
-                    except (ValueError, TypeError):
-                        pass
-
-            # HTX перп: ticks[] with contract_code, bid[0], ask[0]
-            if not isinstance(htx_perp_r, Exception) and htx_perp_r.get("status") == "ok":
-                for t in htx_perp_r.get("ticks", []):
-                    cc = t.get("contract_code", "")
-                    if not cc.endswith("-USDT"):
-                        continue
-                    sym = cc.replace("-", "")  # BTC-USDT → BTCUSDT
-                    try:
-                        bid_data = t.get("bid") or []
-                        ask_data = t.get("ask") or []
-                        bid = float(bid_data[0]) if bid_data else 0.0
-                        ask = float(ask_data[0]) if ask_data else 0.0
-                        if bid > 0 and ask > 0:
-                            self.htx_perp[sym] = (bid + ask) / 2
-                    except (ValueError, TypeError, IndexError):
-                        pass
-
-        except Exception as e:
-            logger.error(f"BasisArbitrage update error: {e}", exc_info=True)
-
-    def _calc_basis(
+    def _check_basis(
         self,
-        sym: str,
-        spot_px: float,
-        perp_px: float,
+        symbol: str,
+        spot_price: float,
+        futures_ask: float,
+        futures_bid: float,
         spot_exchange: str,
         futures_exchange: str,
-    ) -> Optional[BasisArbitrageOpportunity]:
-        if spot_px <= 0 or perp_px <= 0:
+    ) -> Optional[Opportunity]:
+        """Check if basis between spot and futures is profitable."""
+        if spot_price <= 0 or futures_ask <= 0:
             return None
-        basis = (perp_px - spot_px) / spot_px * 100
+
+        # Cash & carry: futures premium
+        basis = (futures_bid - spot_price) / spot_price * 100
         abs_basis = abs(basis)
-        if abs_basis < self.min_basis_pct:
+
+        min_required = ROUND_TRIP_FEE_PCT + SAFETY_BUFFER_PCT
+        if abs_basis < max(self._min_basis, min_required):
             return None
+
+        net_profit = abs_basis - ROUND_TRIP_FEE_PCT
 
         if basis > 0:
-            direction = "cash_and_carry"   # Futures premium → Buy spot, Short futures
+            # Futures premium: buy spot (long), sell futures (short)
+            return Opportunity(
+                strategy=StrategyType.BASIS_ARB,
+                symbol=symbol,
+                long_exchange=spot_exchange,
+                short_exchange=futures_exchange,
+                expected_profit_pct=net_profit,
+                long_price=spot_price,
+                short_price=futures_bid,
+                metadata={
+                    "basis_pct": basis,
+                    "direction": "cash_and_carry",
+                    "spot_exchange": spot_exchange,
+                    "futures_exchange": futures_exchange,
+                },
+            )
         else:
-            direction = "reverse_cash_carry"  # Futures discount → Short spot, Long futures
+            # Futures discount: sell spot (short), buy futures (long)
+            return Opportunity(
+                strategy=StrategyType.BASIS_ARB,
+                symbol=symbol,
+                long_exchange=futures_exchange,
+                short_exchange=spot_exchange,
+                expected_profit_pct=net_profit,
+                long_price=futures_ask,
+                short_price=spot_price,
+                metadata={
+                    "basis_pct": basis,
+                    "direction": "reverse_cash_carry",
+                    "spot_exchange": spot_exchange,
+                    "futures_exchange": futures_exchange,
+                },
+            )
 
-        return BasisArbitrageOpportunity(
-            strategy=StrategyType.BASIS_ARB,
-            symbol=sym,
-            profit_pct=abs_basis,
-            spot_exchange=spot_exchange,
-            futures_exchange=futures_exchange,
-            spot_price=spot_px,
-            futures_price=perp_px,
-            basis_pct=basis,
-            direction=direction,
-        )
-
-    def calculate_opportunities(self) -> List[BasisArbitrageOpportunity]:
+    async def should_exit(
+        self, position: ActivePosition, market_data: MarketDataEngine
+    ) -> Tuple[bool, str]:
         """
-        Найти basis арбитражные возможности во всех комбинациях:
-        - OKX spot + OKX perp
-        - HTX spot + HTX perp
-        - OKX spot + HTX perp
-        - HTX spot + OKX perp
+        Exit when basis converged or timeout.
         """
-        results: List[BasisArbitrageOpportunity] = []
+        sym = position.symbol
+        # Try to reconstruct basis from position metadata
+        spot_ex = position.long_exchange  # In cash_and_carry, long = spot
+        fut_ex = position.short_exchange
 
-        # Получаем все символы со спотовыми ценами
-        all_syms = set(self.okx_spot) | set(self.htx_spot)
+        spot = market_data.get_spot_price(spot_ex, sym)
+        fut = market_data.get_futures_price(fut_ex, sym)
 
-        for sym in all_syms:
-            combinations = [
-                (self.okx_spot.get(sym, 0), self.okx_perp.get(sym, 0), "okx", "okx"),
-                (self.htx_spot.get(sym, 0), self.htx_perp.get(sym, 0), "htx", "htx"),
-                (self.okx_spot.get(sym, 0), self.htx_perp.get(sym, 0), "okx", "htx"),
-                (self.htx_spot.get(sym, 0), self.okx_perp.get(sym, 0), "htx", "okx"),
-            ]
-            for spot_px, perp_px, spot_ex, perp_ex in combinations:
-                opp = self._calc_basis(sym, spot_px, perp_px, spot_ex, perp_ex)
-                if opp:
-                    results.append(opp)
+        if spot and fut:
+            current_basis = abs((fut.bid - spot) / spot * 100)
+            if current_basis <= self._close_threshold:
+                return True, "basis_converged"
 
-        # Убираем дубли: для каждого символа оставляем наибольший basis
-        best: Dict[str, BasisArbitrageOpportunity] = {}
-        for o in results:
-            key = f"{o.symbol}_{o.spot_exchange}_{o.futures_exchange}"
-            if key not in best or o.profit_pct > best[key].profit_pct:
-                best[key] = o
+        # Timeout: 24h
+        if position.duration() > 24 * 3600:
+            return True, "timeout_24h"
 
-        final = sorted(best.values(), key=lambda x: x.profit_pct, reverse=True)
-        return final
+        return False, ""
 
-    def get_all_spreads(self) -> List[dict]:
-        """Все basis значения для Scan."""
+    def get_all_spreads(self, market_data: MarketDataEngine) -> list:
+        """All basis values for display."""
         items = []
-        all_syms = set(self.okx_spot) | set(self.htx_spot)
-        for sym in all_syms:
-            for spot_px, perp_px, spot_ex, perp_ex in [
-                (self.okx_spot.get(sym, 0), self.okx_perp.get(sym, 0), "okx", "okx"),
-                (self.htx_spot.get(sym, 0), self.htx_perp.get(sym, 0), "htx", "htx"),
-            ]:
-                if spot_px > 0 and perp_px > 0:
-                    basis = (perp_px - spot_px) / spot_px * 100
+        for ex in market_data.get_exchange_names():
+            for sym in market_data.common_pairs:
+                spot = market_data.get_spot_price(ex, sym)
+                fut = market_data.get_futures_price(ex, sym)
+                if spot and fut and spot > 0:
+                    basis = (fut.last - spot) / spot * 100
                     items.append({
                         "symbol": sym,
                         "basis_pct": basis,
-                        "spot_exchange": spot_ex,
-                        "futures_exchange": perp_ex,
+                        "exchange": ex,
+                        "spot_price": spot,
+                        "futures_price": fut.last,
                     })
         items.sort(key=lambda x: abs(x["basis_pct"]), reverse=True)
         return items

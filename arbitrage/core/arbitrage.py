@@ -175,16 +175,6 @@ class ArbitrageEngine:
                 f"SHORT {opportunity.short_exchange} @ {opportunity.short_price}"
             )
 
-            # Отправка уведомления о найденной возможности
-            await self.notifications.notify_opportunity_found(
-                spread=opportunity.spread,
-                long_exchange=opportunity.long_exchange,
-                short_exchange=opportunity.short_exchange,
-                long_price=opportunity.long_price,
-                short_price=opportunity.short_price,
-                size=opportunity.size
-            )
-
             # Проверка рисков
             can_enter, reason = self.risk.can_enter_position(
                 opportunity.size,
@@ -292,12 +282,13 @@ class ArbitrageEngine:
                         self.state.update_balance("okx", balance)
                         break
 
-            # HTX баланс
+            # HTX баланс (unified_account_info: code=200)
+            # withdraw_available = реально доступная маржа
             htx_balance_data = await self.htx_client.get_balance()
-            if htx_balance_data.get("status") == "ok" and htx_balance_data.get("data"):
+            if htx_balance_data.get("code") == 200 and htx_balance_data.get("data"):
                 for item in htx_balance_data["data"]:
                     if item.get("margin_asset") == "USDT":
-                        balance = float(item.get("margin_available", 0))
+                        balance = float(item.get("withdraw_available", 0))
                         self.state.update_balance("htx", balance)
                         break
 

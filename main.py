@@ -8,11 +8,12 @@ from aiogram.filters import Command
 from config import BOT_TOKEN
 from database import init_db
 from scheduler import scheduler_loop
-from states import DateForm, InlineThresholdForm, ArbSettingsForm
+from states import DateForm, InlineThresholdForm
 from api import close_session
 
 # Импорт обработчиков
-from handlers import basic, settings, thresholds, stats_handlers, arbitrage_handlers
+from handlers import basic, settings, thresholds, stats_handlers
+from handlers import arbitrage_handlers_simple as arbitrage_handlers
 
 # Настройка логирования
 logging.basicConfig(
@@ -85,31 +86,23 @@ def register_handlers():
     dp.callback_query.register(stats_handlers.cb_stats_period, lambda c: c.data.startswith("stats_curr:"))
     dp.callback_query.register(stats_handlers.cb_show_graph, lambda c: c.data.startswith("stats_period:"))
 
-    # Арбитраж (только мониторинг)
-    dp.message.register(arbitrage_handlers.handle_arbitrage_menu, lambda m: m.text == "🤖 Арбитраж OKX/Bybit")
+    # Арбитраж (multi-strategy)
+    dp.message.register(arbitrage_handlers.handle_arbitrage_menu, lambda m: m.text == "⚡ Арбитраж")
+
+    # Действия арбитража
     dp.callback_query.register(arbitrage_handlers.cb_arb_multi_start, lambda c: c.data == "arb_multi_start")
     dp.callback_query.register(arbitrage_handlers.cb_arb_multi_stop, lambda c: c.data == "arb_multi_stop")
     dp.callback_query.register(arbitrage_handlers.cb_arb_scan_now, lambda c: c.data == "arb_scan_now")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_stats, lambda c: c.data == "arb_stats")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_pair_stats, lambda c: c.data == "arb_pair_stats")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_history, lambda c: c.data == "arb_history")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_funding, lambda c: c.data == "arb_funding")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_basis, lambda c: c.data == "arb_basis")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_stat_arb, lambda c: c.data == "arb_stat_arb")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_emergency_close, lambda c: c.data == "arb_emergency_close")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_emergency_confirm, lambda c: c.data == "arb_emergency_confirm")
     dp.callback_query.register(arbitrage_handlers.cb_arb_settings, lambda c: c.data == "arb_settings")
-    dp.callback_query.register(arbitrage_handlers.cb_back_main, lambda c: c.data == "back_main")
-
-    # Стратегии (5 стратегий)
-    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_menu, lambda c: c.data == "arb_strategies_menu")
-    dp.callback_query.register(arbitrage_handlers.cb_arb_toggle_strategy, lambda c: c.data.startswith("arb_toggle_strategy:"))
-    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_start, lambda c: c.data == "arb_strategies_start")
-    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_stop, lambda c: c.data == "arb_strategies_stop")
-    dp.callback_query.register(arbitrage_handlers.cb_arb_strategies_scan, lambda c: c.data == "arb_strategies_scan")
-
-    # Настройки арбитража (редактирование параметров)
-    dp.callback_query.register(arbitrage_handlers.cb_arb_edit, lambda c: c.data.startswith("arb_edit:"))
-    dp.callback_query.register(arbitrage_handlers.cb_arb_cancel_edit, lambda c: c.data == "arb_cancel_edit")
-    dp.callback_query.register(arbitrage_handlers.cb_arb_reset_settings, lambda c: c.data == "arb_reset_settings")
-    dp.callback_query.register(arbitrage_handlers.cb_arb_back_menu, lambda c: c.data == "arb_back_menu")
-
-    # FSM для ввода значений настроек арбитража
-    dp.message.register(arbitrage_handlers.fsm_arb_entering_spread, ArbSettingsForm.entering_spread)
-    dp.message.register(arbitrage_handlers.fsm_arb_entering_lifetime, ArbSettingsForm.entering_lifetime)
-    dp.message.register(arbitrage_handlers.fsm_arb_entering_interval, ArbSettingsForm.entering_interval)
+    dp.callback_query.register(arbitrage_handlers.cb_arb_menu, lambda c: c.data == "arb_menu")
 
 
 async def shutdown(signal_name: str = None):
@@ -128,6 +121,38 @@ async def shutdown(signal_name: str = None):
             await scheduler_task
         except asyncio.CancelledError:
             logger.info("Scheduler task cancelled")
+
+    # Закрытие арбитражных сессий
+    try:
+        from handlers import arbitrage_handlers_simple as arb
+        if arb._router:
+            arb._router.stop()
+        if arb._state:
+            arb._state.is_running = False
+        if arb._router_task and not arb._router_task.done():
+            arb._router_task.cancel()
+            try:
+                await arb._router_task
+            except asyncio.CancelledError:
+                pass
+        for client in arb._exchanges.values():
+            if client and hasattr(client, 'close'):
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+            elif client and hasattr(client, 'session') and client.session:
+                try:
+                    await client.session.close()
+                except Exception:
+                    pass
+        arb._router_task = None
+        arb._router = None
+        arb._state = None
+        arb._exchanges = {}
+        logger.info("Arbitrage sessions closed")
+    except Exception as e:
+        logger.debug(f"Arbitrage cleanup: {e}")
 
     # Закрытие HTTP-сессии
     await close_session()

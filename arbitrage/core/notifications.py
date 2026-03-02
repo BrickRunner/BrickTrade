@@ -95,17 +95,16 @@ class NotificationManager:
         size: float,
         long_price: float,
         short_price: float,
-        spread: float
+        spread: float,
+        symbol: str = ""
     ):
         """Уведомление об открытии позиции"""
+        symbol_text = f"\n💱 Пара: <b>{symbol}</b>" if symbol else ""
         message = (
-            f"✅ <b>Позиция открыта!</b>\n\n"
-            f"📈 LONG {long_exchange.upper()}\n"
-            f"   Цена входа: ${long_price:,.2f}\n"
-            f"   Размер: {size}\n\n"
-            f"📉 SHORT {short_exchange.upper()}\n"
-            f"   Цена входа: ${short_price:,.2f}\n"
-            f"   Размер: {size}\n\n"
+            f"✅ <b>Сделка открыта!</b>{symbol_text}\n\n"
+            f"📈 LONG {long_exchange.upper()} @ ${long_price:,.4f}\n"
+            f"📉 SHORT {short_exchange.upper()} @ ${short_price:,.4f}\n\n"
+            f"💼 Объём: ${size:,.2f}\n"
             f"📊 Спред: {spread:.3f}%\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
         )
@@ -117,9 +116,12 @@ class NotificationManager:
         long_exchange: str,
         short_exchange: str,
         size: float,
-        duration_seconds: Optional[float] = None
+        duration_seconds: Optional[float] = None,
+        symbol: str = "",
+        entry_spread: Optional[float] = None,
+        exit_spread: Optional[float] = None
     ):
-        """Уведомление о закрытии позиции"""
+        """Уведомление о закрытии сделки с PnL"""
         pnl_emoji = "🟢" if pnl > 0 else "🔴" if pnl < 0 else "⚪"
         pnl_sign = "+" if pnl > 0 else ""
 
@@ -131,12 +133,18 @@ class NotificationManager:
                 minutes = duration_seconds / 60
                 duration_text = f"\n⏱ Длительность: {minutes:.1f}м"
 
+        spread_text = ""
+        if entry_spread is not None and exit_spread is not None:
+            spread_text = f"\n📊 Спред: {entry_spread:.3f}% → {exit_spread:.3f}%"
+
+        symbol_text = f"\n💱 Пара: <b>{symbol}</b>" if symbol else ""
+
         message = (
-            f"{pnl_emoji} <b>Позиция закрыта!</b>\n\n"
-            f"💰 PnL: <b>{pnl_sign}{pnl:.2f} USDT</b>\n\n"
+            f"{pnl_emoji} <b>Сделка закрыта!</b>{symbol_text}\n\n"
+            f"💰 PnL: <b>{pnl_sign}{pnl:.4f} USDT</b>\n\n"
             f"📈 LONG {long_exchange.upper()}\n"
             f"📉 SHORT {short_exchange.upper()}\n"
-            f"💼 Размер: {size} BTC{duration_text}\n"
+            f"💼 Объём: ${size:,.2f}{spread_text}{duration_text}\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S')}"
         )
         await self.send(message)

@@ -86,13 +86,11 @@ class OKXWebSocket:
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("OKX WebSocket connection closed")
                 if self.running:
-                    logger.info("Reconnecting in 3 seconds...")
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"OKX WebSocket error: {e}", exc_info=True)
+                logger.error(f"OKX WebSocket error: {e}")
                 if self.running:
-                    logger.info("Reconnecting in 5 seconds...")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(2)
             finally:
                 self.ws = None
 

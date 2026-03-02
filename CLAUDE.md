@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 This is a dual-purpose Telegram bot written in Python using aiogram 3.0:
 
 1. **Exchange Rate Bot**: Tracks currency exchange rates from the Central Bank of Russia with notifications, thresholds, and statistics
-2. **Arbitrage Bot**: Professional cross-exchange perpetual futures arbitrage trading bot for OKX ↔️ Bybit
+2. **Arbitrage Bot**: Professional cross-exchange perpetual futures arbitrage trading bot for OKX ↔️ HTX
 
 ## Development Commands
 
@@ -53,8 +53,8 @@ python test_multi_pair.py
 # Test OKX API (requires OKX keys if not in mock mode)
 python test_okx_api.py
 
-# Test Bybit public API (NO personal keys required)
-python test_bybit_public_api.py
+# Test HTX public API (NO personal keys required)
+python test_htx_api.py
 
 # Test both exchanges (mode-dependent)
 python test_both_exchanges.py
@@ -89,19 +89,19 @@ The arbitrage bot is a complex trading system with the following architecture:
   - WebSocket connection status for both exchanges
   - Orderbook data (bids/asks) with thread-safe updates
   - Open positions across exchanges
-  - Balance tracking (OKX, Bybit, total)
+  - Balance tracking (OKX, HTX, total)
   - Trade statistics and PnL
 
 - **ArbitrageEngine** (`arbitrage.py`): Main trading logic:
   - Continuously monitors orderbook spreads
-  - Calculates two directional spreads: `spread1 = (bybit_bid - okx_ask) / okx_ask * 100` and `spread2 = (okx_bid - bybit_ask) / bybit_ask * 100`
+  - Calculates two directional spreads: `spread1 = (htx_bid - okx_ask) / okx_ask * 100` and `spread2 = (okx_bid - htx_ask) / htx_ask * 100`
   - Entry logic: Opens positions when spread >= entry_threshold
   - Exit logic: Closes positions when spread <= exit_threshold
   - Integrates with RiskManager and ExecutionManager
 
 - **RiskManager** (`risk.py`): Risk controls:
   - Position size validation based on balance
-  - Delta monitoring (ensures `abs(okx_pos + bybit_pos)` stays within limits)
+  - Delta monitoring (ensures `abs(okx_pos + htx_pos)` stays within limits)
   - Max risk per trade enforcement
   - Balance checks before trading
 
@@ -121,13 +121,13 @@ The arbitrage bot is a complex trading system with the following architecture:
 
 #### Exchange Integration (`arbitrage/exchanges/`)
 
-- **WebSocket Clients** (`okx_ws.py`, `bybit_ws.py`):
+- **WebSocket Clients** (`okx_ws.py`, `htx_ws.py`):
   - Real-time orderbook streaming
   - Auto-reconnect on disconnection
   - Heartbeat/ping-pong management
   - Callback-based orderbook updates
 
-- **REST Clients** (`okx_rest.py`, `bybit_rest.py`):
+- **REST Clients** (`okx_rest.py`, `htx_rest.py`):
   - Order placement and cancellation
   - Position and balance queries
   - Exchange-specific authentication (HMAC signatures)

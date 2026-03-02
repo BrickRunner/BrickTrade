@@ -31,22 +31,31 @@ class ArbitrageConfig:
     htx_api_key: str = ""
     htx_api_secret: str = ""
 
+    # Bybit настройки (опциональные — публичные API для мониторинга)
+    bybit_api_key: str = ""
+    bybit_api_secret: str = ""
+
     # Опциональные параметры
     okx_testnet: bool = False
     htx_testnet: bool = False
+    bybit_testnet: bool = False
 
     # Торговые параметры
     symbol: str = "BTCUSDT"
     position_size: float = 0.01
-    leverage: int = 3
+    leverage: int = 1  # 1 = без плеча
 
     # Пороги входа/выхода
-    entry_threshold: float = 0.25  # % спред для входа
-    exit_threshold: float = 0.05   # % спред для выхода
+    entry_threshold: float = 0.5   # % спред для входа
+    exit_threshold: float = 0.1    # % спред для выхода
 
     # Риск-менеджмент
-    max_risk_per_trade: float = 0.01  # 1% депозита
-    max_delta_percent: float = 0.001  # 0.1% баланса
+    max_position_pct: float = 0.30   # 30% депозита на сделку
+    max_risk_per_trade: float = 0.30  # 30% депозита
+    max_delta_percent: float = 0.01   # 1% баланса
+
+    # Кулдаун пары после сделки (секунды)
+    pair_cooldown_seconds: int = 300  # 5 минут
 
     # Исполнение ордеров
     order_timeout_ms: int = 200  # Таймаут на исполнение ордера
@@ -66,19 +75,19 @@ class ArbitrageConfig:
     # 1. monitoring_only = true: Только мониторинг через публичные API (БЕЗ торговли, БЕЗ личных ключей)
     # 2. monitoring_only = false + mock_mode = true: Mock режим для разработки
     # 3. monitoring_only = false + dry_run_mode = true: Реальные данные, но без ордеров
-    monitoring_only: bool = True  # По умолчанию только мониторинг!
+    monitoring_only: bool = False  # Полный режим с реальными API
 
-    # Mock режим (безопасный режим без реальных денег)
-    mock_mode: bool = True  # По умолчанию TRUE для безопасности!
+    # Mock режим
+    mock_mode: bool = False  # Реальные API
 
-    # DRY RUN режим (реальные API, но БЕЗ совершения сделок)
-    # true = использует реальные биржи для данных, но НЕ размещает ордера
-    # false = размещает реальные ордера (ОПАСНО!)
-    dry_run_mode: bool = True  # По умолчанию TRUE для безопасности!
+    # DRY RUN режим
+    # true = реальные данные, но НЕ размещает ордера
+    # false = РЕАЛЬНАЯ ТОРГОВЛЯ
+    dry_run_mode: bool = False  # Реальная торговля
 
     # Multi-Pair настройки
     min_opportunity_lifetime: int = 3  # Минимальное время жизни возможности (сек)
-    update_interval: int = 1  # Интервал обновления цен (сек)
+    update_interval: float = 0.5  # Интервал обновления цен (сек)
     min_spread: float = 0.05  # Минимальный интересный спред (%)
     spread_change_threshold: float = 0.3  # Порог для уведомления об изменении (%)
     renotify_interval: int = 60  # Повторное уведомление если возможность держится N сек
@@ -88,15 +97,29 @@ class ArbitrageConfig:
 
     # Стратегия: Funding Rate Arbitrage
     min_funding_diff: float = 0.02  # Минимальная разница ставок финансирования (%)
+    funding_btc_threshold: float = 0.02  # BTC funding threshold (%)
+    funding_eth_threshold: float = 0.03  # ETH funding threshold (%)
+    funding_alt_threshold: float = 0.05  # ALT funding threshold (%)
+    funding_target_profit: float = 0.10  # Target profit to exit (%)
 
     # Стратегия: Basis Arbitrage
     min_basis: float = 0.15         # Минимальный базис спот vs фьючерс (%)
+    basis_close_threshold: float = 0.05  # Close when basis < this (%)
+
+    # Стратегия: Statistical Arbitrage
+    stat_arb_z_entry: float = 2.5   # Z-score entry threshold
+    stat_arb_z_exit: float = 0.5    # Z-score exit threshold
+    stat_arb_window: int = 500      # Rolling window size (samples)
 
     # Стратегия: Triangular Arbitrage
     min_triangular_profit: float = 0.05  # Минимальная чистая прибыль треугольника (%)
 
-    # Включённые стратегии (через запятую в .env): spot,futures,funding,basis,triangular
-    enabled_strategies: str = "futures,funding,basis"
+    # Включённые стратегии (через запятую в .env): funding,basis,stat_arb
+    enabled_strategies: str = "funding,basis,stat_arb"
+
+    # Position limits
+    max_concurrent_positions: int = 3
+    emergency_margin_ratio: float = 0.1  # Close all if margin ratio < this
 
     @classmethod
     def from_env(cls) -> "ArbitrageConfig":
@@ -113,18 +136,25 @@ class ArbitrageConfig:
             htx_api_secret=os.getenv("HTX_SECRET", ""),
             htx_testnet=os.getenv("HTX_TESTNET", "false").lower() == "true",
 
+            # Bybit
+            bybit_api_key=os.getenv("BYBIT_API_KEY", ""),
+            bybit_api_secret=os.getenv("BYBIT_SECRET", ""),
+            bybit_testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
+
             # Торговые параметры
             symbol=os.getenv("SYMBOL", "BTCUSDT"),
             position_size=float(os.getenv("POSITION_SIZE", "0.01")),
-            leverage=int(os.getenv("LEVERAGE", "3")),
+            leverage=int(os.getenv("LEVERAGE", "1")),
 
             # Пороги
-            entry_threshold=float(os.getenv("ENTRY_THRESHOLD", "0.25")),
-            exit_threshold=float(os.getenv("EXIT_THRESHOLD", "0.05")),
+            entry_threshold=float(os.getenv("ENTRY_THRESHOLD", "0.5")),
+            exit_threshold=float(os.getenv("EXIT_THRESHOLD", "0.1")),
 
             # Риск
-            max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", "0.01")),
-            max_delta_percent=float(os.getenv("MAX_DELTA_PERCENT", "0.001")),
+            max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.30")),
+            max_risk_per_trade=float(os.getenv("MAX_RISK_PER_TRADE", "0.30")),
+            max_delta_percent=float(os.getenv("MAX_DELTA_PERCENT", "0.01")),
+            pair_cooldown_seconds=int(os.getenv("PAIR_COOLDOWN", "300")),
 
             # Исполнение
             order_timeout_ms=int(os.getenv("ORDER_TIMEOUT_MS", "200")),
@@ -140,18 +170,18 @@ class ArbitrageConfig:
             # Debug
             debug_mode=os.getenv("ARB_DEBUG_MODE", "false").lower() == "true",
 
-            # Monitoring only mode (по умолчанию TRUE - только мониторинг!)
-            monitoring_only=os.getenv("ARB_MONITORING_ONLY", "true").lower() == "true",
+            # Monitoring only mode
+            monitoring_only=os.getenv("ARB_MONITORING_ONLY", "false").lower() == "true",
 
-            # Mock mode (по умолчанию TRUE для безопасности!)
-            mock_mode=os.getenv("ARB_MOCK_MODE", "true").lower() == "true",
+            # Mock mode
+            mock_mode=os.getenv("ARB_MOCK_MODE", "false").lower() == "true",
 
-            # DRY RUN mode (реальные API, но без сделок)
-            dry_run_mode=os.getenv("ARB_DRY_RUN_MODE", "true").lower() == "true",
+            # DRY RUN mode
+            dry_run_mode=os.getenv("ARB_DRY_RUN_MODE", "false").lower() == "true",
 
             # Multi-Pair настройки
             min_opportunity_lifetime=int(os.getenv("MIN_OPPORTUNITY_LIFETIME", "3")),
-            update_interval=int(os.getenv("UPDATE_INTERVAL", "1")),
+            update_interval=float(os.getenv("UPDATE_INTERVAL", "0.5")),
             min_spread=float(os.getenv("MIN_SPREAD", "0.05")),
             spread_change_threshold=float(os.getenv("SPREAD_CHANGE_THRESHOLD", "0.3")),
             renotify_interval=int(os.getenv("RENOTIFY_INTERVAL", "60")),
@@ -159,9 +189,19 @@ class ArbitrageConfig:
             # Стратегии
             min_spot_profit=float(os.getenv("MIN_SPOT_PROFIT", "0.1")),
             min_funding_diff=float(os.getenv("MIN_FUNDING_DIFF", "0.02")),
+            funding_btc_threshold=float(os.getenv("FUNDING_BTC_THRESHOLD", "0.02")),
+            funding_eth_threshold=float(os.getenv("FUNDING_ETH_THRESHOLD", "0.03")),
+            funding_alt_threshold=float(os.getenv("FUNDING_ALT_THRESHOLD", "0.05")),
+            funding_target_profit=float(os.getenv("FUNDING_TARGET_PROFIT", "0.10")),
             min_basis=float(os.getenv("MIN_BASIS", "0.15")),
+            basis_close_threshold=float(os.getenv("BASIS_CLOSE_THRESHOLD", "0.05")),
+            stat_arb_z_entry=float(os.getenv("STAT_ARB_Z_ENTRY", "2.5")),
+            stat_arb_z_exit=float(os.getenv("STAT_ARB_Z_EXIT", "0.5")),
+            stat_arb_window=int(os.getenv("STAT_ARB_WINDOW", "500")),
             min_triangular_profit=float(os.getenv("MIN_TRIANGULAR_PROFIT", "0.05")),
-            enabled_strategies=os.getenv("ENABLED_STRATEGIES", "futures,funding,basis"),
+            enabled_strategies=os.getenv("ENABLED_STRATEGIES", "funding,basis,stat_arb"),
+            max_concurrent_positions=int(os.getenv("MAX_CONCURRENT_POSITIONS", "3")),
+            emergency_margin_ratio=float(os.getenv("EMERGENCY_MARGIN_RATIO", "0.1")),
         )
 
     def get_okx_config(self) -> ExchangeConfig:
@@ -181,26 +221,29 @@ class ArbitrageConfig:
             testnet=self.htx_testnet
         )
 
+    def get_bybit_config(self) -> ExchangeConfig:
+        """Получить конфигурацию Bybit"""
+        return ExchangeConfig(
+            api_key=self.bybit_api_key,
+            api_secret=self.bybit_api_secret,
+            testnet=self.bybit_testnet
+        )
+
     def validate(self) -> bool:
         """Проверить валидность конфигурации"""
+        import logging
+        _logger = logging.getLogger(__name__)
         errors = []
 
-        # В режиме monitoring_only требуются только OKX ключи
-        if self.monitoring_only:
-            # OKX ключи нужны для получения данных
-            if not self.okx_api_key or not self.okx_api_secret or not self.okx_passphrase:
-                errors.append("OKX credentials required in monitoring mode (set in .env)")
-            # HTX ключи НЕ нужны в monitoring режиме - используется только публичное API
-        # В mock/debug режиме API ключи не требуются
-        elif not self.debug_mode and not self.mock_mode:
-            # В режиме реальной торговли или dry_run нужны API ключи
-            if not self.dry_run_mode:
-                # Реальная торговля - нужны полные ключи
-                if not self.okx_api_key or not self.okx_api_secret or not self.okx_passphrase:
-                    errors.append("OKX credentials are missing (set ARB_MONITORING_ONLY=true or ARB_DRY_RUN_MODE=true)")
+        # OKX ключи нужны всегда (для данных и торговли)
+        if not self.okx_api_key or not self.okx_api_secret or not self.okx_passphrase:
+            errors.append("OKX credentials required (set in .env)")
 
-                if not self.htx_api_key or not self.htx_api_secret:
-                    errors.append("HTX credentials are missing (set ARB_MONITORING_ONLY=true or ARB_DRY_RUN_MODE=true)")
+        # HTX ключи нужны только для реальной торговли
+        if not self.dry_run_mode and not self.monitoring_only and not self.mock_mode:
+            if not self.htx_api_key or not self.htx_api_secret:
+                _logger.warning("HTX API keys not configured - trading disabled, only monitoring")
+                # НЕ добавляем в errors - бот запустится в режиме мониторинга
 
         if self.position_size <= 0:
             errors.append("Position size must be positive")
