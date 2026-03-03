@@ -18,8 +18,8 @@ class ActivePosition:
     symbol: str
     long_exchange: str
     short_exchange: str
-    long_contracts: int
-    short_contracts: int
+    long_contracts: float
+    short_contracts: float
     long_price: float
     short_price: float
     entry_spread: float

@@ -199,6 +199,17 @@ class OKXRestClient:
         """Получить открытые позиции"""
         return await self._request("GET", "/api/v5/account/positions", {"instType": inst_type})
 
+    async def get_cross_position(self, symbol: str) -> Dict[str, Any]:
+        """Получить позицию по конкретному символу (cross margin)"""
+        if symbol.endswith("USDT"):
+            base = symbol[:-4]
+            inst_id = f"{base}-USDT-SWAP"
+        else:
+            inst_id = f"{symbol}-SWAP"
+        return await self._request(
+            "GET", "/api/v5/account/positions", {"instId": inst_id}
+        )
+
     async def set_leverage(self, symbol: str, leverage: int, margin_mode: str = "cross") -> Dict[str, Any]:
         """Установить кредитное плечо"""
         # Форматирование символа для OKX

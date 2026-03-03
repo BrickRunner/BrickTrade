@@ -64,7 +64,7 @@ class TradeExecutor:
         avg_price = (opp.long_price + opp.short_price) / 2
         first_contracts = self._calculate_contracts(first_ex, symbol, per_side_usd, avg_price)
         second_contracts = self._calculate_contracts(second_ex, symbol, per_side_usd, avg_price)
-        if first_contracts < 1 or second_contracts < 1:
+        if first_contracts <= 0 or second_contracts <= 0:
             return False
 
         await asyncio.gather(
@@ -84,7 +84,9 @@ class TradeExecutor:
                 self._get_order_type(first_ex), offset="open", leverage=leverage
             )
             if not self._check_result(first_ex, first_result):
-                logger.warning(f"First leg ({first_ex}) failed for {symbol}")
+                logger.warning(
+                    f"First leg ({first_ex}) failed for {symbol}: {first_result}"
+                )
                 return False
 
             await asyncio.sleep(0.5)
@@ -92,7 +94,7 @@ class TradeExecutor:
             if first_actual == 0:
                 logger.warning(f"{first_ex.upper()} no position for {symbol}")
                 return False
-            first_contracts = int(first_actual)
+            first_contracts = self._normalize_size(first_ex, first_actual)
 
             # Step 2: Second leg
             if second_ex == "okx":
@@ -113,6 +115,10 @@ class TradeExecutor:
                 )
 
             second_ok = self._check_result(second_ex, second_result)
+            if not second_ok:
+                logger.warning(
+                    f"Second leg ({second_ex}) order rejected for {symbol}: {second_result}"
+                )
             second_fill = 0.0
             if second_ok:
                 await asyncio.sleep(0.5)
@@ -120,7 +126,7 @@ class TradeExecutor:
                 if second_actual == 0:
                     second_ok = False
                 else:
-                    second_contracts = int(second_actual)
+                    second_contracts = self._normalize_size(second_ex, second_actual)
 
             if second_ok:
                 if first_ex == long_ex:
@@ -250,19 +256,60 @@ class TradeExecutor:
         long_bal = state.get_balance(long_ex)
         short_bal = state.get_balance(short_ex)
         pct = self.config.max_position_pct
-        long_side = max(4.0, long_bal * pct)
-        short_side = max(4.0, short_bal * pct)
+        
+        # Bybit requires minimum $5.4 per side, other exchanges can be smaller
+        long_min = 5.4 if long_ex == "bybit" else 0.0
+        short_min = 5.4 if short_ex == "bybit" else 0.0
+        
+        long_side = max(long_min, long_bal * pct)
+        short_side = max(short_min, short_bal * pct)
         if long_side > long_bal or short_side > short_bal:
             return 0.0
         return min(long_side, short_side)
 
     def _calculate_contracts(
         self, exchange: str, symbol: str, usd: float, price: float
-    ) -> int:
+    ) -> float:
+        """Calculate position size. Returns contract count (OKX/HTX) or qty in base (Bybit)."""
         ct = self._contract_sizes.get(exchange, {}).get(symbol, 1.0)
         if price <= 0 or ct <= 0:
             return 0
-        return max(1, int(usd / (price * ct)))
+        if exchange == "bybit":
+            # Bybit: qty is in base currency; ct = qtyStep (min increment)
+            raw_qty = usd / price
+
+            # Guardrail: Bybit min order value is 5 USDT (per log retCode=110094).
+            # Add a small buffer for rounding down and fees.
+            min_notional = 5.0
+            buffer = 0.15  # USDT
+            if usd < (min_notional + buffer):
+                # returning 0 will cause execute_entry() to skip this opportunity
+                return 0
+
+            # Round DOWN to qtyStep so we don't exceed risk sizing
+            steps = int(raw_qty / ct)
+            qty = steps * ct
+            if qty <= 0:
+                return 0
+
+            # Ensure notional after rounding still meets min_notional
+            if qty * price < min_notional:
+                # Try rounding UP by one step if it still fits our USD budget (+buffer).
+                up_qty = (steps + 1) * ct
+                if up_qty * price <= usd + buffer and up_qty * price >= min_notional:
+                    return up_qty
+                return 0
+
+            return qty
+        else:
+            # OKX/HTX: integer contract count
+            return max(1, int(usd / (price * ct)))
+
+    def _normalize_size(self, exchange: str, raw_size: float) -> float:
+        """Normalize verified position size to usable format."""
+        if exchange == "bybit":
+            return raw_size  # already in base currency
+        return int(raw_size)  # OKX/HTX: integer contracts
 
     @staticmethod
     def _get_order_type(exchange: str) -> str:
@@ -316,6 +363,10 @@ class TradeExecutor:
                 symbol, side, contracts, order_type, offset=offset, lever_rate=leverage
             )
         elif exchange == "bybit":
+            # Bybit qty is already in base currency (from _calculate_contracts)
+            logger.info(
+                f"Bybit order: {symbol} {side} qty={contracts} type={order_type}"
+            )
             return await client.place_order(
                 symbol, side, contracts, order_type, price=price,
                 offset=offset, lever_rate=leverage
@@ -370,7 +421,7 @@ class TradeExecutor:
         return 0, 0
 
     async def _close_with_retries(
-        self, exchange: str, symbol: str, side: str, contracts: int, leverage: int
+        self, exchange: str, symbol: str, side: str, contracts: float, leverage: int
     ) -> bool:
         """Close position with 3 retries and verification."""
         order_type = "opponent" if exchange == "htx" else "market"
@@ -386,7 +437,7 @@ class TradeExecutor:
                     if remaining == 0:
                         return True
                     if remaining < contracts:
-                        contracts = int(remaining)
+                        contracts = self._normalize_size(exchange, remaining)
                         logger.warning(
                             f"{exchange.upper()} {symbol}: partial, {remaining} left"
                         )
