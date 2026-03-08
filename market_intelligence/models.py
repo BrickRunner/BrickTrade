@@ -95,6 +95,10 @@ class OpportunityScore:
     reasons: List[str]
     breakdown: Dict[str, float] = field(default_factory=dict)
     directional_bias: str = "neutral"
+    # BLOCK 4.2: Multi-level signal quality
+    signal_quality_level: str = "medium"  # "high", "medium", or "low"
+    # BLOCK 4.3: Directional bias strength
+    directional_bias_strength: float = 0.0  # Range: -1.0 to +1.0
 
 
 @dataclass
