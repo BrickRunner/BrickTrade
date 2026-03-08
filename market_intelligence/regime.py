@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
+import json
 import math
 from collections import defaultdict, deque
-from typing import Deque, Dict, List
+from pathlib import Path
+from typing import Any, Deque, Dict, List
 
 from market_intelligence.models import FeatureVector, MarketRegime, RegimeState
 
@@ -394,3 +396,74 @@ class RegimeModel:
         # Convert to proportions
         total = len(recent)
         return {r: count / total for r, count in counts.items()}
+
+    # BLOCK 6.1: State persistence
+    def save_state(self, path: Path) -> None:
+        """Save regime model state to JSON file for persistence across restarts."""
+        state: Dict[str, Any] = {
+            "_stable_state": {
+                k: {
+                    "regime": v.regime.value,
+                    "confidence": v.confidence,
+                    "probabilities": {r.value: p for r, p in v.probabilities.items()},
+                    "stable_for_cycles": v.stable_for_cycles,
+                    "transition_probability": v.transition_probability,
+                    "warm_start": v.warm_start,
+                }
+                for k, v in self._stable_state.items()
+            },
+            "_smooth_probs": {
+                k: {r.value: p for r, p in probs.items()}
+                for k, probs in self._smooth_probs.items()
+            },
+            "_history": {k: [r.value for r in list(deq)] for k, deq in self._history.items()},
+            "_candidate_history": {k: [r.value for r in list(deq)] for k, deq in self._candidate_history.items()},
+            "_consecutive_candidate_count": dict(self._consecutive_candidate_count),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+    def load_state(self, path: Path) -> bool:
+        """Load regime model state from JSON file. Returns True if successful."""
+        try:
+            if not path.exists():
+                return False
+
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            # Restore _stable_state
+            self._stable_state = {
+                k: RegimeState(
+                    regime=MarketRegime(v["regime"]),
+                    confidence=v["confidence"],
+                    probabilities={MarketRegime(r): p for r, p in v["probabilities"].items()},
+                    stable_for_cycles=v["stable_for_cycles"],
+                    transition_probability=v.get("transition_probability", 0.0),
+                    warm_start=v.get("warm_start", True),  # Mark as warm start
+                )
+                for k, v in state.get("_stable_state", {}).items()
+            }
+
+            # Restore _smooth_probs
+            self._smooth_probs = {
+                k: {MarketRegime(r): p for r, p in probs.items()}
+                for k, probs in state.get("_smooth_probs", {}).items()
+            }
+
+            # Restore _history
+            self._history = defaultdict(lambda: deque(maxlen=64))
+            for k, regimes in state.get("_history", {}).items():
+                self._history[k] = deque([MarketRegime(r) for r in regimes], maxlen=64)
+
+            # Restore _candidate_history
+            self._candidate_history = defaultdict(lambda: deque(maxlen=5))
+            for k, regimes in state.get("_candidate_history", {}).items():
+                self._candidate_history[k] = deque([MarketRegime(r) for r in regimes], maxlen=5)
+
+            # Restore _consecutive_candidate_count
+            self._consecutive_candidate_count = state.get("_consecutive_candidate_count", {})
+
+            return True
+        except Exception:
+            return False

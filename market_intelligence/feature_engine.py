@@ -1,7 +1,9 @@
 ﻿from __future__ import annotations
 
+import json
 from collections import defaultdict, deque
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from market_intelligence.indicators import adx, atr, bollinger_bands, cumulative_volume_delta, ema, linear_slope, macd, market_structure, rsi, volume_spike, volume_trend, vwap
 from market_intelligence.models import FeatureVector, OHLCV, PairSnapshot
@@ -307,3 +309,51 @@ class FeatureEngine:
             features[symbol] = FeatureVector(symbol=symbol, timestamp=snap.timestamp, values=values, normalized=normalized)
 
         return features
+
+    # BLOCK 6.1: State persistence
+    def save_state(self, path: Path) -> None:
+        """Save feature engine state (rolling stats and ATR ratios) to JSON."""
+        state: Dict[str, Any] = {
+            "_window": self._window,
+            "_local_window": self._local_window,
+            "_stats": {
+                symbol: {
+                    key: {"window": stats.window, "values": stats.values}
+                    for key, stats in stats_dict.items()
+                }
+                for symbol, stats_dict in self._stats.items()
+            },
+            "_atr_ratio_history": {k: list(v) for k, v in self._atr_ratio_history.items()},
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+
+    def load_state(self, path: Path) -> bool:
+        """Load feature engine state from JSON. Returns True if successful."""
+        try:
+            if not path.exists():
+                return False
+
+            with open(path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            self._window = state.get("_window", self._window)
+            self._local_window = state.get("_local_window", self._local_window)
+
+            # Restore rolling stats
+            self._stats = defaultdict(dict)
+            for symbol, stats_dict in state.get("_stats", {}).items():
+                for key, stats_data in stats_dict.items():
+                    rs = RollingStats(window=stats_data["window"])
+                    for val in stats_data["values"]:
+                        rs.push(val)
+                    self._stats[symbol][key] = rs
+
+            # Restore ATR ratio history
+            self._atr_ratio_history = defaultdict(lambda: deque(maxlen=50))
+            for k, vals in state.get("_atr_ratio_history", {}).items():
+                self._atr_ratio_history[k] = deque(vals, maxlen=50)
+
+            return True
+        except Exception:
+            return False
