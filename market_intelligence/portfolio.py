@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from market_intelligence.models import DataHealthStatus, MarketRegime, OpportunityScore, PortfolioRiskSignal, RegimeState
+from market_intelligence.models import DataHealthStatus, FeatureVector, MarketRegime, OpportunityScore, PortfolioRiskSignal, RegimeState
 
 
 class PortfolioAnalyzer:
@@ -20,6 +20,10 @@ class PortfolioAnalyzer:
         min_score_threshold: float = 20.0,
         # BLOCK 3.3: Historical regime distribution
         regime_distribution: Dict[MarketRegime, float] | None = None,
+        # BLOCK 5.1: Tail risk protection (requires raw volatility data)
+        features: Optional[Dict[str, FeatureVector]] = None,
+        # BLOCK 5.2: Drawdown-aware allocation
+        current_portfolio_drawdown_pct: float = 0.0,
     ) -> PortfolioRiskSignal:
         # Hard lock: no synthetic allocations when scoring is disabled.
         if not scoring_enabled:
@@ -87,6 +91,12 @@ class PortfolioAnalyzer:
             if stress_pct > 0.6:
                 base_risk *= 0.8  # Additional 20% reduction
 
+        # BLOCK 5.2: Drawdown-aware allocation
+        # If portfolio is in drawdown > 10%, reduce risk proportionally
+        if current_portfolio_drawdown_pct > 10.0:
+            drawdown_penalty = 1.0 - 0.02 * current_portfolio_drawdown_pct
+            base_risk *= max(0.5, drawdown_penalty)  # Cap at 50% of base risk
+
         risk_multiplier = max(0.05, min(1.0, base_risk))
 
         top = opportunities[: min(len(opportunities), 12)]
@@ -132,6 +142,35 @@ class PortfolioAnalyzer:
             for s in list(allocation):
                 allocation[s] = 100.0 * allocation[s] / total
 
+        # BLOCK 5.1: Tail risk protection using VaR (95th percentile)
+        if features:
+            volatilities = []
+            for sym in allocation:
+                if sym in features and features[sym].normalized.get("rolling_volatility") is not None:
+                    vol = float(features[sym].normalized.get("rolling_volatility"))
+                    volatilities.append(vol)
+
+            if len(volatilities) >= 3:  # Need at least 3 samples for percentile
+                volatilities_sorted = sorted(volatilities)
+                var_95_index = int(0.95 * len(volatilities_sorted))
+                var_95 = volatilities_sorted[var_95_index]
+
+                # Apply tail risk penalty to symbols with extreme volatility
+                for sym in list(allocation):
+                    if sym in features and features[sym].normalized.get("rolling_volatility") is not None:
+                        vol = float(features[sym].normalized.get("rolling_volatility"))
+                        if vol > var_95 and var_95 > 0:
+                            penalty_factor = (vol - var_95) / var_95
+                            tail_penalty = 1.0 - 0.2 * penalty_factor
+                            tail_penalty = max(0.6, tail_penalty)  # Cap at 40% reduction
+                            allocation[sym] *= tail_penalty
+
+                # Renormalize after tail risk adjustment
+                total_after_tail = sum(allocation.values())
+                if total_after_tail > 0:
+                    for s in allocation:
+                        allocation[s] = 100.0 * allocation[s] / total_after_tail
+
         # Cap individual allocation at 25% (iterate to handle redistribution overflow)
         MAX_SINGLE_PAIR_PCT = 25.0
         for _ in range(5):  # max iterations to converge
@@ -168,6 +207,50 @@ class PortfolioAnalyzer:
             for s in list(allocation):
                 if allocation[s] > MAX_SINGLE_PAIR_PCT:
                     allocation[s] = MAX_SINGLE_PAIR_PCT
+
+        # BLOCK 5.3: Sector concentration (base currency)
+        # Extract base currency and check if any base dominates > 40%
+        base_allocation = defaultdict(float)
+        symbol_to_base = {}
+        for sym in allocation:
+            # Extract base currency (everything before USDT, USDC, USD, etc.)
+            base = self._extract_base_currency(sym)
+            symbol_to_base[sym] = base
+            base_allocation[base] += allocation[sym]
+
+        # Apply penalty to over-concentrated bases
+        for base, base_pct in base_allocation.items():
+            if base_pct > 40.0:
+                penalty = 0.8  # Reduce by 20%
+                for sym in allocation:
+                    if symbol_to_base.get(sym) == base:
+                        allocation[sym] *= penalty
+
+        # Renormalize after sector concentration adjustment
+        total_after_sector = sum(allocation.values())
+        if total_after_sector > 0:
+            for s in allocation:
+                allocation[s] = 100.0 * allocation[s] / total_after_sector
+
+        # Re-apply 25% cap after all adjustments to ensure hard limit (iterative approach)
+        for _ in range(5):  # max iterations to converge
+            capped = False
+            for s in list(allocation):
+                if allocation[s] > MAX_SINGLE_PAIR_PCT:
+                    allocation[s] = MAX_SINGLE_PAIR_PCT
+                    capped = True
+            if not capped:
+                break
+            final_total = sum(allocation.values())
+            if final_total > 0 and abs(final_total - 100.0) > 0.01:
+                uncapped = {s: v for s, v in allocation.items() if v < MAX_SINGLE_PAIR_PCT}
+                uncapped_total = sum(uncapped.values())
+                if uncapped_total > 0:
+                    excess = 100.0 - final_total
+                    for s in uncapped:
+                        allocation[s] += excess * (uncapped[s] / uncapped_total)
+                else:
+                    break
 
         exposure = defaultdict(float)
         for s, pct in allocation.items():
@@ -223,3 +306,25 @@ class PortfolioAnalyzer:
         if global_volatility_regime == "unavailable":
             base *= 0.6
         return max(0.05, min(0.25, base))
+
+    @staticmethod
+    def _extract_base_currency(symbol: str) -> str:
+        """Extract base currency from trading pair symbol.
+
+        Examples:
+            ETHUSDT -> ETH
+            BTCUSDC -> BTC
+            SOLUSDT -> SOL
+        """
+        # Common quote currencies to strip
+        quote_currencies = ["USDT", "USDC", "USD", "BUSD", "TUSD", "DAI"]
+        symbol_upper = symbol.upper()
+
+        for quote in quote_currencies:
+            if symbol_upper.endswith(quote):
+                return symbol_upper[: -len(quote)]
+
+        # Fallback: assume last 3-4 chars are quote
+        if len(symbol) > 4:
+            return symbol_upper[:-4]
+        return symbol_upper
