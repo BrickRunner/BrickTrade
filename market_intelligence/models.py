@@ -80,6 +80,10 @@ class RegimeState:
     confidence: float
     probabilities: Dict[MarketRegime, float]
     stable_for_cycles: int
+    # BLOCK 3.1: Transition regime probability
+    transition_probability: float = 0.0
+    # BLOCK 6: Warm start indicator (for persistence)
+    warm_start: bool = False
 
 
 @dataclass

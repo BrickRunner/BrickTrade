@@ -142,6 +142,9 @@ class MarketIntelligenceEngine:
         # to avoid blocking the event loop.
         p = await asyncio.to_thread(self._compute_pipeline, snapshots, histories, candles)
 
+        # BLOCK 3.3: Get regime distribution for portfolio analysis
+        regime_dist = self.regime_model.regime_distribution("__global__", window=64)
+
         portfolio = self.portfolio.analyze(
             p.opportunities,
             p.local_regimes,
@@ -152,6 +155,7 @@ class MarketIntelligenceEngine:
             data_health_status=p.validation.status,
             scoring_enabled=p.scoring_enabled,
             min_score_threshold=self.config.min_opportunity_score,
+            regime_distribution=regime_dist,
         )
 
         alerts = self._detect_alerts(p.features, p.local_regimes)
