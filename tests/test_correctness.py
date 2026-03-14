@@ -311,6 +311,16 @@ class TestPnLCalculation:
         # LONG: (50050 - 50000) * 0.01 = +0.50
         # SHORT: (50100 - 50050) * 0.01 = +0.50
         # Total gross: +1.00
+        await state.update_orderbook({
+            "exchange": "okx", "symbol": "BTCUSDT",
+            "bids": [[50050.0, 1.0]], "asks": [[50051.0, 1.0]],
+            "timestamp": 123456
+        })
+        await state.update_orderbook({
+            "exchange": "htx", "symbol": "BTCUSDT",
+            "bids": [[50050.0, 1.0]], "asks": [[50051.0, 1.0]],
+            "timestamp": 123456
+        })
         success, _ = await execution.execute_arbitrage_exit()
 
         stats = state.get_stats()
@@ -333,6 +343,16 @@ class TestPnLCalculation:
         # LONG: (49900 - 50000) * 0.01 = -1.00
         # SHORT: (50100 - 50200) * 0.01 = -1.00
         # Total gross: -2.00
+        await state.update_orderbook({
+            "exchange": "okx", "symbol": "BTCUSDT",
+            "bids": [[49900.0, 1.0]], "asks": [[49901.0, 1.0]],
+            "timestamp": 123456
+        })
+        await state.update_orderbook({
+            "exchange": "htx", "symbol": "BTCUSDT",
+            "bids": [[50200.0, 1.0]], "asks": [[50201.0, 1.0]],
+            "timestamp": 123456
+        })
         success, _ = await execution.execute_arbitrage_exit()
 
         stats = state.get_stats()
@@ -361,13 +381,14 @@ class TestOperatingModes:
         state.update_balance("htx", 10000)
 
         # Попытка войти в сделку
-        success = await execution.execute_arbitrage_entry(
+        success, _ = await execution.execute_arbitrage_entry(
             long_exchange="okx", short_exchange="htx",
             long_price=50000.0, short_price=50100.0, size=0.01
         )
 
         # В monitoring_only режиме сделка не должна выполниться
-        assert success == False or len(list(state.positions.values())) == 0
+        assert success == False
+        assert len(list(state.positions.values())) == 0
 
     async def test_dry_run_mode(self):
         """В dry_run режиме сделки симулируются"""
@@ -384,7 +405,7 @@ class TestOperatingModes:
         state.update_balance("okx", 10000)
         state.update_balance("htx", 10000)
 
-        success = await execution.execute_arbitrage_entry(
+        success, _ = await execution.execute_arbitrage_entry(
             long_exchange="okx", short_exchange="htx",
             long_price=50000.0, short_price=50100.0, size=0.01
         )
@@ -512,7 +533,7 @@ class TestFullWorkflow:
         assert risk_manager.validate_spread(spread, is_entry=True) == True
 
         # 4. Вход в позицию
-        success = await execution.execute_arbitrage_entry(
+        success, _ = await execution.execute_arbitrage_entry(
             long_exchange="okx",
             short_exchange="htx",
             long_price=okx_data.best_ask,
@@ -544,7 +565,7 @@ class TestFullWorkflow:
         assert risk_manager.validate_spread(exit_spread, is_entry=False) == True
 
         # 7. Выход из позиции
-        exit_success = await execution.execute_arbitrage_exit()
+        exit_success, _ = await execution.execute_arbitrage_exit()
         assert exit_success == True
         assert state.is_in_position == False
 

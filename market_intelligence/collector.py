@@ -93,6 +93,7 @@ class MarketDataCollector:
         # Caches for real exchange data
         self._oi_cache: Dict[str, float] = {}
         self._volume_cache: Dict[str, float] = {}
+        self._volume_per_exchange_cache: Dict[str, Dict[str, float]] = {}  # {exchange: {symbol: volume}}
         self._lsr_cache: Dict[str, float] = {}
         self._liq_cache: Dict[str, float] = {}
         self._ob_cache: Dict[str, float] = {}
@@ -259,7 +260,10 @@ class MarketDataCollector:
             aggregation_method = "simple_average"
             if len(ex_prices) > 1:
                 # Try volume-weighted aggregation
-                ex_volumes = {ex: self._volume_cache.get(symbol, 0.0) for ex in ex_prices}
+                ex_volumes = {}
+                for ex in ex_prices:
+                    ex_vol = self._volume_per_exchange_cache.get(ex, {}).get(symbol, 0.0)
+                    ex_volumes[ex] = ex_vol
                 total_volume = sum(v for v in ex_volumes.values() if v > 0)
 
                 if total_volume > 0:
@@ -486,14 +490,16 @@ class MarketDataCollector:
         self._oi_cache.update(merged)
 
     async def _update_24h_volume(self) -> None:
-        """Fetch real 24h volume from all exchanges, aggregate by symbol."""
+        """Fetch real 24h volume from all exchanges, store per-exchange and aggregated."""
         merged: Dict[str, float] = {}
+        per_exchange: Dict[str, Dict[str, float]] = {}  # {exchange: {symbol: volume}}
         for ex in self.exchanges:
             cb = self._circuit_breakers[ex]
             if not cb.is_available():
                 continue
             try:
                 vol_data = await self.market_data.fetch_24h_volumes(ex)
+                per_exchange[ex] = vol_data
                 for sym, val in vol_data.items():
                     merged[sym] = merged.get(sym, 0.0) + val
                 cb.record_success()
@@ -501,6 +507,7 @@ class MarketDataCollector:
                 cb.record_failure()
                 logger.warning("Volume fetch %s: %s", ex, e)
         self._volume_cache.update(merged)
+        self._volume_per_exchange_cache = per_exchange
 
     async def update_slow_data(self, symbols: List[str], is_stress: bool = False) -> None:
         """BLOCK 1.4: Fetch rate-limited data (long/short ratio, liquidations).

@@ -80,10 +80,21 @@ class OKXRestClient:
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
-                result = await response.json()
+                try:
+                    result = await response.json()
+                except Exception:
+                    text = await response.text()
+                    logger.error(
+                        "OKX public API error: non-JSON response "
+                        f"status={response.status} endpoint={endpoint} params={params} body={text[:200]}"
+                    )
+                    return {"code": str(response.status), "msg": "non_json_response"}
 
                 if result.get("code") != "0":
-                    logger.error(f"OKX public API error: {result}")
+                    logger.error(
+                        "OKX public API error: "
+                        f"status={response.status} endpoint={endpoint} params={params} result={result}"
+                    )
 
                 return result
 
@@ -157,6 +168,9 @@ class OKXRestClient:
         """Получить спотовые тикеры (публичный API)"""
         return await self._public_request("GET", "/api/v5/market/tickers", {"instType": "SPOT"})
 
+    async def get_spot_instruments(self) -> Dict[str, Any]:
+        return await self._public_request("GET", "/api/v5/public/instruments", {"instType": "SPOT"})
+
     async def get_funding_rate(self, inst_id: str) -> Dict[str, Any]:
         """
         Получить текущую ставку финансирования для конкретного инструмента
@@ -194,6 +208,12 @@ class OKXRestClient:
     async def get_balance(self) -> Dict[str, Any]:
         """Получить баланс аккаунта"""
         return await self._request("GET", "/api/v5/account/balance")
+
+    async def get_trade_fee(self, inst_type: str = "SWAP", inst_id: str = "") -> Dict[str, Any]:
+        params = {"instType": inst_type}
+        if inst_id:
+            params["instId"] = inst_id
+        return await self._request("GET", "/api/v5/account/trade-fee", params)
 
     async def get_positions(self, inst_type: str = "SWAP") -> Dict[str, Any]:
         """Получить открытые позиции"""
@@ -273,6 +293,75 @@ class OKXRestClient:
         logger.info(f"Placing OKX order: {data}")
         return await self._request("POST", "/api/v5/trade/order", data=data)
 
+    async def place_spot_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        order_type: str = "limit",
+        price: Optional[float] = None,
+        time_in_force: str = "ioc",
+    ) -> Dict[str, Any]:
+        inst_id = symbol.replace("USDT", "-USDT") if symbol.endswith("USDT") else symbol.replace("-", "")
+        data = {
+            "instId": inst_id,
+            "tdMode": "cash",
+            "side": side,
+            "ordType": order_type,
+            "sz": str(size),
+        }
+        if order_type == "limit":
+            if price is None:
+                raise ValueError("Price is required for limit orders")
+            data["px"] = str(price)
+        if time_in_force == "ioc":
+            data["ordType"] = "ioc" if order_type == "limit" else "market"
+        logger.info(f"Placing OKX spot order: {data}")
+        return await self._request("POST", "/api/v5/trade/order", data=data)
+
+    async def place_oco_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        *,
+        tp_trigger: float,
+        tp_price: float,
+        sl_trigger: float,
+        sl_price: float,
+        spot: bool = False,
+        reduce_only: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Place an OCO (TP/SL) algo order.
+        Uses /api/v5/trade/order-algo with ordType=oco.
+        Docs: OKX REST v5 Place Algo Order (OCO) parameters.
+        """
+        if symbol.endswith("USDT"):
+            base = symbol[:-4]
+            inst_id = f"{base}-USDT"
+        else:
+            inst_id = symbol
+        if not spot:
+            inst_id = inst_id if inst_id.endswith("-SWAP") else f"{inst_id}-SWAP"
+
+        data = {
+            "instId": inst_id,
+            "tdMode": "cash" if spot else "cross",
+            "side": side,
+            "ordType": "oco",
+            "sz": str(size),
+            "tpTriggerPx": str(tp_trigger),
+            "tpOrdPx": str(tp_price),
+            "slTriggerPx": str(sl_trigger),
+            "slOrdPx": str(sl_price),
+        }
+        if reduce_only and not spot:
+            data["reduceOnly"] = "true"
+
+        logger.info(f"Placing OKX OCO order: {data}")
+        return await self._request("POST", "/api/v5/trade/order-algo", data=data)
+
     async def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
         """Отменить ордер"""
         if symbol.endswith("USDT"):
@@ -299,6 +388,11 @@ class OKXRestClient:
             "instId": inst_id,
             "ordId": order_id
         }
+        return await self._request("GET", "/api/v5/trade/order", params=params)
+
+    async def get_spot_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        inst_id = symbol.replace("USDT", "-USDT") if symbol.endswith("USDT") else symbol.replace("-", "")
+        params = {"instId": inst_id, "ordId": order_id}
         return await self._request("GET", "/api/v5/trade/order", params=params)
 
     async def close_position(self, symbol: str, side: str, size: float) -> Dict[str, Any]:

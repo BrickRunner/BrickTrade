@@ -29,11 +29,15 @@ from market_intelligence.models import (
 from market_intelligence.portfolio import PortfolioAnalyzer
 from market_intelligence.regime import RegimeModel
 from market_intelligence.scorer import OpportunityScorer
+from market_intelligence.order_flow import OrderFlowAnalyzer
 # BLOCK 2.2: Use robust correlation instead of Pearson
 from market_intelligence.statistics import robust_corr, rolling_returns
 from market_intelligence.validation import DataValidator, ValidationResult
+# BLOCK 2: Structured logging
+from market_intelligence.structured_log import new_cycle_context, get_structured_logger
 
 logger = logging.getLogger("market_intelligence")
+struct_logger = get_structured_logger("engine")
 
 
 @dataclass
@@ -85,14 +89,20 @@ class MarketIntelligenceEngine:
             w_regime=config.score_weight_regime,
             w_risk_penalty=config.score_weight_risk_penalty,
             w_liquidity=config.score_weight_liquidity,
+            signal_half_life_seconds=config.signal_half_life_seconds,
         )
         self.portfolio = PortfolioAnalyzer()
         self.validator = DataValidator()
         self.logger = JsonlLogger(config.log_dir, config.jsonl_file_name)
+        # Order flow analyzer (optional)
+        self.order_flow: Optional[OrderFlowAnalyzer] = None
+        if config.order_flow_enabled:
+            self.order_flow = OrderFlowAnalyzer()
         self._previous_payload: Optional[Dict] = None
         self._snapshot_file = Path(config.log_dir) / "market_intelligence_prev_snapshot.json"
         self._previous_loaded = False
         self._cycle_count = 0
+        self._cycle_counter = 0  # BLOCK 2: For structured logging cycle tracking
         self._state_restored = False
         # BLOCK 2.3: MTF candles caching
         self._last_candles_fetch: float = 0.0
@@ -100,6 +110,11 @@ class MarketIntelligenceEngine:
         self._candles_refresh_interval: float = 1800.0  # 30 minutes
 
     async def run_once(self) -> MarketIntelligenceReport:
+        # BLOCK 2: Start cycle context for structured logging
+        self._cycle_counter += 1
+        ctx = new_cycle_context(self._cycle_counter)
+        struct_logger.info("Cycle started", symbols_count=len(self._select_symbols()), cycle=self._cycle_counter)
+
         await self._ensure_previous_loaded()
         await self._restore_persisted_state()
 
@@ -141,6 +156,10 @@ class MarketIntelligenceEngine:
         # Offload CPU-bound feature/regime/scoring pipeline to a thread
         # to avoid blocking the event loop.
         p = await asyncio.to_thread(self._compute_pipeline, snapshots, histories, candles)
+
+        # FIX C.2: Record ML feedback for adaptive weight optimization
+        if self._previous_payload and self.config.adaptive_ml_weighting:
+            self._record_ml_feedback(p)
 
         # BLOCK 3.3: Get regime distribution for portfolio analysis
         regime_dist = self.regime_model.regime_distribution("__global__", window=64)
@@ -279,6 +298,12 @@ class MarketIntelligenceEngine:
         features = self.feature_engine.compute(snapshots, histories, candles=candles)
         validation = self.validator.validate(features, snapshots, histories)
         features = validation.sanitized_features
+
+        # Add order flow features if enabled
+        if self.order_flow:
+            for symbol, fv in features.items():
+                flow = self.order_flow.get_flow_features(symbol)
+                fv.values.update(flow)
 
         btc_symbol = "BTCUSDT" if "BTCUSDT" in features else next(iter(features.keys()))
         global_regime = self.regime_model.classify_global(features[btc_symbol])
@@ -560,6 +585,13 @@ class MarketIntelligenceEngine:
                 alerts.append(f"Overheat: {symbol} (RSI={float(v.get('rsi', 0.0) or 0.0):.1f})")
             if abs(float(v.get("funding_rate", 0.0) or 0.0)) >= funding_extreme_threshold:
                 alerts.append(f"Funding extreme: {symbol} ({float(v.get('funding_rate', 0.0) or 0.0):.4f})")
+
+            # NEW: Liquidation cascade alert
+            cascade_stage = int(v.get("cascade_stage") or 0)
+            if cascade_stage >= 2:
+                severity = "warning" if cascade_stage == 2 else "critical"
+                alerts.append(f"Liquidation cascade stage {cascade_stage}/3: {symbol} ({severity})")
+
         return alerts
 
     def _assert_consistency(self, payload: Dict) -> None:
@@ -635,3 +667,47 @@ class MarketIntelligenceEngine:
             self._snapshot_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
         await asyncio.to_thread(_write)
+
+    def _record_ml_feedback(self, current: PipelineResult) -> None:
+        """FIX C.2: Record outcome feedback for ML weight optimization."""
+        prev_opps = self._previous_payload.get("opportunities", [])
+        if not prev_opps:
+            return
+
+        for prev_opp in prev_opps:
+            symbol = prev_opp["symbol"]
+            prev_score = prev_opp["score"]
+            prev_bias = prev_opp.get("directional_bias", "neutral")
+
+            # Check if we have current price data
+            if symbol not in current.features:
+                continue
+
+            current_price = current.features[symbol].values.get("price")
+            prev_features = self._previous_payload.get("features", {}).get(symbol, {})
+            prev_price = prev_features.get("price")
+
+            if current_price is None or prev_price is None or prev_price == 0:
+                continue
+
+            # Actual outcome: price return since last cycle
+            price_return = (current_price - prev_price) / prev_price
+
+            # Map to outcome relative to predicted bias
+            if prev_bias == "long":
+                actual_outcome = price_return  # positive return = correct prediction
+            elif prev_bias == "short":
+                actual_outcome = -price_return  # negative return = correct prediction
+            else:
+                actual_outcome = abs(price_return)  # any movement = opportunity existed
+
+            # Extract feature breakdown for ML
+            breakdown = prev_opp.get("breakdown", {})
+            if breakdown:
+                self.scorer.record_outcome(
+                    symbol=symbol,
+                    score=prev_score,
+                    actual_outcome=actual_outcome,
+                    timestamp=current.features[symbol].timestamp,
+                    feature_vector=breakdown,
+                )

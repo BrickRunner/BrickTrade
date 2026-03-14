@@ -4,11 +4,22 @@ Tracks balances, positions, and statistics per strategy.
 """
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Union
 
 from arbitrage.utils import get_arbitrage_logger
 
 logger = get_arbitrage_logger("state")
+
+
+@dataclass
+class Position:
+    """Minimal position model for core execution/tests."""
+    exchange: str
+    symbol: str
+    side: str
+    size: float
+    entry_price: float
+    order_id: Optional[str] = None
 
 
 @dataclass
@@ -36,6 +47,32 @@ class ActivePosition:
         return time.time() - self.entry_time
 
 
+@dataclass
+class OrderBookData:
+    """Lightweight orderbook snapshot for core flow."""
+    exchange: str
+    symbol: str
+    bids: List[List[float]]
+    asks: List[List[float]]
+    timestamp: float
+    best_bid: float
+    best_ask: float
+
+
+@dataclass
+class ArbitrageOpportunity:
+    """Describes a detected arbitrage opportunity."""
+    spread: float
+    long_exchange: str
+    short_exchange: str
+    long_price: float
+    short_price: float
+    size: float
+
+
+PositionLike = Union[ActivePosition, Position]
+
+
 class BotState:
     """Central state for the arbitrage bot."""
 
@@ -44,8 +81,11 @@ class BotState:
         self.balances: Dict[str, float] = {}
         self.total_balance: float = 0.0
 
-        # Active positions: {(strategy, symbol): ActivePosition}
-        self.positions: Dict[tuple, ActivePosition] = {}
+        # Active positions (supports core Position + strategy ActivePosition)
+        self.positions: Dict[tuple, PositionLike] = {}
+
+        # Latest orderbooks by exchange (core flow)
+        self._orderbooks: Dict[str, OrderBookData] = {}
 
         # Per-strategy stats
         self.strategy_stats: Dict[str, Dict[str, Any]] = {}
@@ -58,6 +98,10 @@ class BotState:
 
         # Running state
         self.is_running: bool = False
+        self.is_in_position: bool = False
+
+        # Current arbitrage opportunity (used by legacy ArbitrageEngine)
+        self.current_opportunity: Optional[ArbitrageOpportunity] = None
 
         # Legacy compat aliases
         self.okx_balance: float = 0.0
@@ -82,37 +126,96 @@ class BotState:
 
     # ─── Positions ────────────────────────────────────────────────────────
 
-    def add_position(self, pos: ActivePosition) -> None:
-        key = (pos.strategy, pos.symbol)
+    def add_position(self, pos: PositionLike) -> None:
+        if isinstance(pos, ActivePosition):
+            key = (pos.strategy, pos.symbol)
+            logger.info(
+                f"Position added: {pos.strategy} {pos.symbol} "
+                f"L:{pos.long_exchange} S:{pos.short_exchange}"
+            )
+        else:
+            key = (pos.exchange, pos.symbol, pos.side)
+            logger.info(
+                f"Position added: {pos.exchange} {pos.symbol} side={pos.side}"
+            )
         self.positions[key] = pos
-        logger.info(f"Position added: {pos.strategy} {pos.symbol} "
-                    f"L:{pos.long_exchange} S:{pos.short_exchange}")
+        self.is_in_position = True
 
-    def remove_position(self, strategy: str, symbol: str) -> Optional[ActivePosition]:
+    def remove_position(self, strategy: str, symbol: str) -> Optional[PositionLike]:
+        # Strategy-based lookup (ActivePosition)
         key = (strategy, symbol)
         pos = self.positions.pop(key, None)
         if pos:
             logger.info(f"Position removed: {strategy} {symbol}")
-        return pos
+            self.is_in_position = len(self.positions) > 0
+            return pos
+
+        # Exchange-based lookup (core Position)
+        for key, candidate in list(self.positions.items()):
+            if isinstance(candidate, Position) and candidate.exchange == strategy and candidate.symbol == symbol:
+                self.positions.pop(key, None)
+                logger.info(f"Position removed: {strategy} {symbol}")
+                self.is_in_position = len(self.positions) > 0
+                return candidate
+
+        return None
 
     def get_position(self, strategy: str, symbol: str) -> Optional[ActivePosition]:
-        return self.positions.get((strategy, symbol))
+        pos = self.positions.get((strategy, symbol))
+        return pos if isinstance(pos, ActivePosition) else None
 
     def get_positions_by_strategy(self, strategy: str) -> List[ActivePosition]:
-        return [p for (s, _), p in self.positions.items() if s == strategy]
+        return [
+            p for p in self.positions.values()
+            if isinstance(p, ActivePosition) and p.strategy == strategy
+        ]
 
-    def get_all_positions(self) -> List[ActivePosition]:
+    def get_all_positions(self) -> List[PositionLike]:
         return list(self.positions.values())
 
     def position_count(self) -> int:
         return len(self.positions)
 
     def has_position_on_symbol(self, symbol: str) -> bool:
-        return any(sym == symbol for (_, sym) in self.positions)
+        return any(
+            getattr(pos, "symbol", None) == symbol
+            for pos in self.positions.values()
+        )
+
+    def clear_positions(self) -> None:
+        self.positions.clear()
+        self.is_in_position = False
+
+    async def update_orderbook(self, data: Dict[str, Any]) -> None:
+        exchange = data.get("exchange")
+        symbol = data.get("symbol")
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        timestamp = float(data.get("timestamp") or time.time())
+
+        if not exchange or not symbol or not bids or not asks:
+            return
+
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+
+        self._orderbooks[exchange] = OrderBookData(
+            exchange=exchange,
+            symbol=symbol,
+            bids=bids,
+            asks=asks,
+            timestamp=timestamp,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+
+    def get_orderbooks(self) -> tuple[Optional[OrderBookData], Optional[OrderBookData]]:
+        return self._orderbooks.get("okx"), self._orderbooks.get("htx")
 
     # ─── Trade Recording ──────────────────────────────────────────────────
 
-    def record_trade(self, strategy: str, success: bool, pnl: float = 0.0) -> None:
+    def record_trade(self, strategy: Optional[str] = None, success: bool = False, pnl: float = 0.0) -> None:
+        strategy_name = strategy or "arbitrage"
         self.total_trades += 1
         if success:
             self.successful_trades += 1
@@ -121,11 +224,11 @@ class BotState:
         self.total_pnl += pnl
 
         # Per-strategy
-        if strategy not in self.strategy_stats:
-            self.strategy_stats[strategy] = {
+        if strategy_name not in self.strategy_stats:
+            self.strategy_stats[strategy_name] = {
                 "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0
             }
-        stats = self.strategy_stats[strategy]
+        stats = self.strategy_stats[strategy_name]
         stats["trades"] += 1
         if success:
             stats["wins"] += 1
@@ -133,8 +236,29 @@ class BotState:
             stats["losses"] += 1
         stats["pnl"] += pnl
 
-        logger.info(f"Trade [{strategy}]: ok={success} pnl={pnl:+.4f} "
+        logger.info(f"Trade [{strategy_name}]: ok={success} pnl={pnl:+.4f} "
                     f"total={self.total_trades} total_pnl={self.total_pnl:+.4f}")
+
+    def calculate_pnl(self) -> float:
+        """Calculate PnL from current open positions using orderbook prices."""
+        okx_ob = self._orderbooks.get("okx")
+        htx_ob = self._orderbooks.get("htx")
+        if not okx_ob or not htx_ob:
+            return 0.0
+
+        pnl = 0.0
+        for pos in self.positions.values():
+            if not isinstance(pos, Position):
+                continue
+            if pos.exchange == "okx":
+                exit_price = okx_ob.best_bid if pos.side == "LONG" else okx_ob.best_ask
+            else:
+                exit_price = htx_ob.best_bid if pos.side == "LONG" else htx_ob.best_ask
+            if pos.side == "LONG":
+                pnl += (exit_price - pos.entry_price) * pos.size
+            else:
+                pnl += (pos.entry_price - exit_price) * pos.size
+        return pnl
 
     # ─── Stats ────────────────────────────────────────────────────────────
 

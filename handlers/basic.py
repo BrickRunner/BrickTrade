@@ -1,6 +1,8 @@
+# -*- coding: utf-8 -*-
+import asyncio
+import logging
 from datetime import datetime, timedelta
 from aiogram import types
-from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 
 from database import get_settings
@@ -8,6 +10,9 @@ from api import fetch_rates, fetch_rates_by_date
 from utils import format_rates_for_user
 from keyboards import main_menu
 from states import DateForm
+from market_intelligence.integration import is_market_startup_enabled, send_market_report
+
+logger = logging.getLogger(__name__)
 
 
 async def cmd_start(m: types.Message):
@@ -16,13 +21,18 @@ async def cmd_start(m: types.Message):
     await m.answer(
         "👋 <b>Привет!</b>\n\n"
         "Я бот с двумя режимами:\n\n"
-        "📊 <b>Курсы валют</b> — данные ЦБ РФ, уведомления, пороги, статистика\n"
-        "⚡ <b>Арбитраж OKX/HTX/Bybit</b> — 3-way арбитраж фьючерсами, "
-        "adaptive thresholds, funding rate учёт, per-pair статистика\n\n"
+        "📉 <b>Курсы валют</b> — данные ЦБ РФ, уведомления, пороги, статистика\n"
+        "⚡ <b>Арбитраж OKX/HTX</b> — кросс-биржевой арбитраж фьючерсов, "
+        "адаптивные пороги и контроль рисков\n\n"
         "Выберите действие:",
         reply_markup=main_menu(),
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
+    try:
+        if await is_market_startup_enabled():
+            await asyncio.wait_for(send_market_report(m.bot, m.from_user.id, force_refresh=True), timeout=25)
+    except Exception as exc:
+        logger.warning("Failed to send startup market report to user %s: %s", m.from_user.id, exc)
 
 
 async def handle_send_now(m: types.Message):
@@ -47,9 +57,9 @@ async def process_date(m: types.Message, state: FSMContext):
     try:
         dt = datetime.strptime(m.text.strip(), "%d.%m.%Y").date()
     except ValueError:
-        await m.answer("❗ Неверный формат даты. Используйте DD.MM.YYYY (например: 25.09.2025)")
+        await m.answer("❌ Неверный формат даты. Используйте DD.MM.YYYY (например: 25.09.2025)")
         return
-    
+
     row = await get_settings(m.from_user.id)
     currencies = [c.strip().upper() for c in (row[1] or "USD,EUR").split(",") if c.strip()]
     res = await fetch_rates_by_date(dt, currencies)

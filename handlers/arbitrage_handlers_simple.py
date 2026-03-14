@@ -1,788 +1,650 @@
-"""
-Telegram handlers for the multi-strategy arbitrage bot.
-Auto-start, strategy-based UI, trade notifications.
-Supports 3 exchanges: OKX, HTX, Bybit.
-"""
+from __future__ import annotations
+
 import asyncio
-from typing import Optional
-from aiogram import types
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.exceptions import TelegramBadRequest
-
-from arbitrage.utils import ArbitrageConfig
-from arbitrage.core import BotState, RiskManager, NotificationManager, MarketDataEngine
-from arbitrage.strategies import StrategyRouter, TradeExecutor
-from arbitrage.exchanges import OKXRestClient, HTXRestClient, BybitRestClient
-
 import logging
+from dataclasses import dataclass, field
+from dataclasses import replace
+from typing import Optional
+
+from aiogram import types
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from arbitrage.core.market_data import MarketDataEngine
+from arbitrage.system import (
+    AtomicExecutionEngine,
+    InMemoryMonitoring,
+    LiveExecutionVenue,
+    LiveMarketDataProvider,
+    SlippageModel,
+    SystemState,
+    TradingSystemConfig,
+    TradingSystemEngine,
+    build_exchange_clients,
+    usdt_symbol_universe,
+)
 
 logger = logging.getLogger(__name__)
 
-# Global instances
-_router: Optional[StrategyRouter] = None
+
+# ---------------------------------------------------------------------------
+# Engine state encapsulated in a single object
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _EngineState:
+    engine: Optional[TradingSystemEngine] = None
+    task: Optional[asyncio.Task] = None
+    state: Optional[SystemState] = None
+    provider: Optional[LiveMarketDataProvider] = None
+    venue: Optional[LiveExecutionVenue] = None
+    monitor: Optional[InMemoryMonitoring] = None
+    config: Optional[TradingSystemConfig] = None
+    exchanges: dict = field(default_factory=dict)
+    user_id: Optional[int] = None
+    last_error: Optional[str] = None
+
+    @property
+    def running(self) -> bool:
+        return self.task is not None and not self.task.done()
+
+    def exchange_names(self) -> str:
+        if self.config:
+            return "/".join(ex.upper() for ex in self.config.exchanges)
+        if self.exchanges:
+            return "/".join(ex.upper() for ex in self.exchanges.keys())
+        return "OKX/HTX"
+
+    def task_state_str(self) -> str:
+        if self.task is None:
+            return "stopped"
+        if not self.task.done():
+            return "running"
+        if self.task.cancelled():
+            return "cancelled"
+        try:
+            self.task.exception()
+            return "failed"
+        except Exception:
+            return "done"
+
+    async def shutdown(self) -> None:
+        task = self.task
+        self.task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self.venue:
+            try:
+                await self.venue.close()
+            except Exception:
+                pass
+        self.engine = None
+        self.state = None
+        self.provider = None
+        self.venue = None
+        self.monitor = None
+        self.config = None
+        self.exchanges = {}
+        self.user_id = None
+        self.last_error = None
+
+
+_es = _EngineState()
+
+# Compatibility aliases used by main.py shutdown block.
+_router = None
 _router_task: Optional[asyncio.Task] = None
-_state: Optional[BotState] = None
+_state: Optional[SystemState] = None
 _exchanges: dict = {}
 
 
-async def _safe_edit(message, text: str, reply_markup=None, parse_mode="HTML"):
-    """Edit message, ignoring 'message is not modified' error."""
+# ---------------------------------------------------------------------------
+# Telegram monitoring sink
+# ---------------------------------------------------------------------------
+
+
+class TelegramMonitoringSink(InMemoryMonitoring):
+    def __init__(self, tg_logger: logging.Logger, bot, user_id: int):
+        super().__init__(logger=tg_logger)
+        self._bot = bot
+        self._user_id = user_id
+
+    async def emit(self, event: str, payload: dict) -> None:
+        await super().emit(event, payload)
+        text = self._format_event_message(event, payload)
+        if not text:
+            return
+        try:
+            await self._bot.send_message(self._user_id, text, parse_mode="HTML")
+        except Exception:
+            logger.debug("telegram_notify_failed event=%s", event, exc_info=True)
+
+    @staticmethod
+    def _format_event_message(event: str, payload: dict) -> Optional[str]:
+        if event == "execution_fill" and not payload.get("dry_run", True):
+            return (
+                "✅ <b>Позиция открыта (обе ноги исполнены)</b>\n"
+                f"Символ: <b>{payload.get('symbol')}</b>\n"
+                f"Стратегия: <b>{payload.get('strategy')}</b>\n"
+                f"Long: {payload.get('long_exchange')} @ {payload.get('entry_long_price', 0):.6f}\n"
+                f"Short: {payload.get('short_exchange')} @ {payload.get('entry_short_price', 0):.6f}\n"
+                f"ID: <code>{payload.get('position_id')}</code>"
+            )
+        if event == "position_close_signal":
+            return (
+                "🔎 <b>Сигнал на закрытие позиции</b>\n"
+                f"Символ: <b>{payload.get('symbol')}</b>\n"
+                f"Причина: {payload.get('reason')}\n"
+                f"PnL: {payload.get('pnl_usd', 0):.6f} USDT\n"
+                f"Age: {payload.get('age_sec', 0)}s"
+            )
+        if event == "position_closed":
+            return (
+                "🧾 <b>Позиция закрыта</b>\n"
+                f"Символ: <b>{payload.get('symbol')}</b>\n"
+                f"Причина: {payload.get('reason')}\n"
+                f"Realized PnL: {payload.get('realized_pnl_usd', 0):.6f} USDT\n"
+                f"ID: <code>{payload.get('position_id')}</code>"
+            )
+        if event == "execution_critical":
+            return (
+                "🚨 <b>Критическая ошибка исполнения</b>\n"
+                f"Символ: <b>{payload.get('symbol')}</b>\n"
+                f"Стратегия: {payload.get('strategy')}\n"
+                f"Причина: <code>{payload.get('reason')}</code>\n"
+                "Kill-switch активирован."
+            )
+        if event == "symbol_cooldown":
+            cd_sec = int(payload.get("cooldown_seconds", 0) or 0)
+            cd_hours = cd_sec / 3600
+            return (
+                "⛔ <b>Пара временно отключена</b>\n"
+                f"Символ: <b>{payload.get('symbol')}</b>\n"
+                f"Причина: {payload.get('reason')}\n"
+                f"Убыточных закрытий подряд: {payload.get('loss_streak', 0)}\n"
+                f"Блокировка: {cd_hours:.1f} ч"
+            )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# UI helpers
+# ---------------------------------------------------------------------------
+
+
+async def _safe_edit(message: types.Message, text: str, reply_markup=None, parse_mode: str = "HTML") -> None:
     try:
         await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e):
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc):
             raise
 
 
-def _main_keyboard(is_running: bool = True) -> InlineKeyboardMarkup:
+def _main_keyboard(is_running: bool) -> InlineKeyboardMarkup:
     if not is_running:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ Старт", callback_data="arb_multi_start")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Возможности", callback_data="arb_scan_now"),
-         InlineKeyboardButton(text="📈 Статистика", callback_data="arb_stats")],
-        [InlineKeyboardButton(text="📋 История", callback_data="arb_history"),
-         InlineKeyboardButton(text="💸 Funding", callback_data="arb_funding")],
-        [InlineKeyboardButton(text="📉 Basis", callback_data="arb_basis"),
-         InlineKeyboardButton(text="📊 Stat Arb", callback_data="arb_stat_arb")],
-        [InlineKeyboardButton(text="🚨 Закрыть всё", callback_data="arb_emergency_close")],
-        [InlineKeyboardButton(text="⏹ Стоп", callback_data="arb_multi_stop")],
-    ])
-
-
-def _get_exchange_names() -> str:
-    if _exchanges:
-        return "/".join(e.upper() for e in _exchanges.keys())
-    return "OKX/HTX/Bybit"
-
-
-async def _ensure_started(bot, user_id: int) -> Optional[str]:
-    """Start bot if not running. Returns status text or None."""
-    global _router, _router_task, _state, _exchanges
-
-    if _router_task and not _router_task.done():
-        return None
-
-    config = ArbitrageConfig.from_env()
-
-    okx_client = OKXRestClient(config.get_okx_config())
-    htx_client = HTXRestClient(config.get_htx_config())
-    bybit_client = BybitRestClient(config.get_bybit_config())
-
-    _exchanges = {"okx": okx_client, "htx": htx_client, "bybit": bybit_client}
-    _state = BotState()
-    _state.is_running = True
-
-    market_data = MarketDataEngine(_exchanges)
-    risk_manager = RiskManager(config, _state)
-    executor = TradeExecutor(config, _exchanges)
-    notification_manager = NotificationManager(bot, user_id)
-
-    _router = StrategyRouter(
-        config=config,
-        state=_state,
-        market_data=market_data,
-        risk_manager=risk_manager,
-        executor=executor,
-        notification_manager=notification_manager,
-    )
-
-    pairs_count = await _router.initialize()
-    # Pass contract sizes to executor
-    executor.set_contract_sizes(market_data.contract_sizes)
-
-    _router_task = asyncio.create_task(_router.start())
-
-    status = _router.get_status()
-    mode = status["mode"].upper()
-    strategies = ", ".join(s.replace("_", " ").title() for s in status["strategies"])
-
-    mode_detail = ""
-    if mode == "REAL":
-        mode_detail = (
-            f"Плечо: {config.leverage}x\n"
-            f"Позиция: {config.max_position_pct*100:.0f}% депозита\n"
-            f"Стратегии: {strategies}"
+        return InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="▶️ Старт", callback_data="arb_multi_start")]]
         )
-    elif mode == "DRY_RUN":
-        mode_detail = f"Данные реальные, ордера НЕ размещаются\nСтратегии: {strategies}"
-    else:
-        mode_detail = f"Только мониторинг\nСтратегии: {strategies}"
-
-    exchange_names = _get_exchange_names()
-
-    await notification_manager.send(
-        f"✅ <b>Бот запущен!</b>\n\n"
-        f"Биржи: <b>{exchange_names}</b>\n"
-        f"Режим: <b>{mode}</b>\n"
-        f"Пар: {pairs_count}\n"
-        f"{mode_detail}\n\n"
-        f"🔔 Уведомления о сделках"
-    )
-
-    return (
-        f"Запущен ({mode})\n"
-        f"Биржи: {exchange_names}\n"
-        f"Пар: {pairs_count}\n"
-        f"{mode_detail}"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Возможности", callback_data="arb_scan_now"),
+             InlineKeyboardButton(text="📈 Статистика", callback_data="arb_stats")],
+            [InlineKeyboardButton(text="📋 История", callback_data="arb_history"),
+             InlineKeyboardButton(text="💸 Funding", callback_data="arb_funding")],
+            [InlineKeyboardButton(text="📉 Basis", callback_data="arb_basis"),
+             InlineKeyboardButton(text="📊 Stat Arb", callback_data="arb_stat_arb")],
+            [InlineKeyboardButton(text="🚨 Закрыть всё", callback_data="arb_emergency_close")],
+            [InlineKeyboardButton(text="⏹ Стоп", callback_data="arb_multi_stop")],
+        ]
     )
 
 
-# ─── Menu ──────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Affordability helpers
+# ---------------------------------------------------------------------------
 
-async def handle_arbitrage_menu(m: types.Message):
-    """Main arbitrage menu — auto-start."""
-    try:
-        start_msg = await _ensure_started(m.bot, m.from_user.id)
-        is_running = _router_task is not None and not _router_task.done()
 
-        if start_msg:
-            status_line = f"🟢 {start_msg}"
-        elif is_running and _router:
-            status_line = _build_status_line()
-        else:
-            status_line = "⚪ Остановлен"
+def _symbol_min_notional_usd(market_data: MarketDataEngine, exchange: str, symbol: str) -> float:
+    ticker = market_data.get_futures_price(exchange, symbol)
+    if not ticker:
+        return 0.0
+    mid = (ticker.bid + ticker.ask) / 2
+    ct = market_data.get_contract_size(exchange, symbol)
+    if mid <= 0 or ct <= 0:
+        return 0.0
+    if exchange == "bybit":
+        return 5.0
+    return mid * ct
 
-        exchange_names = _get_exchange_names()
-        text = f"⚡ <b>Арбитраж {exchange_names}</b>\n\n{status_line}"
-        await m.answer(text, reply_markup=_main_keyboard(is_running), parse_mode="HTML")
 
-    except Exception as e:
-        logger.error(f"Error in arbitrage menu: {e}", exc_info=True)
-        await m.answer(f"❌ Ошибка: {str(e)}")
+def _filter_affordable_symbols(
+    market_data: MarketDataEngine,
+    symbols: list[str],
+    exchanges: list[str],
+    balances: dict[str, float],
+    headroom: float = 1.0,
+) -> list[str]:
+    affordable: list[str] = []
+    for symbol in symbols:
+        ok = True
+        for exchange in exchanges:
+            available = max(0.0, balances.get(exchange, 0.0)) * max(0.0, min(1.0, headroom))
+            min_notional = _symbol_min_notional_usd(market_data, exchange, symbol)
+            if min_notional <= 0 or available < min_notional:
+                ok = False
+                break
+        if ok:
+            affordable.append(symbol)
+    return affordable
+
+
+def _best_joint_requirement_hint(
+    market_data: MarketDataEngine,
+    symbols: list[str],
+    exchanges: list[str],
+    headroom: float = 1.0,
+) -> tuple[str, dict[str, float]] | tuple[None, None]:
+    best_symbol = None
+    best_requirements: dict[str, float] | None = None
+    best_score = None
+    scale = max(0.01, min(1.0, headroom))
+    for symbol in symbols:
+        req: dict[str, float] = {}
+        valid = True
+        for exchange in exchanges:
+            mn = _symbol_min_notional_usd(market_data, exchange, symbol)
+            if mn <= 0:
+                valid = False
+                break
+            req[exchange] = mn / scale
+        if not valid:
+            continue
+        score = max(req.values()) if req else float("inf")
+        if best_score is None or score < best_score:
+            best_score = score
+            best_symbol = symbol
+            best_requirements = req
+    if best_symbol is None or best_requirements is None:
+        return None, None
+    return best_symbol, best_requirements
+
+
+def _min_required_balance_hint(
+    market_data: MarketDataEngine,
+    symbols: list[str],
+    exchanges: list[str],
+    headroom: float = 1.0,
+) -> dict[str, float]:
+    hint: dict[str, float] = {}
+    for exchange in exchanges:
+        mins = []
+        for symbol in symbols:
+            mn = _symbol_min_notional_usd(market_data, exchange, symbol)
+            if mn > 0:
+                mins.append(mn / max(0.01, min(1.0, headroom)))
+        if mins:
+            hint[exchange] = min(mins)
+    return hint
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
 
 
 def _build_status_line() -> str:
-    """Build status line from current router state."""
-    if not _router or not _state:
-        return "⚪ Нет данных"
-
-    status = _router.get_status()
-    positions = _state.position_count()
-    trades = status["total_trades"]
-    pnl = status["total_pnl"]
-    balance = status["total_balance"]
-    mode = status["mode"].upper()
-
-    pos_text = ""
-    if positions > 0:
-        pos_list = _state.get_all_positions()
-        for p in pos_list[:2]:
-            dur = p.duration()
-            pos_text += f"\n📍 {p.symbol} L:{p.long_exchange.upper()} S:{p.short_exchange.upper()} ({dur:.0f}s)"
-
+    if not _es.state or not _es.config:
+        return "⚪ Остановлен"
+    err = f"\nОшибка: {_es.last_error}" if _es.last_error else ""
     return (
-        f"🟢 {mode} | {len(_router.market_data.common_pairs)} пар\n"
-        f"💰 Баланс: ${balance:.2f}\n"
-        f"📈 Сделок: {trades} | PnL: ${pnl:.4f}\n"
-        f"📊 Позиций: {positions}{pos_text}"
+        f"🟢 {'DRY_RUN' if _es.config.execution.dry_run else 'LIVE'}\n"
+        f"Task: {_es.task_state_str()}\n"
+        f"Биржи: {_es.exchange_names()}\n"
+        f"Стратегии: {', '.join(_es.config.strategy.enabled)}\n"
+        f"Символов: {len(_es.config.symbols)}{err}"
     )
 
 
-# ─── Start / Stop ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Engine lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def _run_engine_task() -> None:
+    try:
+        await _es.engine.run_forever()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _es.last_error = str(exc)
+        logger.error("engine_fatal_error: %s", exc, exc_info=True)
+        if _es.user_id and _es.monitor:
+            try:
+                await _es.monitor.emit("engine_fatal_error", {"error": str(exc)})
+            except Exception:
+                pass
+
+
+async def _start_engine(bot, user_id: int) -> str:
+    global _router, _router_task, _state, _exchanges
+    if _es.running:
+        return "Уже запущен"
+
+    clients = None
+    venue = None
+    try:
+        config = TradingSystemConfig.from_env()
+        config.validate()
+        clients = build_exchange_clients(config)
+        market_data = MarketDataEngine(clients)
+        provider = LiveMarketDataProvider(market_data=market_data, exchanges=config.exchanges)
+        await provider.initialize()
+
+        if config.trade_all_symbols:
+            selected = usdt_symbol_universe(market_data, config.max_symbols)
+            config = replace(config, symbols=selected)
+
+        # Align working equity with real available balances to avoid oversizing.
+        balances = await market_data.fetch_balances()
+        live_equity = sum(max(0.0, v) for v in balances.values())
+        if live_equity > 0:
+            config = replace(config, starting_equity=live_equity)
+
+        affordable = _filter_affordable_symbols(
+            market_data, config.symbols, config.exchanges, balances, headroom=1.0
+        )
+        if not affordable:
+            universe = usdt_symbol_universe(market_data, max_symbols=9999)
+            affordable_universe = _filter_affordable_symbols(
+                market_data, universe, config.exchanges, balances, headroom=1.0
+            )
+            if affordable_universe:
+                config = replace(config, symbols=affordable_universe[: max(1, config.max_symbols)])
+                logger.warning(
+                    "Configured symbols are not affordable; switched to %s affordable symbols from common universe.",
+                    len(config.symbols),
+                )
+            else:
+                hints = _min_required_balance_hint(
+                    market_data, config.symbols, config.exchanges, headroom=1.0
+                )
+                best_symbol, joint_hint = _best_joint_requirement_hint(
+                    market_data, universe if universe else config.symbols, config.exchanges, headroom=1.0
+                )
+                joint_text = "n/a"
+                if best_symbol and joint_hint:
+                    req_text = ", ".join(
+                        f"{ex.upper()}~${joint_hint.get(ex, 0.0):.2f}+" for ex in config.exchanges
+                    )
+                    joint_text = f"{best_symbol}: {req_text}"
+                bal_text = ", ".join(f"{ex.upper()}=${max(0.0, balances.get(ex, 0.0)):.2f}" for ex in config.exchanges)
+                hint_text = ", ".join(f"{ex.upper()}~${amt:.2f}+" for ex, amt in hints.items()) if hints else "n/a"
+                raise ValueError(
+                    "No affordable symbols for current balances on both exchanges. "
+                    f"Balances from API: {bal_text}. "
+                    f"Approx minimum (per-exchange minima): {hint_text}. "
+                    f"Best joint symbol requirement: {joint_text}."
+                )
+        else:
+            config = replace(config, symbols=affordable)
+
+        state = SystemState(starting_equity=config.starting_equity)
+        monitor = TelegramMonitoringSink(tg_logger=logging.getLogger("trading_system"), bot=bot, user_id=user_id)
+        venue = LiveExecutionVenue(exchanges=clients, market_data=market_data)
+        execution = AtomicExecutionEngine(
+            config=config.execution,
+            venue=venue,
+            slippage=SlippageModel(),
+            state=state,
+            monitor=monitor,
+        )
+        engine = TradingSystemEngine.create(
+            config=config,
+            provider=provider,
+            monitor=monitor,
+            execution=execution,
+            state=state,
+        )
+    except Exception:
+        if venue is not None:
+            try:
+                await venue.close()
+            except Exception:
+                pass
+        elif clients:
+            for client in clients.values():
+                if hasattr(client, "close"):
+                    try:
+                        await client.close()
+                    except Exception:
+                        pass
+        raise
+
+    _es.config = config
+    _es.exchanges = clients
+    _es.provider = provider
+    _es.venue = venue
+    _es.monitor = monitor
+    _es.state = state
+    _es.engine = engine
+    _es.user_id = user_id
+    _es.last_error = None
+    _es.task = asyncio.create_task(_run_engine_task())
+
+    # Sync compatibility aliases
+    _router_task = _es.task
+    _state = _es.state
+    _exchanges = _es.exchanges
+    _router = _es.engine
+
+    await bot.send_message(
+        user_id,
+        (
+            "✅ <b>Новый trading engine запущен</b>\n\n"
+            f"Режим: <b>{'DRY_RUN' if config.execution.dry_run else 'LIVE'}</b>\n"
+            f"Биржи: <b>{_es.exchange_names()}</b>\n"
+            f"Символов: {len(config.symbols)}\n"
+            f"Стратегии: {', '.join(config.strategy.enabled)}\n"
+            f"Equity: ${config.starting_equity:.2f}"
+        ),
+        parse_mode="HTML",
+    )
+    return "Запущен"
+
+
+async def shutdown_arbitrage() -> None:
+    global _router, _router_task, _state, _exchanges
+    await _es.shutdown()
+    _router_task = None
+    _router = None
+    _state = None
+    _exchanges = {}
+
+
+# ---------------------------------------------------------------------------
+# Telegram handlers
+# ---------------------------------------------------------------------------
+
+
+async def handle_arbitrage_menu(m: types.Message):
+    is_running = _es.running
+    text = f"⚡ <b>Арбитраж {_es.exchange_names()}</b>\n\n{_build_status_line()}"
+    await m.answer(text, reply_markup=_main_keyboard(is_running), parse_mode="HTML")
+
 
 async def cb_arb_multi_start(call: types.CallbackQuery):
     try:
-        if _router_task and not _router_task.done():
+        if _es.running:
             await call.answer("Уже запущен")
             return
-
         await call.answer()
-        await call.message.edit_text("⏳ <b>Запуск...</b>", parse_mode="HTML")
-
-        start_msg = await _ensure_started(call.bot, call.from_user.id)
-
-        await call.message.edit_text(
-            f"🟢 <b>{start_msg}</b>",
-            parse_mode="HTML",
-            reply_markup=_main_keyboard(True)
-        )
-    except Exception as e:
-        logger.error(f"Error starting: {e}", exc_info=True)
-        try:
-            await call.message.edit_text(f"❌ {str(e)}", parse_mode="HTML")
-        except Exception:
-            pass
+        await _safe_edit(call.message, "⏳ <b>Запуск нового engine...</b>")
+        status = await _start_engine(call.bot, call.from_user.id)
+        await _safe_edit(call.message, f"🟢 <b>{status}</b>\n\n{_build_status_line()}", reply_markup=_main_keyboard(True))
+    except Exception as exc:
+        logger.error("Start error: %s", exc, exc_info=True)
+        await _safe_edit(call.message, f"❌ {exc}", reply_markup=_main_keyboard(False))
 
 
 async def cb_arb_multi_stop(call: types.CallbackQuery):
-    global _router_task, _state, _router, _exchanges
+    await call.answer()
+    await shutdown_arbitrage()
+    await _safe_edit(call.message, "⏹ <b>Остановлен</b>", reply_markup=_main_keyboard(False))
 
-    try:
-        if not _router_task or _router_task.done():
-            await call.answer("Не запущен")
-            return
-
-        stats_text = ""
-        if _state:
-            stats = _state.get_stats()
-            if stats.get("total_trades", 0) > 0:
-                stats_text = (
-                    f"\n\n📊 <b>Итого:</b>\n"
-                    f"Сделок: {stats['total_trades']}\n"
-                    f"PnL: ${stats['total_pnl']:.4f}"
-                )
-
-        if _router:
-            _router.stop()
-        if _state:
-            _state.is_running = False
-
-        if _router_task:
-            _router_task.cancel()
-            try:
-                await _router_task
-            except asyncio.CancelledError:
-                pass
-
-        # Close exchange sessions
-        for client in _exchanges.values():
-            if client and hasattr(client, 'close'):
-                try:
-                    await client.close()
-                except Exception:
-                    pass
-            elif client and hasattr(client, 'session') and client.session:
-                try:
-                    await client.session.close()
-                except Exception:
-                    pass
-
-        _router_task = None
-        _router = None
-        _state = None
-        _exchanges = {}
-
-        await call.message.edit_text(
-            f"⏹ <b>Остановлен</b>{stats_text}",
-            parse_mode="HTML",
-            reply_markup=_main_keyboard(False)
-        )
-        await call.answer("Остановлен")
-
-    except Exception as e:
-        logger.error(f"Error stopping: {e}", exc_info=True)
-        await call.answer(f"Ошибка: {str(e)}")
-
-
-# ─── Scan (Opportunities) ──────────────────────────────────────────────────
 
 async def cb_arb_scan_now(call: types.CallbackQuery):
-    """Show current opportunities from all strategies."""
-    try:
-        await call.answer("Сканирование...")
-
-        if not _router:
-            await _safe_edit(call.message, "📊 Бот не запущен",
-                             reply_markup=_main_keyboard(False))
-            return
-
-        results = await _router.scan_all()
-
-        # Positions info
-        pos_text = ""
-        if _state and _state.position_count() > 0:
-            pos_text = "<b>📍 Открытые позиции:</b>\n"
-            for p in _state.get_all_positions():
-                dur = p.duration()
-                pos_text += (
-                    f"  {p.strategy}: {p.symbol} "
-                    f"L:{p.long_exchange.upper()} S:{p.short_exchange.upper()} "
-                    f"({dur:.0f}s)\n"
+    await call.answer("Сканирую...")
+    if not _es.engine or not _es.provider:
+        await _safe_edit(call.message, "📊 Бот не запущен", reply_markup=_main_keyboard(False))
+        return
+    lines = ["📊 <b>Top сигналов (новые стратегии)</b>", ""]
+    found = 0
+    for symbol in _es.config.symbols[:10]:
+        try:
+            snapshot = await _es.provider.get_snapshot(symbol)
+            intents = await _es.engine.strategies.generate_intents(snapshot)
+            intents.sort(key=lambda x: x.expected_edge_bps * x.confidence, reverse=True)
+            for intent in intents[:2]:
+                found += 1
+                lines.append(
+                    f"{symbol} | {intent.strategy_id.value} | edge={intent.expected_edge_bps:.2f}bps | conf={intent.confidence:.2f}"
                 )
-            pos_text += "\n"
-
-        text = f"{pos_text}📊 <b>Топ возможности</b>:\n\n"
-        has_data = False
-
-        for strategy_name, items in results.items():
-            if not items:
-                continue
-            has_data = True
-            display_name = strategy_name.replace("_", " ").title()
-            text += f"<b>{display_name}:</b>\n"
-
-            for item in items[:5]:
-                sym = item.get("symbol", "?")
-                if strategy_name == "funding_arb":
-                    spread = item.get("funding_spread", 0)
-                    ann = item.get("annualized", 0)
-                    text += (
-                        f"  {sym}: {spread:.4f}% "
-                        f"(~{ann:.0f}%/yr) "
-                        f"L:{item.get('long_exchange', '?').upper()} "
-                        f"S:{item.get('short_exchange', '?').upper()}\n"
-                    )
-                elif strategy_name == "basis_arb":
-                    basis = item.get("basis_pct", 0)
-                    text += (
-                        f"  {sym}: {basis:+.3f}% "
-                        f"({item.get('exchange', '?').upper()} "
-                        f"{'contango' if basis > 0 else 'backwd'})\n"
-                    )
-                elif strategy_name == "stat_arb":
-                    z = item.get("z_score", 0)
-                    spread = item.get("current_spread", 0)
-                    text += (
-                        f"  {sym}: z={z:+.2f} spread={spread:.3f}% "
-                        f"{item.get('ex1', '?').upper()}↔{item.get('ex2', '?').upper()}\n"
-                    )
-            text += "\n"
-
-        if not has_data:
-            text += "Нет данных (ожидание первых циклов)\n"
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        except Exception:
+            continue
+        if found >= 20:
+            break
+    if found == 0:
+        lines.append("Нет валидных сигналов в текущем цикле")
+    await _safe_edit(
+        call.message,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_scan_now")],
                 [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Scan error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
+            ]
+        ),
+    )
 
-
-# ─── Stats ──────────────────────────────────────────────────────────────────
 
 async def cb_arb_stats(call: types.CallbackQuery):
-    try:
-        await call.answer("Статистика...")
-
-        if not _state or not _router:
-            await _safe_edit(call.message, "📈 Бот не запущен",
-                             reply_markup=_main_keyboard(False))
-            return
-
-        status = _router.get_status()
-        stats = _state.get_stats()
-        metrics = status.get("metrics", {})
-
-        total = stats["total_trades"]
-        wins = stats["successful_trades"]
-        losses = stats["failed_trades"]
-        pnl = stats["total_pnl"]
-        balance = stats["total_balance"]
-        win_rate = stats["success_rate"]
-
-        # Positions
-        pos_text = "Нет активных позиций"
-        if _state.position_count() > 0:
-            pos_lines = []
-            for p in _state.get_all_positions():
-                dur = p.duration()
-                pos_lines.append(
-                    f"  {p.strategy}: {p.symbol} "
-                    f"L:{p.long_exchange.upper()} S:{p.short_exchange.upper()} "
-                    f"${p.size_usd:.2f} ({dur:.0f}s)"
-                )
-            pos_text = "\n".join(pos_lines)
-
-        # Balance per exchange
-        balance_lines = []
-        for ex, bal in stats.get("balances", {}).items():
-            balance_lines.append(f"   {ex.upper()}: ${bal:.2f}")
-
-        # Per-strategy stats
-        strat_text = ""
-        for name, ss in stats.get("strategy_stats", {}).items():
-            display = name.replace("_", " ").title()
-            sw = ss.get("wins", 0)
-            sl = ss.get("losses", 0)
-            sp = ss.get("pnl", 0)
-            strat_text += f"  {display}: {ss['trades']} (✅{sw} ❌{sl}) ${sp:+.4f}\n"
-
-        # Metrics
-        sharpe = metrics.get("sharpe", 0)
-        max_dd = metrics.get("max_drawdown", 0)
-        avg_cycle = metrics.get("avg_cycle_ms", 0)
-
-        text = (
-            f"📈 <b>Статистика</b>\n\n"
-            f"💰 Баланс: <b>${balance:.2f}</b>\n"
-            f"{chr(10).join(balance_lines)}\n\n"
-            f"📊 Сделок: {total} (✅{wins} ❌{losses})\n"
-            f"🎯 Win rate: {win_rate:.1f}%\n"
-            f"💵 PnL: <b>${pnl:+.4f}</b>\n"
-            f"📉 Max DD: ${max_dd:.4f}\n"
-            f"📐 Sharpe: {sharpe:.2f}\n"
-            f"⏱ Цикл: {avg_cycle:.0f}ms\n\n"
-        )
-
-        if strat_text:
-            text += f"<b>По стратегиям:</b>\n{strat_text}\n"
-
-        text += f"📍 {pos_text}"
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await call.answer("Статистика...")
+    if not _es.state or not _es.config:
+        await _safe_edit(call.message, "📈 Бот не запущен", reply_markup=_main_keyboard(False))
+        return
+    snap = await _es.state.snapshot()
+    dd = await _es.state.drawdowns()
+    text = (
+        "📈 <b>Статистика нового engine</b>\n\n"
+        f"Режим: {'DRY_RUN' if _es.config.execution.dry_run else 'LIVE'}\n"
+        f"Task: {_es.task_state_str()}\n"
+        f"Биржи: {_es.exchange_names()}\n"
+        f"Символов: {len(_es.config.symbols)}\n"
+        f"Стратегии: {', '.join(_es.config.strategy.enabled)}\n\n"
+        f"Equity: ${snap['equity']:.2f}\n"
+        f"Open positions: {snap['open_positions']}\n"
+        f"Total exposure: ${snap['total_exposure']:.2f}\n"
+        f"Realized PnL: ${snap['realized_pnl']:.2f}\n"
+        f"Daily DD: {dd['daily_dd']*100:.2f}%\n"
+        f"Portfolio DD: {dd['portfolio_dd']*100:.2f}%\n"
+        f"Kill switch: {'ON' if snap['kill_switch'] else 'OFF'}"
+    )
+    if _es.last_error:
+        text += f"\n\nОшибка task:\n<code>{_es.last_error}</code>"
+    await _safe_edit(
+        call.message,
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_stats")],
                 [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Stats error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
+            ]
+        ),
+    )
 
-
-# ─── History ────────────────────────────────────────────────────────────────
 
 async def cb_arb_history(call: types.CallbackQuery):
-    try:
-        await call.answer("Загрузка...")
+    await call.answer()
+    events = list(_es.monitor.events)[-20:] if _es.monitor else []
+    if not events:
+        text = "📋 <b>История</b>\n\nНет событий."
+    else:
+        lines = ["📋 <b>История событий</b>", ""]
+        for e in reversed(events):
+            lines.append(f"{e['event']}: {e['payload']}")
+        text = "\n".join(lines)
+    await _safe_edit(call.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
 
-        from arbitrage.core.trade_history import get_recent_trades, get_overall_stats
-        trades = await get_recent_trades(10)
-        overall = await get_overall_stats()
-
-        text = "📋 <b>История сделок</b>\n\n"
-
-        if overall.get("total_trades", 0) > 0:
-            wr = (overall["wins"] / overall["total_trades"] * 100) if overall["total_trades"] > 0 else 0
-            text += (
-                f"<b>Всего:</b> {overall['total_trades']} сделок\n"
-                f"WR: {wr:.0f}% | PnL: ${overall['total_pnl']:.4f}\n"
-                f"Fees: ${overall['total_fees']:.4f} | Funding: ${overall['total_funding']:.4f}\n"
-                f"Best: ${overall['best_trade']:.4f} | Worst: ${overall['max_drawdown_trade']:.4f}\n\n"
-            )
-
-        if trades:
-            text += "<b>Последние:</b>\n"
-            for t in trades:
-                emoji = "✅" if t.get("pnl_usd", 0) > 0 else "❌"
-                duration = t.get("duration_seconds", 0)
-                from datetime import datetime
-                exit_dt = datetime.fromtimestamp(t["exit_time"]).strftime("%m/%d %H:%M") if t.get("exit_time") else "?"
-                text += (
-                    f"{emoji} {t['symbol']} ${t['pnl_usd']:.4f} "
-                    f"({t['entry_spread']:.2f}%→{t.get('exit_spread', 0):.2f}%) "
-                    f"{duration:.0f}s {exit_dt}\n"
-                )
-        else:
-            text += "Нет закрытых сделок"
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_history")],
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"History error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
-
-
-# ─── Per-pair stats ─────────────────────────────────────────────────────────
 
 async def cb_arb_pair_stats(call: types.CallbackQuery):
-    try:
-        await call.answer("Загрузка...")
+    await call.answer()
+    await _safe_edit(call.message, "📊 Per-pair статистика пока агрегируется через события.\nИспользуйте «История».",
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
 
-        from arbitrage.core.trade_history import get_pair_stats
-        pair_stats = await get_pair_stats()
-
-        if not pair_stats:
-            text = "📊 <b>Per-pair статистика</b>\n\nНет данных о сделках"
-        else:
-            text = "📊 <b>Per-pair статистика</b>\n\n"
-            for ps in pair_stats[:15]:
-                wr = (ps["wins"] / ps["total_trades"] * 100) if ps["total_trades"] > 0 else 0
-                emoji = "🟢" if ps["total_pnl"] > 0 else "🔴"
-                text += (
-                    f"{emoji} <b>{ps['symbol']}</b>\n"
-                    f"   Сделок: {ps['total_trades']} (WR: {wr:.0f}%)\n"
-                    f"   PnL: ${ps['total_pnl']:.4f} (avg ${ps['avg_pnl']:.4f})\n"
-                    f"   Fees: ${ps['total_fees']:.4f} | Funding: ${ps['total_funding']:.4f}\n\n"
-                )
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_pair_stats")],
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Pair stats error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
-
-
-# ─── Funding Rates ──────────────────────────────────────────────────────────
 
 async def cb_arb_funding(call: types.CallbackQuery):
-    """Show funding rate spreads across exchanges."""
-    try:
-        await call.answer("Загрузка...")
+    await call.answer()
+    await _safe_edit(call.message, "💸 Funding view доступен в «Возможности» (scan).",
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
 
-        if not _router:
-            await _safe_edit(call.message, "💸 Бот не запущен",
-                             reply_markup=_main_keyboard(False))
-            return
-
-        strategy = _router._strategies.get("funding_arb")
-        if not strategy:
-            await _safe_edit(call.message, "💸 Funding стратегия не включена")
-            return
-
-        items = strategy.get_all_spreads(_router.market_data)
-
-        if not items:
-            text = "💸 <b>Funding Rates</b>\n\nНет данных"
-        else:
-            text = "💸 <b>Funding Rate Spreads</b>\n\n"
-            for item in items[:15]:
-                sym = item["symbol"]
-                spread = item["funding_spread"]
-                ann = item["annualized"]
-                long_ex = item["long_exchange"]
-                short_ex = item["short_exchange"]
-
-                rates_text = " | ".join(
-                    f"{ex.upper()}:{r:.4f}%"
-                    for ex, r in item["rates"].items()
-                )
-
-                text += (
-                    f"{'🟢' if spread > 0.03 else '⚪'} <b>{sym}</b>\n"
-                    f"   Spread: {spread:.4f}% (~{ann:.0f}%/yr)\n"
-                    f"   L:{long_ex.upper()} S:{short_ex.upper()}\n"
-                    f"   {rates_text}\n\n"
-                )
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_funding")],
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Funding error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
-
-
-# ─── Basis (Spot vs Futures) ───────────────────────────────────────────────
 
 async def cb_arb_basis(call: types.CallbackQuery):
-    """Show spot-futures basis spreads."""
-    try:
-        await call.answer("Загрузка...")
+    await call.answer()
+    await _safe_edit(call.message, "📉 Basis view доступен в «Возможности» (scan).",
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
 
-        if not _router:
-            await _safe_edit(call.message, "📉 Бот не запущен",
-                             reply_markup=_main_keyboard(False))
-            return
-
-        strategy = _router._strategies.get("basis_arb")
-        if not strategy:
-            await _safe_edit(call.message, "📉 Basis стратегия не включена")
-            return
-
-        items = strategy.get_all_spreads(_router.market_data)
-
-        if not items:
-            text = "📉 <b>Spot-Futures Basis</b>\n\nНет данных (нужны spot тикеры)"
-        else:
-            text = "📉 <b>Spot-Futures Basis</b>\n\n"
-            for item in items[:15]:
-                basis = item["basis_pct"]
-                emoji = "📈" if basis > 0 else "📉"
-                state = "contango" if basis > 0 else "backwardation"
-                text += (
-                    f"{emoji} <b>{item['symbol']}</b> ({item['exchange'].upper()})\n"
-                    f"   Basis: {basis:+.3f}% ({state})\n"
-                    f"   Spot: ${item['spot_price']:.4f} | Fut: ${item['futures_price']:.4f}\n\n"
-                )
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_basis")],
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Basis error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
-
-
-# ─── Statistical Arbitrage ──────────────────────────────────────────────────
 
 async def cb_arb_stat_arb(call: types.CallbackQuery):
-    """Show statistical arbitrage z-scores."""
-    try:
-        await call.answer("Загрузка...")
+    await call.answer()
+    await _safe_edit(call.message, "📊 Stat-arb view доступен в «Возможности» (scan).",
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
 
-        if not _router:
-            await _safe_edit(call.message, "📊 Бот не запущен",
-                             reply_markup=_main_keyboard(False))
-            return
-
-        strategy = _router._strategies.get("stat_arb")
-        if not strategy:
-            await _safe_edit(call.message, "📊 Stat Arb стратегия не включена")
-            return
-
-        items = strategy.get_all_spreads(_router.market_data)
-
-        if not items:
-            text = "📊 <b>Statistical Arbitrage</b>\n\nНет данных (нужно >= 30 samples)"
-        else:
-            text = "📊 <b>Stat Arb Z-Scores</b>\n\n"
-            for item in items[:15]:
-                z = item["z_score"]
-                sym = item["symbol"]
-                ex1 = item["ex1"].upper()
-                ex2 = item["ex2"].upper()
-                samples = item["samples"]
-
-                if abs(z) > 2.5:
-                    emoji = "🔴"
-                elif abs(z) > 1.5:
-                    emoji = "🟡"
-                else:
-                    emoji = "🟢"
-
-                text += (
-                    f"{emoji} <b>{sym}</b> {ex1}↔{ex2}\n"
-                    f"   z={z:+.2f} | spread={item['current_spread']:.3f}%\n"
-                    f"   mean={item['mean']:.3f}% std={item['std']:.3f}% ({samples} samples)\n\n"
-                )
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_stat_arb")],
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Stat arb error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
-
-
-# ─── Emergency Close ────────────────────────────────────────────────────────
 
 async def cb_arb_emergency_close(call: types.CallbackQuery):
-    try:
-        await call.answer("⚠️ Подтвердите!")
-        exchange_names = _get_exchange_names()
-        await call.message.edit_text(
-            f"🚨 <b>ЭКСТРЕННОЕ ЗАКРЫТИЕ</b>\n\n"
-            f"Будут закрыты ВСЕ позиции на {exchange_names} по рыночной цене.\n\n"
-            f"⚠️ Это может привести к убыткам!",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🚨 ПОДТВЕРДИТЬ ЗАКРЫТИЕ", callback_data="arb_emergency_confirm")],
+    await call.answer("Подтвердите!")
+    await _safe_edit(
+        call.message,
+        "🚨 <b>Экстренная остановка</b>\n\nБудет остановлен engine и запрещены новые входы.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🚨 ПОДТВЕРДИТЬ", callback_data="arb_emergency_confirm")],
                 [InlineKeyboardButton(text="⬅️ Отмена", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Emergency close dialog error: {e}", exc_info=True)
+            ]
+        ),
+    )
 
 
 async def cb_arb_emergency_confirm(call: types.CallbackQuery):
-    try:
-        await call.answer("Закрываем...")
+    await call.answer("Останавливаю...")
+    await shutdown_arbitrage()
+    await _safe_edit(call.message, "🚨 <b>Engine остановлен</b>", reply_markup=_main_keyboard(False))
 
-        if not _router:
-            await call.message.edit_text(
-                "Бот не запущен — нечего закрывать",
-                parse_mode="HTML",
-                reply_markup=_main_keyboard(False)
-            )
-            return
-
-        await call.message.edit_text("⏳ <b>Закрываем все позиции...</b>", parse_mode="HTML")
-
-        positions = _state.get_all_positions() if _state else []
-        closed = 0
-        failed = 0
-
-        for pos in positions:
-            try:
-                success, pnl = await _router.executor.execute_exit(
-                    pos, _state, _router.market_data, "emergency_manual"
-                )
-                if success:
-                    closed += 1
-                    if _state:
-                        _state.record_trade(pos.strategy, success=(pnl > 0), pnl=pnl)
-                else:
-                    failed += 1
-            except Exception as e:
-                logger.error(f"Emergency close {pos.symbol}: {e}")
-                failed += 1
-
-        result = f"Закрыто: {closed}\nНе удалось: {failed}\nВсего было: {len(positions)}"
-
-        await call.message.edit_text(
-            f"🚨 <b>Emergency Close</b>\n\n<pre>{result}</pre>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Emergency confirm error: {e}", exc_info=True)
-        await call.message.edit_text(f"❌ {str(e)}", parse_mode="HTML")
-
-
-# ─── Settings ───────────────────────────────────────────────────────────────
 
 async def cb_arb_settings(call: types.CallbackQuery):
-    try:
-        await call.answer()
+    await call.answer()
+    if not _es.config:
+        await _safe_edit(call.message, "⚙️ Engine не запущен", reply_markup=_main_keyboard(False))
+        return
+    text = (
+        "⚙️ <b>Настройки нового engine</b>\n\n"
+        f"Dry run: {_es.config.execution.dry_run}\n"
+        f"Symbols: {len(_es.config.symbols)}\n"
+        f"Max symbols: {_es.config.max_symbols}\n"
+        f"Strategies: {', '.join(_es.config.strategy.enabled)}\n"
+        f"Max exposure: {_es.config.risk.max_total_exposure_pct:.2f}\n"
+        f"Max strategy alloc: {_es.config.risk.max_strategy_allocation_pct:.2f}\n"
+        f"Latency limit ms: {_es.config.risk.api_latency_limit_ms}\n"
+        f"Max open positions: {_es.config.risk.max_open_positions}\n"
+    )
+    await _safe_edit(call.message, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
 
-        if not _router:
-            await _safe_edit(call.message, "⚙️ Бот не запущен",
-                             reply_markup=_main_keyboard(False))
-            return
-
-        config = _router.config
-        status = _router.get_status()
-        strategies = ", ".join(s.replace("_", " ").title() for s in status["strategies"])
-
-        text = (
-            "⚙️ <b>Настройки</b>\n\n"
-            f"Режим: <b>{status['mode'].upper()}</b>\n"
-            f"Стратегии: {strategies}\n\n"
-            f"📊 Entry/exit (Funding):\n"
-            f"   BTC: {config.funding_btc_threshold}%\n"
-            f"   ETH: {config.funding_eth_threshold}%\n"
-            f"   ALT: {config.funding_alt_threshold}%\n\n"
-            f"📉 Basis close: {config.basis_close_threshold}%\n\n"
-            f"📊 Stat Arb:\n"
-            f"   Z-entry: {config.stat_arb_z_entry}\n"
-            f"   Z-exit: {config.stat_arb_z_exit}\n"
-            f"   Window: {config.stat_arb_window}\n\n"
-            f"⚡ Leverage: {config.leverage}x\n"
-            f"💰 Position: {config.max_position_pct*100:.0f}%\n"
-            f"📊 Max concurrent: {config.max_concurrent_positions}\n"
-        )
-
-        await _safe_edit(call.message, text,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ])
-        )
-    except Exception as e:
-        logger.error(f"Settings error: {e}", exc_info=True)
-        await _safe_edit(call.message, f"❌ {str(e)}")
-
-
-# ─── Back to Menu ──────────────────────────────────────────────────────────
 
 async def cb_arb_menu(call: types.CallbackQuery):
-    try:
-        await call.answer()
-        is_running = _router_task is not None and not _router_task.done()
-
-        if is_running and _router:
-            status_line = _build_status_line()
-        else:
-            status_line = "⚪ Остановлен"
-
-        exchange_names = _get_exchange_names()
-        text = f"⚡ <b>Арбитраж {exchange_names}</b>\n\n{status_line}"
-        await _safe_edit(call.message, text, reply_markup=_main_keyboard(is_running))
-
-    except Exception as e:
-        logger.error(f"Menu error: {e}", exc_info=True)
+    await call.answer()
+    text = f"⚡ <b>Арбитраж {_es.exchange_names()}</b>\n\n{_build_status_line()}"
+    await _safe_edit(call.message, text, reply_markup=_main_keyboard(_es.running))

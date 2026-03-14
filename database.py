@@ -50,7 +50,7 @@ async def init_db():
 
 
 async def get_settings(user_id: int) -> Optional[Tuple]:
-    """Получение настроек пользователя"""
+    """Получение настроек пользователя (создаёт запись при первом обращении)"""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
@@ -58,11 +58,16 @@ async def get_settings(user_id: int) -> Optional[Tuple]:
                 (user_id,)
             )
             row = await cur.fetchone()
-            if not row:
-                await db.execute("INSERT INTO user_settings (user_id) VALUES (?)", (user_id,))
-                await db.commit()
-                return await get_settings(user_id)
-            return row
+            if row:
+                return row
+            # Race-safe bootstrap: INSERT OR IGNORE avoids UNIQUE violation on concurrent /start.
+            await db.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (user_id,))
+            await db.commit()
+            cur = await db.execute(
+                "SELECT user_id, currencies, notify_time, days, timezone, last_sent_date FROM user_settings WHERE user_id=?",
+                (user_id,)
+            )
+            return await cur.fetchone()
     except Exception as e:
         logger.error(f"Error getting settings for user {user_id}: {e}", exc_info=True)
         raise
@@ -81,6 +86,8 @@ async def update_settings(user_id: int, field: str, value: str):
 
     try:
         async with aiosqlite.connect(DB_PATH) as db:
+            # Guarantee user row exists before update.
+            await db.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (user_id,))
             # Безопасно: field проверен по белому списку
             await db.execute(f"UPDATE user_settings SET {field}=? WHERE user_id=?", (value, user_id))
             await db.commit()

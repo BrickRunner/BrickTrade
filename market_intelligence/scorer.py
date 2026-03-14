@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from market_intelligence.ml_weights import OnlineWeightOptimizer
-from market_intelligence.models import FeatureVector, MarketRegime, OpportunityScore, RegimeState
+from market_intelligence.models import FeatureKey, FeatureVector, MarketRegime, OpportunityScore, RegimeState
 
 
 REGIME_WEIGHT_OVERRIDES: Dict[MarketRegime, Dict[str, float]] = {
@@ -28,6 +28,7 @@ class OpportunityScorer:
         w_risk_penalty: float = 0.28,
         w_liquidity: float = 0.15,
         weights_file: Optional[Path] = None,
+        signal_half_life_seconds: float = 1800.0,
     ):
         self.adaptive_ml_weighting = adaptive_ml_weighting
         self.w_volatility = w_volatility
@@ -36,6 +37,10 @@ class OpportunityScorer:
         self.w_regime = w_regime
         self.w_risk_penalty = w_risk_penalty
         self.w_liquidity = w_liquidity
+
+        # BLOCK 3: Signal time-decay tracking
+        self._first_seen: Dict[str, float] = {}  # symbol -> timestamp первого обнаружения
+        self._signal_half_life_seconds: float = signal_half_life_seconds
 
         # BLOCK 4.1: Initialize online weight optimizer
         self._weight_optimizer: Optional[OnlineWeightOptimizer] = None
@@ -74,8 +79,18 @@ class OpportunityScorer:
             w_risk_penalty = overrides.get("w_risk_penalty", self.w_risk_penalty)
             w_liquidity = overrides.get("w_liquidity", self.w_liquidity)
 
+        # FIX C.3: Normalize positive weights to sum to 1.0
+        positive_sum = w_volatility + w_funding + w_oi + w_regime + w_liquidity
+        if positive_sum > 0:
+            w_volatility /= positive_sum
+            w_funding /= positive_sum
+            w_oi /= positive_sum
+            w_regime /= positive_sum
+            w_liquidity /= positive_sum
+        # w_risk_penalty remains as-is (it's a penalty, not part of the positive sum)
+
         # Pre-compute max volume across batch for liquidity normalization.
-        volumes = {s: float(f.values.get("volume_proxy") or 0.0) for s, f in features.items()}
+        volumes = {s: float(f.values.get(FeatureKey.VOLUME_PROXY) or 0.0) for s, f in features.items()}
         max_vol = max(volumes.values()) if volumes else 0.0
         log_max = math.log1p(max_vol)
 
@@ -85,26 +100,33 @@ class OpportunityScorer:
             v = f.values
 
             required = (
-                z.get("rolling_volatility_local"),
-                z.get("bb_width_local"),
-                z.get("funding_rate"),
-                z.get("funding_delta"),
-                z.get("oi_delta"),
-                v.get("oi_delta_pct"),
+                z.get(FeatureKey.ROLLING_VOLATILITY_LOCAL),
+                z.get(FeatureKey.BB_WIDTH_LOCAL),
+                z.get(FeatureKey.FUNDING_RATE),
+                z.get(FeatureKey.FUNDING_DELTA),
+                z.get(FeatureKey.OI_DELTA),
+                v.get(FeatureKey.OI_DELTA_PCT),
             )
             if any(x is None for x in required):
                 continue
 
             vol_expansion_score = self._clip01(
-                (max(0.0, float(z.get("rolling_volatility_local"))) + max(0.0, float(z.get("bb_width_local")))) / 2.2
+                (max(0.0, float(z.get(FeatureKey.ROLLING_VOLATILITY_LOCAL))) + max(0.0, float(z.get(FeatureKey.BB_WIDTH_LOCAL)))) / 2.2
             )
             funding_divergence_score = self._clip01(
-                abs(float(z.get("funding_rate"))) * 0.8
-                + abs(float(z.get("funding_delta"))) * 4.0
-                + abs(float(v.get("funding_pct"))) / 0.2
+                abs(float(z.get(FeatureKey.FUNDING_RATE))) * 0.8
+                + abs(float(z.get(FeatureKey.FUNDING_DELTA))) * 4.0
+                + abs(float(v.get(FeatureKey.FUNDING_PCT))) / 0.2
             )
+
+            # Boost if funding is in extreme territory
+            funding_extreme = float(v.get(FeatureKey.FUNDING_EXTREME_FLAG) or 0.0)
+            if funding_extreme >= 1.0:
+                funding_divergence_score *= 1.2
+                funding_divergence_score = min(1.0, funding_divergence_score)
+
             oi_acceleration_score = self._clip01(
-                abs(float(z.get("oi_delta"))) * 0.7 + abs(float(v.get("oi_delta_pct"))) / 20.0
+                abs(float(z.get(FeatureKey.OI_DELTA))) * 0.7 + abs(float(v.get(FeatureKey.OI_DELTA_PCT))) / 20.0
             )
 
             regime_alignment_score = 0.3
@@ -115,15 +137,22 @@ class OpportunityScorer:
             elif reg.regime in {MarketRegime.PANIC, MarketRegime.OVERHEATED, MarketRegime.HIGH_VOLATILITY}:
                 regime_alignment_score = 0.15 + 0.25 * reg.confidence
             # CVD momentum: strong CVD in trend direction boosts alignment.
-            cvd = float(v.get("cvd") or 0.0)
+            cvd = float(v.get(FeatureKey.CVD) or 0.0)
             if reg.regime == MarketRegime.TREND_UP and cvd > 0.2:
                 regime_alignment_score *= 1.0 + min(0.15, cvd * 0.3)
             elif reg.regime == MarketRegime.TREND_DOWN and cvd < -0.2:
                 regime_alignment_score *= 1.0 + min(0.15, abs(cvd) * 0.3)
             regime_alignment_score = self._clip01(regime_alignment_score)
 
+            # Order flow boost: strong delta flow in trend direction
+            flow_delta_ratio = float(v.get(FeatureKey.FLOW_DELTA_RATIO) or 0.0)
+            if reg.regime == MarketRegime.TREND_UP and flow_delta_ratio > 0.3:
+                regime_alignment_score = min(1.0, regime_alignment_score + 0.05)
+            elif reg.regime == MarketRegime.TREND_DOWN and flow_delta_ratio < -0.3:
+                regime_alignment_score = min(1.0, regime_alignment_score + 0.05)
+
             # Orderbook imbalance confirmation/contradiction
-            ob_imb_raw = float(v.get("orderbook_imbalance") or 0.0) if v.get("orderbook_imbalance") is not None else None
+            ob_imb_raw = float(v.get(FeatureKey.ORDERBOOK_IMBALANCE) or 0.0) if v.get(FeatureKey.ORDERBOOK_IMBALANCE) is not None else None
             ob_bonus = 0.0
             ob_reason = ""
             if ob_imb_raw is not None:
@@ -144,14 +173,24 @@ class OpportunityScorer:
             vol_component = self._clip01(
                 math.log1p(volumes.get(symbol, 0.0)) / max(log_max, 1e-9)
             ) if log_max > 1e-9 else 0.5
-            spread_bps = float(v.get("spread_bps") or 0.0)
+            spread_bps = float(v.get(FeatureKey.SPREAD_BPS) or 0.0)
             spread_component = self._clip01(1.0 - min(1.0, spread_bps / 30.0))
             liquidity_score = 0.6 * vol_component + 0.4 * spread_component
+
+            # Order flow boost: high absorption indicates deep liquidity
+            flow_absorption = float(v.get(FeatureKey.FLOW_ABSORPTION_SCORE) or 0.0)
+            if flow_absorption > 0.5:
+                liquidity_score = min(1.0, liquidity_score + 0.05)
+
+            # NEW: Tight spread boost (spread tighter than usual = good liquidity)
+            spread_percentile = float(v.get(FeatureKey.SPREAD_PERCENTILE) or 0.5)
+            if spread_percentile < 0.4:
+                liquidity_score = min(1.0, liquidity_score * 1.15)
 
             corr = abs(correlations_to_btc.get(symbol, 0.0))
             spread_corr = abs(spread_correlations_to_btc.get(symbol, 0.0))
             risk_penalty = self._clip01(
-                0.45 * corr + 0.35 * spread_corr + 0.25 * max(0.0, float(z.get("rolling_volatility") or 0.0))
+                0.45 * corr + 0.35 * spread_corr + 0.25 * max(0.0, float(z.get(FeatureKey.ROLLING_VOLATILITY) or 0.0))
             )
 
             raw_score = (
@@ -174,11 +213,28 @@ class OpportunityScorer:
             if signal_power <= 1e-9:
                 raw_score = 0.0
 
+            # BLOCK 3: Signal time-decay
+            import time
+            now = time.time()
+
+            # Track first-seen time
+            if symbol not in self._first_seen:
+                self._first_seen[symbol] = now
+
+            # Time-decay: exponential decay with half-life
+            age_seconds = now - self._first_seen[symbol]
+            decay_factor = math.pow(0.5, age_seconds / self._signal_half_life_seconds)
+            # Minimum decay floor: don't completely kill old signals
+            decay_factor = max(0.15, decay_factor)
+
+            # Apply decay to raw_score
+            raw_score *= decay_factor
+
             # BLOCK 4.3: Directional bias with strength calculation
-            funding_rate = float(v.get("funding_rate") or 0.0)
-            basis_bps = float(v.get("basis_bps") or 0.0)
-            basis_slope = float(v.get("basis_acceleration") or 0.0)
-            oi_delta_pct_val = float(v.get("oi_delta_pct") or 0.0)
+            funding_rate = float(v.get(FeatureKey.FUNDING_RATE) or 0.0)
+            basis_bps = float(v.get(FeatureKey.BASIS_BPS) or 0.0)
+            basis_slope = float(v.get(FeatureKey.BASIS_ACCELERATION) or 0.0)
+            oi_delta_pct_val = float(v.get(FeatureKey.OI_DELTA_PCT) or 0.0)
 
             # Compute strength for each signal (0 to 1, signed)
             # Funding signal: strength proportional to |funding_rate| / 0.03 (3% is extreme)
@@ -186,6 +242,12 @@ class OpportunityScorer:
             if funding_rate != 0:
                 funding_signal = -1.0 * min(1.0, abs(funding_rate) / 0.03) * (1 if funding_rate > 0 else -1)
                 # Negative funding (longs pay shorts) = bullish = positive signal for long
+
+            # Funding deviation: crowding signal from mean-reversion model
+            funding_deviation = float(v.get(FeatureKey.FUNDING_DEVIATION) or 0.0)
+            if abs(funding_deviation) > 1.0:
+                # Positive deviation (crowded longs) = bearish, negative (crowded shorts) = bullish
+                funding_signal += -0.3 * min(1.0, abs(funding_deviation) / 3.0) * (1 if funding_deviation > 0 else -1)
 
             # Basis signal: strength proportional to |basis| / 20 bps
             basis_signal = 0.0
@@ -213,7 +275,7 @@ class OpportunityScorer:
                 "funding_sign": "positive" if funding_rate > 0 else "negative" if funding_rate < 0 else "zero",
                 "basis_direction": "contango" if basis_bps > 0 else "backwardation" if basis_bps < 0 else "flat",
                 "oi_momentum": "rising" if oi_delta_pct_val > 0.5 else "falling" if oi_delta_pct_val < -0.5 else "stable",
-                "funding_momentum": "accelerating" if float(v.get("funding_slope") or 0.0) > 0.3 else "decelerating" if float(v.get("funding_slope") or 0.0) < -0.3 else "stable",
+                "funding_momentum": "accelerating" if float(v.get(FeatureKey.FUNDING_SLOPE) or 0.0) > 0.3 else "decelerating" if float(v.get(FeatureKey.FUNDING_SLOPE) or 0.0) < -0.3 else "stable",
             }
 
             reasons = [
@@ -227,6 +289,21 @@ class OpportunityScorer:
             ]
             if ob_reason:
                 reasons.append(ob_reason)
+
+            # Order flow divergence warning
+            flow_divergence = float(v.get(FeatureKey.FLOW_DELTA_DIVERGENCE) or 0.0)
+            if flow_divergence >= 1.0:
+                reasons.append("flow_divergence_warning")
+
+            # Funding mean reversion signal
+            funding_mr_signal = float(v.get(FeatureKey.FUNDING_MEAN_REVERSION_SIGNAL) or 0.0)
+            if funding_mr_signal > 0.5:
+                reasons.append("funding_mean_reversion")
+
+            # NEW: Market impact warning (high cost to enter/exit)
+            total_cost_bps = float(v.get(FeatureKey.MARKET_IMPACT_TOTAL_BPS) or 0.0)
+            if total_cost_bps > 5.0:
+                reasons.append(f"market_impact={total_cost_bps:.1f}bps")
 
             raw_rows.append(
                 (
@@ -242,6 +319,9 @@ class OpportunityScorer:
                         "liquidity_score": liquidity_score,
                         "risk_penalty": risk_penalty,
                         "orderbook_bonus": ob_bonus,
+                        # BLOCK 3: Signal age and decay
+                        "signal_age_seconds": age_seconds,
+                        "decay_factor": decay_factor,
                     },
                     reasons,
                     bias,
@@ -271,7 +351,9 @@ class OpportunityScorer:
             ) / 4.0
 
             if len(raw_rows) <= 1:
-                normalized_score = self._clip(0.0, 100.0, (raw_score + 0.10) * 100.0)
+                # FIX: For single symbol, normalize raw_score with signal quality weighting
+                # Use raw_score (which includes weights) but scale by signal_quality for consistency
+                normalized_score = self._clip(0.0, 100.0, (0.6 * signal_quality + 0.4 * max(0.0, min(1.0, raw_score))) * 100.0)
             else:
                 rank = rank_index[symbol]
                 rank_scaled = 1.0 - (rank / max(1, len(raw_rows) - 1))
@@ -300,7 +382,7 @@ class OpportunityScorer:
                 0.45 * reg.confidence + 0.20 * (1.0 - risk_penalty) + 0.35 * (normalized_score / 100.0),
             )
             # Penalize confidence for partial exchange data.
-            dq_code = float(features[symbol].values.get("data_quality_code") or 0.0)
+            dq_code = float(features[symbol].values.get(FeatureKey.DATA_QUALITY_CODE) or 0.0)
             if dq_code > 0.0:
                 conf *= 0.80
             out.append(
@@ -318,6 +400,13 @@ class OpportunityScorer:
             )
 
         out.sort(key=lambda x: (x.score, x.confidence), reverse=True)
+
+        # BLOCK 3: Clean up expired symbols from first_seen tracking
+        current_symbols = {row[0] for row in raw_rows}
+        expired = [s for s in self._first_seen if s not in current_symbols]
+        for s in expired:
+            del self._first_seen[s]
+
         return out
 
     # BLOCK 4.4: Feedback loop for ML weight optimization

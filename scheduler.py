@@ -9,6 +9,7 @@ from database import get_all_users_settings, update_last_sent_date, get_user_thr
 from api import fetch_rates
 from utils import format_rates_for_user
 from config import DEFAULT_CURRENCIES, DEFAULT_WORKDAYS, DEFAULT_TIMEZONE
+from market_intelligence.integration import is_market_hourly_enabled, send_market_report
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,9 @@ async def scheduler_loop(bot: Bot):
     """Планировщик для отправки уведомлений"""
     # Множество для отслеживания уже отправленных уведомлений в текущей минуте
     sent_this_minute: Set[Tuple[int, int, int]] = set()  # (user_id, hour, minute)
+    market_hourly_sent: Set[Tuple[int, int]] = set()  # (user_id, hour)
     last_checked_minute = None
+    last_checked_hour = None
 
     logger.info("Scheduler started")
 
@@ -34,9 +37,21 @@ async def scheduler_loop(bot: Bot):
                 sent_this_minute.clear()
                 last_checked_minute = current_minute
 
+            # Сброс кеша hourly-отчётов при смене часа
+            if current_time.hour != last_checked_hour:
+                market_hourly_sent.clear()
+                last_checked_hour = current_time.hour
+
             rows = await get_all_users_settings()
             if rows:
                 logger.info(f"Scheduler check: {len(rows)} users at UTC {current_time.strftime('%H:%M:%S')}")
+
+            # Check once per cycle instead of per-user
+            hourly_enabled = False
+            try:
+                hourly_enabled = await is_market_hourly_enabled()
+            except Exception:
+                pass
 
             for row in rows:
                 user_id, currencies, notify_time, days, tz, last_sent = row
@@ -62,6 +77,19 @@ async def scheduler_loop(bot: Bot):
                     tz = DEFAULT_TIMEZONE
 
                 user_now = datetime.utcnow() + timedelta(hours=tz)
+
+                # Hourly market report.
+                if hourly_enabled and user_now.minute == 0:
+                    hourly_key = (user_id, user_now.hour)
+                    if hourly_key not in market_hourly_sent:
+                        try:
+                            await send_market_report(bot, user_id, force_refresh=False)
+                            market_hourly_sent.add(hourly_key)
+                            logger.info(f"Sent hourly market report to user {user_id}")
+                        except TelegramAPIError as e:
+                            logger.warning(f"Failed to send hourly market report to user {user_id}: {e}")
+                        except Exception as e:
+                            logger.error(f"Error sending hourly market report to user {user_id}: {e}", exc_info=True)
 
                 # Проверка на уже отправленное уведомление в эту минуту
                 notification_key = (user_id, user_now.hour, user_now.minute)

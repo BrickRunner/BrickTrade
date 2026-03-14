@@ -156,6 +156,12 @@ class BybitRestClient:
             params={"category": "linear", "status": "Trading"},
         )
 
+    async def get_spot_instruments(self) -> Dict[str, Any]:
+        return await self._public_request(
+            "GET", "/v5/market/instruments-info",
+            params={"category": "spot", "status": "Trading"},
+        )
+
     async def get_tickers(self, inst_type: str = "SWAP") -> Dict[str, Any]:
         """Получить котировки для всех линейных контрактов"""
         return await self._public_request(
@@ -192,15 +198,26 @@ class BybitRestClient:
             "GET", "/v5/account/wallet-balance",
             params={"accountType": "UNIFIED"},
         )
+        if not isinstance(result, dict):
+            return {"retCode": -1, "retMsg": "empty_response", "result": {}}
         # Check if UNIFIED returned coins
         if result.get("retCode") == 0:
             coins = result.get("result", {}).get("list", [{}])[0].get("coin", [])
             if coins:
                 return result
         # Fallback to CONTRACT
-        return await self._request(
+        result = await self._request(
             "GET", "/v5/account/wallet-balance",
             params={"accountType": "CONTRACT"},
+        )
+        if not isinstance(result, dict):
+            return {"retCode": -1, "retMsg": "empty_response", "result": {}}
+        return result
+
+    async def get_fee_rates(self, category: str = "linear") -> Dict[str, Any]:
+        return await self._request(
+            "GET", "/v5/account/fee-rate",
+            params={"category": category},
         )
 
     async def get_positions(self) -> Dict[str, Any]:
@@ -281,6 +298,43 @@ class BybitRestClient:
 
         return await self._request("POST", "/v5/order/create", data=body)
 
+    async def place_spot_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        order_type: str = "limit",
+        price: float = 0.0,
+        time_in_force: str = "",
+    ) -> Dict[str, Any]:
+        bybit_side = side.capitalize()
+        bybit_type = "Market"
+        tif = "GTC"
+        if order_type.lower() in ("market", "opponent", "optimal_5"):
+            bybit_type = "Market"
+            tif = ""
+        elif order_type.lower() == "ioc":
+            bybit_type = "Limit"
+            tif = "IOC"
+        elif order_type.lower() == "limit":
+            bybit_type = "Limit"
+            tif = "GTC"
+
+        body: Dict[str, Any] = {
+            "category": "spot",
+            "symbol": symbol,
+            "side": bybit_side,
+            "orderType": bybit_type,
+            "qty": str(size),
+        }
+        if bybit_type == "Limit" and price > 0:
+            body["price"] = str(price)
+        if time_in_force:
+            body["timeInForce"] = time_in_force
+        elif tif:
+            body["timeInForce"] = tif
+        return await self._request("POST", "/v5/order/create", data=body)
+
     async def cancel_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
         """Отменить ордер"""
         return await self._request(
@@ -295,6 +349,12 @@ class BybitRestClient:
             params={"category": "linear", "symbol": symbol, "orderId": order_id},
         )
 
+    async def get_spot_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        return await self._request(
+            "GET", "/v5/order/realtime",
+            params={"category": "spot", "symbol": symbol, "orderId": order_id},
+        )
+
     async def close_position(self, symbol: str, side: str, size: float) -> Dict[str, Any]:
         """Закрыть позицию рыночным ордером"""
         return await self.place_order(
@@ -304,6 +364,23 @@ class BybitRestClient:
             order_type="market",
             offset="close",
         )
+
+    # ── RFQ (Block Trading) ────────────────────────────────────────────────
+
+    async def get_rfq_config(self) -> Dict[str, Any]:
+        """Get RFQ config / counterparty info."""
+        return await self._request("GET", "/v5/rfq/config-query")
+
+    async def create_rfq(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Create RFQ. Payload must follow Bybit RFQ Create spec."""
+        return await self._request("POST", "/v5/rfq/create-rfq", data=payload)
+
+    async def cancel_rfq(self, rfq_id: str) -> Dict[str, Any]:
+        return await self._request("POST", "/v5/rfq/cancel-rfq", data={"rfqId": rfq_id})
+
+    async def execute_quote(self, quote_id: str) -> Dict[str, Any]:
+        """Execute quote returned from RFQ."""
+        return await self._request("POST", "/v5/rfq/execute-quote", data={"quoteId": quote_id})
 
     async def close(self) -> None:
         """Закрыть HTTP сессию"""

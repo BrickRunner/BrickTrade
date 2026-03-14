@@ -43,6 +43,9 @@ class ExecutionManager:
         Returns:
             (success, message)
         """
+        if self.config.monitoring_only:
+            return False, "Monitoring-only mode"
+
         logger.info(
             f"Executing arbitrage entry: LONG {long_exchange} @ {long_price}, "
             f"SHORT {short_exchange} @ {short_price}, size={size}"
@@ -67,7 +70,7 @@ class ExecutionManager:
                 logger.info("Both legs executed successfully")
 
                 # Сохранение позиций
-                await self.state.add_position(Position(
+                self.state.add_position(Position(
                     exchange=long_exchange,
                     symbol=self.config.symbol,
                     side="LONG",
@@ -76,7 +79,7 @@ class ExecutionManager:
                     order_id=long_result.get("order_id")
                 ))
 
-                await self.state.add_position(Position(
+                self.state.add_position(Position(
                     exchange=short_exchange,
                     symbol=self.config.symbol,
                     side="SHORT",
@@ -149,7 +152,7 @@ class ExecutionManager:
                 self.state.record_trade(success=True, pnl=pnl)
 
                 # Очистка позиций
-                await self.state.clear_positions()
+                self.state.clear_positions()
 
                 return True, f"Positions closed, PnL: {pnl:.2f} USDT"
 
@@ -160,7 +163,7 @@ class ExecutionManager:
                 # Удаляем только успешно закрытые позиции
                 for i, (pos, success) in enumerate(zip(positions, successes)):
                     if success:
-                        await self.state.remove_position(pos.exchange, pos.symbol)
+                        self.state.remove_position(pos.exchange, pos.symbol)
 
                 return False, "Partial close, manual intervention needed"
 
@@ -353,7 +356,7 @@ class ExecutionManager:
 
         try:
             await asyncio.gather(*tasks, return_exceptions=True)
-            await self.state.clear_positions()
+            self.state.clear_positions()
             logger.info("All positions closed")
         except Exception as e:
             logger.critical(f"Emergency close failed: {e}", exc_info=True)

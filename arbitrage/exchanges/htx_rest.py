@@ -53,6 +53,7 @@ class HTXRestClient:
         self.public_only = not self.api_key or not self.api_secret
 
         self.session: Optional[aiohttp.ClientSession] = None
+        self._spot_account_id: Optional[str] = None
 
     # ─── Session ─────────────────────────────────────────────────────────────
 
@@ -151,7 +152,8 @@ class HTXRestClient:
         url = f"{base_url}{endpoint}"
         host = urllib.parse.urlparse(base_url).hostname or ""
 
-        for attempt in range(3):
+        max_attempts = 2
+        for attempt in range(max_attempts):
             try:
                 # Пересоздаём подпись на каждой попытке (timestamp меняется)
                 get_params = dict(params or {})
@@ -159,7 +161,7 @@ class HTXRestClient:
                 session = await self._get_session()
 
                 if method.upper() == "GET":
-                    async with session.get(url, params=signed, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    async with session.get(url, params=signed, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                         return await resp.json(content_type=None)
                 else:
                     # POST: подпись в query string, тело — JSON
@@ -168,15 +170,15 @@ class HTXRestClient:
                         f"{url}?{qs}",
                         json=data or {},
                         headers={"Content-Type": "application/json"},
-                        timeout=aiohttp.ClientTimeout(total=15),
+                        timeout=aiohttp.ClientTimeout(total=8),
                     ) as resp:
                         return await resp.json(content_type=None)
             except Exception as e:
-                if attempt < 2:
+                if attempt < max_attempts - 1:
                     logger.warning(f"Private request attempt {attempt+1} failed {endpoint}: {e}")
-                    await asyncio.sleep(0.5 * (attempt + 1))
+                    await asyncio.sleep(0.3)
                 else:
-                    logger.error(f"Private request error {endpoint} after 3 attempts: {e}")
+                    logger.error(f"Private request error {endpoint} after {max_attempts} attempts: {e}")
                     return {"status": "error", "err-msg": str(e)}
 
     # ─── Market Data (Public) ────────────────────────────────────────────────
@@ -205,6 +207,11 @@ class HTXRestClient:
         """Получить котировки спотового рынка"""
         return await self._public_request(
             "GET", SPOT_BASE_URL, "/market/tickers"
+        )
+
+    async def get_spot_symbols(self) -> Dict[str, Any]:
+        return await self._public_request(
+            "GET", SPOT_BASE_URL, "/v1/common/symbols"
         )
 
     async def get_funding_rates(self) -> Dict[str, Any]:
@@ -241,7 +248,7 @@ class HTXRestClient:
         """Получить баланс аккаунта (unified account — merged cross/isolated)"""
         return await self._request(
             "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/unified_account_info",
-            data={}
+            data={"margin_account": "USDT"}
         )
 
     async def get_positions(self) -> Dict[str, Any]:
@@ -303,7 +310,7 @@ class HTXRestClient:
             "volume": size,
             "margin_account": "USDT",
         }
-        if price > 0 and htx_order_type == "limit":
+        if price > 0 and htx_order_type in ("limit", "ioc", "fok"):
             body["price"] = price
 
         # Используем cross-margin endpoint (swap_cross_order)
@@ -327,6 +334,56 @@ class HTXRestClient:
             "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_order_info",
             data={"contract_code": contract_code, "order_id": order_id},
         )
+
+    async def get_spot_order(self, symbol: str, order_id: str) -> Dict[str, Any]:
+        return await self._request(
+            "GET", SPOT_BASE_URL, f"/v1/order/orders/{order_id}",
+            params={},
+        )
+
+    async def place_spot_order(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        order_type: str = "limit",
+        price: float = 0.0,
+    ) -> Dict[str, Any]:
+        account_id = await self._get_spot_account_id()
+        if not account_id:
+            return {"status": "error", "err-msg": "spot_account_id_unavailable"}
+
+        symbol_code = symbol.lower().replace("-", "")
+        if order_type.lower() in {"market", "opponent"}:
+            order_type_name = "buy-market" if side.lower() == "buy" else "sell-market"
+        else:
+            order_type_name = "buy-limit" if side.lower() == "buy" else "sell-limit"
+
+        body: Dict[str, Any] = {
+            "account-id": account_id,
+            "symbol": symbol_code,
+            "type": order_type_name,
+            "amount": str(size),
+        }
+        if order_type_name.endswith("limit") and price > 0:
+            body["price"] = str(price)
+
+        return await self._request(
+            "POST", SPOT_BASE_URL, "/v1/order/orders/place",
+            params={},
+            data=body,
+        )
+
+    async def _get_spot_account_id(self) -> Optional[str]:
+        if self._spot_account_id:
+            return self._spot_account_id
+        result = await self._request("GET", SPOT_BASE_URL, "/v1/account/accounts", params={})
+        data = result.get("data") or []
+        for item in data:
+            if item.get("type") == "spot" and item.get("state") == "working":
+                self._spot_account_id = str(item.get("id"))
+                break
+        return self._spot_account_id
 
     async def close_position(self, symbol: str, side: str, size: float) -> Dict[str, Any]:
         """

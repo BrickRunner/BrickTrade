@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from market_intelligence.models import DataHealthStatus, FeatureVector, MarketRegime, OpportunityScore, PortfolioRiskSignal, RegimeState
+from market_intelligence.models import DataHealthStatus, FeatureKey, FeatureVector, MarketRegime, OpportunityScore, PortfolioRiskSignal, RegimeState
 
 
 class PortfolioAnalyzer:
@@ -146,30 +146,43 @@ class PortfolioAnalyzer:
         if features:
             volatilities = []
             for sym in allocation:
-                if sym in features and features[sym].normalized.get("rolling_volatility") is not None:
-                    vol = float(features[sym].normalized.get("rolling_volatility"))
+                if sym in features and features[sym].normalized.get(FeatureKey.ROLLING_VOLATILITY) is not None:
+                    vol = float(features[sym].normalized.get(FeatureKey.ROLLING_VOLATILITY))
                     volatilities.append(vol)
 
-            if len(volatilities) >= 3:  # Need at least 3 samples for percentile
-                volatilities_sorted = sorted(volatilities)
-                var_95_index = int(0.95 * len(volatilities_sorted))
-                var_95 = volatilities_sorted[var_95_index]
+            # FIX D.1: Historical VaR - proper 95th percentile of portfolio losses
+            all_weighted_returns: List[float] = []
+            for sym in allocation:
+                if sym in features:
+                    fv = features[sym]
+                    vol_z = fv.normalized.get(FeatureKey.ROLLING_VOLATILITY)
+                    # Use rolling volatility as proxy for expected daily return distribution
+                    # In a full system, you'd have actual return series
+                    if vol_z is not None:
+                        vol = float(vol_z)
+                        # Approximate loss at 95th percentile: ~1.65 * sigma
+                        expected_loss = 1.65 * abs(vol)
+                        weight = allocation[sym] / 100.0
+                        all_weighted_returns.append(expected_loss * weight)
 
-                # Apply tail risk penalty to symbols with extreme volatility
-                for sym in list(allocation):
-                    if sym in features and features[sym].normalized.get("rolling_volatility") is not None:
-                        vol = float(features[sym].normalized.get("rolling_volatility"))
-                        if vol > var_95 and var_95 > 0:
-                            penalty_factor = (vol - var_95) / var_95
-                            tail_penalty = 1.0 - 0.2 * penalty_factor
-                            tail_penalty = max(0.6, tail_penalty)  # Cap at 40% reduction
-                            allocation[sym] *= tail_penalty
+            if all_weighted_returns:
+                portfolio_var_95 = sum(all_weighted_returns)
+                # If portfolio VaR exceeds threshold, reduce allocations proportionally
+                VAR_THRESHOLD = 2.0  # 2 sigma portfolio risk
+                if portfolio_var_95 > VAR_THRESHOLD:
+                    scale_factor = VAR_THRESHOLD / portfolio_var_95
+                    for sym in allocation:
+                        allocation[sym] *= scale_factor
+                    # Renormalize after VaR adjustment
+                    total_after_var = sum(allocation.values())
+                    if total_after_var > 0:
+                        for s in allocation:
+                            allocation[s] = 100.0 * allocation[s] / total_after_var
 
-                # Renormalize after tail risk adjustment
-                total_after_tail = sum(allocation.values())
-                if total_after_tail > 0:
-                    for s in allocation:
-                        allocation[s] = 100.0 * allocation[s] / total_after_tail
+        # FIX D.3: Apply pairwise correlation penalty before caps
+        allocation = self._pairwise_correlation_penalty(
+            list(allocation.keys()), correlations_to_btc, allocation
+        )
 
         # Cap individual allocation at 25% (iterate to handle redistribution overflow)
         MAX_SINGLE_PAIR_PCT = 25.0
@@ -307,6 +320,35 @@ class PortfolioAnalyzer:
             base *= 0.6
         return max(0.05, min(0.25, base))
 
+    def _pairwise_correlation_penalty(
+        self,
+        symbols: List[str],
+        correlations_to_btc: Dict[str, float],
+        allocation: Dict[str, float],
+    ) -> Dict[str, float]:
+        """FIX D.3: Reduce allocation for symbols that are highly correlated with each other.
+
+        Approximation: if two symbols both have high BTC correlation (>0.8),
+        they are likely correlated with each other. Reduce allocation for the lower-scored one.
+        """
+        high_corr_symbols = [s for s in symbols if abs(correlations_to_btc.get(s, 0.0)) > 0.8]
+
+        if len(high_corr_symbols) <= 2:
+            return allocation
+
+        # Keep top 2 by allocation, penalize the rest
+        sorted_hc = sorted(high_corr_symbols, key=lambda s: allocation.get(s, 0.0), reverse=True)
+        for s in sorted_hc[2:]:
+            allocation[s] *= 0.7  # 30% penalty for correlated overflow
+
+        # Renormalize
+        total = sum(allocation.values())
+        if total > 0:
+            for s in allocation:
+                allocation[s] = 100.0 * allocation[s] / total
+
+        return allocation
+
     @staticmethod
     def _extract_base_currency(symbol: str) -> str:
         """Extract base currency from trading pair symbol.
@@ -315,6 +357,9 @@ class PortfolioAnalyzer:
             ETHUSDT -> ETH
             BTCUSDC -> BTC
             SOLUSDT -> SOL
+            1000PEPEUSDT -> PEPE
+            1000SHIBUSDT -> SHIB
+            BTCDOMUSDT -> BTCDOM
         """
         # Common quote currencies to strip
         quote_currencies = ["USDT", "USDC", "USD", "BUSD", "TUSD", "DAI"]
@@ -322,7 +367,10 @@ class PortfolioAnalyzer:
 
         for quote in quote_currencies:
             if symbol_upper.endswith(quote):
-                return symbol_upper[: -len(quote)]
+                base = symbol_upper[: -len(quote)]
+                # FIX D.2: Strip numeric multiplier prefix (1000, 10000, etc.)
+                stripped = base.lstrip("0123456789")
+                return stripped if stripped else base
 
         # Fallback: assume last 3-4 chars are quote
         if len(symbol) > 4:

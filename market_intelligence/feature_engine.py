@@ -5,8 +5,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from market_intelligence.indicators import adx, atr, bollinger_bands, cumulative_volume_delta, ema, linear_slope, macd, market_structure, rsi, volume_spike, volume_trend, vwap
-from market_intelligence.models import FeatureVector, OHLCV, PairSnapshot
+from market_intelligence.indicators import adx, atr, bollinger_bands, cumulative_volume_delta, ema, estimate_market_impact, funding_zscore_adaptive, linear_slope, liquidation_cascade_risk, macd, market_structure, rsi, spread_dynamics, volume_spike, volume_trend, vwap
+from market_intelligence.models import FeatureKey, FeatureVector, OHLCV, PairSnapshot
 from market_intelligence.statistics import RollingStats, rolling_returns
 
 
@@ -38,26 +38,40 @@ class FeatureEngine:
         for symbol, snap in snapshots.items():
             h = histories.get(symbol, {})
             closes = h.get("price", [])
-            highs = h.get("ask", closes)
-            lows = h.get("bid", closes)
-            vols = h.get("volume", [])
             basis_hist = h.get("basis", [])
             funding_hist = h.get("funding", [])
             oi_hist = h.get("oi", [])
             spread_hist = h.get("spread", [])
 
-            # Override with OHLCV candle data when available for better accuracy.
+            # Primary: OHLCV candle data (accurate high/low)
             ohlcv_1h = (candles or {}).get(symbol, {}).get("1H", [])
-            if ohlcv_1h:
+            if ohlcv_1h and len(ohlcv_1h) >= 30:
                 ohlcv_closes = [c.close for c in ohlcv_1h]
                 ohlcv_highs = [c.high for c in ohlcv_1h]
                 ohlcv_lows = [c.low for c in ohlcv_1h]
                 ohlcv_vols = [c.volume for c in ohlcv_1h]
+                # Use candle data for ALL indicators that need HLC
+                highs_for_indicators = ohlcv_highs
+                lows_for_indicators = ohlcv_lows
+                closes_for_indicators = ohlcv_closes
+                volumes_for_indicators = ohlcv_vols
+                using_candles = True
             else:
                 ohlcv_closes = []
                 ohlcv_highs = []
                 ohlcv_lows = []
                 ohlcv_vols = []
+                # Fallback: bid/ask as proxy (mark as degraded)
+                highs_for_indicators = h.get("ask", closes)
+                lows_for_indicators = h.get("bid", closes)
+                closes_for_indicators = closes
+                volumes_for_indicators = h.get("volume", [])
+                using_candles = False
+
+            # Keep original for compatibility
+            highs = highs_for_indicators
+            lows = lows_for_indicators
+            vols = volumes_for_indicators
 
             local_slice = slice(-self._local_window, None)
             closes_local = closes[local_slice]
@@ -177,11 +191,38 @@ class FeatureEngine:
             oi_delta_pct = ((oi_delta / max(abs(oi_prev), 1e-9)) * 100.0) if (oi_delta is not None and oi_prev is not None) else None
 
             funding_delta = funding_hist[-1] - funding_hist[-2] if len(funding_hist) >= 2 else 0.0
+
+            # Funding mean-reversion analysis
+            funding_analysis = funding_zscore_adaptive(funding_hist, short_window=12, long_window=72)
+
+            # Liquidation cascade risk analysis
+            liq_hist = h.get("liquidation", [])
+            price_changes = returns  # Already computed rolling_returns
+            oi_deltas_hist = []
+            for i in range(1, len(oi_hist)):
+                prev = oi_hist[i-1]
+                if abs(prev) > 1e-9:
+                    oi_deltas_hist.append((oi_hist[i] - prev) / prev)
+                else:
+                    oi_deltas_hist.append(0.0)
+            cascade = liquidation_cascade_risk(liq_hist, price_changes, oi_deltas_hist)
+
             basis_acc = linear_slope(basis_hist, window=10)
             spread_acc = linear_slope(spread_hist, window=10)
             basis_acc_z = basis_acc / max(_std_window(basis_hist, 50), 1e-9) if len(basis_hist) >= 2 else 0.0
             spread_acc_z = spread_acc / max(_std_window(spread_hist, 50), 1e-9) if len(spread_hist) >= 2 else 0.0
             funding_slope = linear_slope(funding_hist, window=10)
+
+            # NEW: Spread dynamics analysis
+            spread_bps = (snap.ask - snap.bid) / max(snap.price, 1e-9) * 10_000
+            spread_hist_bps = [(s * 10_000) for s in spread_hist] if spread_hist else []
+            spread_analysis = spread_dynamics(spread_hist_bps, window=20)
+
+            # NEW: Market impact estimation
+            ob_bid_vol = snap.orderbook_bid_volume or 0.0
+            ob_ask_vol = snap.orderbook_ask_volume or 0.0
+            avg_trade_vol = snap.volume_proxy or 1.0
+            market_impact_analysis = estimate_market_impact(ob_bid_vol, ob_ask_vol, avg_trade_vol, spread_bps)
 
             atr_pct = ((atr_val or 0.0) / max(abs(snap.price), 1e-9)) * 100.0
             atr_local_pct = ((atr_local or 0.0) / max(abs(snap.price), 1e-9)) * 100.0
@@ -197,58 +238,77 @@ class FeatureEngine:
             }
 
             values: Dict[str, Optional[float]] = {
-                "price": snap.price,
-                "ema50": ema50,
-                "ema200": ema200,
-                "ema_cross": ema_cross,
-                "adx": adx_val,
-                "adx_local": adx_local,
-                "rsi": rsi_val,
+                FeatureKey.PRICE: snap.price,
+                FeatureKey.EMA50: ema50,
+                FeatureKey.EMA200: ema200,
+                FeatureKey.EMA_CROSS: ema_cross,
+                FeatureKey.ADX: adx_val,
+                FeatureKey.ADX_LOCAL: adx_local,
+                FeatureKey.RSI: rsi_val,
                 "rsi_local": rsi_local,
                 "macd": macd_line,
-                "macd_signal": macd_signal,
-                "macd_hist": macd_hist,
+                FeatureKey.MACD_SIGNAL: macd_signal,
+                FeatureKey.MACD_HIST: macd_hist,
                 "macd_local": macd_local,
                 "macd_signal_local": macd_signal_local,
                 "macd_hist_local": macd_hist_local,
-                "atr": atr_val,
+                FeatureKey.ATR: atr_val,
                 "atr_local": atr_local,
-                "atr_pct": atr_pct,
+                FeatureKey.ATR_PCT: atr_pct,
                 "atr_local_pct": atr_local_pct,
                 # BLOCK 2.1: ATR proxy calibration info
                 "atr_calibration_code": 0.0 if atr_calibration == "static" else 1.0,
                 "atr_proxy_ratio": atr_proxy_ratio,
-                "bb_width": bb_width,
-                "bb_width_local": bb_width_local,
-                "bb_width_pct": bb_width_pct,
+                FeatureKey.BB_WIDTH: bb_width,
+                FeatureKey.BB_WIDTH_LOCAL: bb_width_local,
+                FeatureKey.BB_WIDTH_PCT: bb_width_pct,
                 "bb_width_local_pct": bb_width_local_pct,
-                "volume_spike": vol_spike,
-                "cvd": cvd_val,
-                "vwap": vwap_val,
+                FeatureKey.VOLUME_SPIKE: vol_spike,
+                FeatureKey.CVD: cvd_val,
+                FeatureKey.VWAP: vwap_val,
                 "price_vs_vwap_pct": price_vs_vwap_pct,
-                "volume_trend": vol_trend_val,
-                "funding_rate": snap.funding_rate,
-                "funding_pct": funding_pct,
-                "funding_delta": funding_delta,
-                "open_interest": snap.open_interest,
-                "oi_delta": oi_delta,
-                "oi_delta_pct": oi_delta_pct,
-                "basis_bps": snap.basis,
-                "basis_acceleration": basis_acc,
+                FeatureKey.VOLUME_TREND: vol_trend_val,
+                FeatureKey.FUNDING_RATE: snap.funding_rate,
+                FeatureKey.FUNDING_PCT: funding_pct,
+                FeatureKey.FUNDING_DELTA: funding_delta,
+                FeatureKey.FUNDING_DEVIATION: funding_analysis["funding_deviation"],
+                FeatureKey.FUNDING_REGIME_CODE: funding_analysis["funding_regime"],
+                FeatureKey.FUNDING_MEAN_REVERSION_SIGNAL: funding_analysis["funding_mean_reversion_signal"],
+                FeatureKey.FUNDING_ACCELERATION: funding_analysis["funding_acceleration"],
+                FeatureKey.FUNDING_EXTREME_FLAG: funding_analysis["funding_extreme"],
+                FeatureKey.OPEN_INTEREST: snap.open_interest,
+                FeatureKey.OI_DELTA: oi_delta,
+                FeatureKey.OI_DELTA_PCT: oi_delta_pct,
+                FeatureKey.BASIS_BPS: snap.basis,
+                FeatureKey.BASIS_ACCELERATION: basis_acc,
                 "basis_acceleration_z": basis_acc_z,
-                "long_short_ratio": snap.long_short_ratio,
-                "liquidation_cluster": snap.liquidation_cluster_score,
-                "orderbook_imbalance": snap.orderbook_imbalance,
-                "market_structure_code": mkt_struct_code,
-                "data_quality_code": 0.0 if getattr(snap, 'data_quality', 'full') == "full" else 1.0,
-                "rolling_volatility": rolling_vol,
-                "rolling_volatility_local": rolling_vol_local,
-                "spread_bps": (snap.ask - snap.bid) / max(snap.price, 1e-9) * 10_000,
+                FeatureKey.LONG_SHORT_RATIO: snap.long_short_ratio,
+                FeatureKey.LIQUIDATION_CLUSTER: snap.liquidation_cluster_score,
+                FeatureKey.CASCADE_RISK: cascade["cascade_risk"],
+                FeatureKey.CASCADE_STAGE: cascade["cascade_stage"],
+                FeatureKey.CASCADE_DIRECTION: cascade["cascade_direction"],
+                FeatureKey.ORDERBOOK_IMBALANCE: snap.orderbook_imbalance,
+                FeatureKey.MARKET_STRUCTURE_CODE: mkt_struct_code,
+                FeatureKey.DATA_QUALITY_CODE: 0.0 if getattr(snap, 'data_quality', 'full') == "full" else 1.0,
+                FeatureKey.ROLLING_VOLATILITY: rolling_vol,
+                FeatureKey.ROLLING_VOLATILITY_LOCAL: rolling_vol_local,
+                FeatureKey.SPREAD_BPS: spread_bps,
                 "spread_acceleration": spread_acc,
                 "spread_acceleration_z": spread_acc_z,
-                "atr_source_code": 0.0 if atr_source == "ohlcv" else 1.0,
-                "funding_slope": funding_slope,
-                "atr_proxy_penalty_applied": atr_proxy_penalty_applied,
+                # NEW: Spread dynamics features
+                FeatureKey.SPREAD_REGIME_CODE: spread_analysis["spread_regime_code"],
+                FeatureKey.SPREAD_EXPANSION_RATE: spread_analysis["spread_expansion_rate"],
+                FeatureKey.SPREAD_PERCENTILE: spread_analysis["spread_percentile"],
+                FeatureKey.LIQUIDITY_WITHDRAWAL: spread_analysis["liquidity_withdrawal"],
+                # NEW: Market impact features
+                "immediate_cost_bps": market_impact_analysis["immediate_cost_bps"],
+                "depth_impact_bps": market_impact_analysis["depth_impact_bps"],
+                FeatureKey.MARKET_IMPACT_TOTAL_BPS: market_impact_analysis["total_cost_bps"],
+                FeatureKey.ENTRY_FEASIBILITY: market_impact_analysis["entry_feasibility"],
+                FeatureKey.ATR_SOURCE_CODE: 0.0 if atr_source == "ohlcv" else 1.0,
+                FeatureKey.FUNDING_SLOPE: funding_slope,
+                FeatureKey.ATR_PROXY_PENALTY: atr_proxy_penalty_applied,
+                FeatureKey.USING_CANDLE_DATA: 1.0 if using_candles else 0.0,
                 **indicator_availability,
             }
 
@@ -273,10 +333,13 @@ class FeatureEngine:
                     mtf_ema_cross = mtf_ema50 - mtf_ema200
                     mtf_adx_val = adx(mtf_highs, mtf_lows, mtf_closes, 14)
                     mtf_rsi_val = rsi(mtf_closes, 14)
-                    values[f"ema_cross_{mtf_tf}"] = mtf_ema_cross
-                    values[f"adx_{mtf_tf}"] = mtf_adx_val
-                    values[f"rsi_{mtf_tf}"] = mtf_rsi_val
-                    for k in (f"ema_cross_{mtf_tf}", f"adx_{mtf_tf}", f"rsi_{mtf_tf}"):
+                    ema_key = FeatureKey.EMA_CROSS_4H if mtf_tf == "4H" else FeatureKey.EMA_CROSS_1D
+                    adx_key = FeatureKey.ADX_4H if mtf_tf == "4H" else FeatureKey.ADX_1D
+                    rsi_key = FeatureKey.RSI_4H if mtf_tf == "4H" else FeatureKey.RSI_1D
+                    values[ema_key] = mtf_ema_cross
+                    values[adx_key] = mtf_adx_val
+                    values[rsi_key] = mtf_rsi_val
+                    for k in (ema_key, adx_key, rsi_key):
                         st_key = self._stats[symbol].setdefault(k, RollingStats(self._window))
                         if values[k] is not None:
                             st_key.push(values[k])
@@ -285,26 +348,28 @@ class FeatureEngine:
                             normalized[k] = None
 
             # Volatility regime using ATR percentile rank in history.
-            atr_stats = self._stats[symbol].setdefault("atr_pct", RollingStats(self._window))
-            if atr_pct is not None:
-                atr_stats.push(atr_pct)
-            atr_percentile = atr_stats.percentile_rank(atr_pct if atr_pct is not None else 0.0)
+            # Note: atr_pct already pushed in normalization loop above
+            atr_stats = self._stats[symbol].get(FeatureKey.ATR_PCT)
+            if atr_stats:
+                atr_percentile = atr_stats.percentile_rank(atr_pct if atr_pct is not None else 0.0)
+            else:
+                atr_percentile = 0.5
             if atr_percentile < 0.30:
                 volatility_regime = "low"
             elif atr_percentile <= 0.70:
                 volatility_regime = "medium"
             else:
                 volatility_regime = "high"
-            values["atr_percentile"] = atr_percentile
-            values["volatility_regime_code"] = 0.0 if volatility_regime == "low" else 1.0 if volatility_regime == "medium" else 2.0
-            normalized["atr_percentile"] = atr_stats.zscore(atr_percentile)
-            normalized["volatility_regime_code"] = 0.0
+            values[FeatureKey.ATR_PERCENTILE] = atr_percentile
+            values[FeatureKey.VOLATILITY_REGIME_CODE] = 0.0 if volatility_regime == "low" else 1.0 if volatility_regime == "medium" else 2.0
+            normalized[FeatureKey.ATR_PERCENTILE] = atr_stats.zscore(atr_percentile)
+            normalized[FeatureKey.VOLATILITY_REGIME_CODE] = 0.0
 
             # Local momentum/volatility state used in reporting.
-            values["local_volatility_expansion"] = 1.0 if (rolling_vol_local > rolling_vol) else -1.0
-            values["local_momentum_bias"] = 1.0 if (macd_hist_local > 0 and rsi_local >= 50) else -1.0 if (macd_hist_local < 0 and rsi_local < 50) else 0.0
-            normalized["local_volatility_expansion"] = values["local_volatility_expansion"]
-            normalized["local_momentum_bias"] = values["local_momentum_bias"]
+            values[FeatureKey.LOCAL_VOLATILITY_EXPANSION] = 1.0 if (rolling_vol_local > rolling_vol) else -1.0
+            values[FeatureKey.LOCAL_MOMENTUM_BIAS] = 1.0 if (macd_hist_local > 0 and rsi_local >= 50) else -1.0 if (macd_hist_local < 0 and rsi_local < 50) else 0.0
+            normalized[FeatureKey.LOCAL_VOLATILITY_EXPANSION] = values[FeatureKey.LOCAL_VOLATILITY_EXPANSION]
+            normalized[FeatureKey.LOCAL_MOMENTUM_BIAS] = values[FeatureKey.LOCAL_MOMENTUM_BIAS]
 
             features[symbol] = FeatureVector(symbol=symbol, timestamp=snap.timestamp, values=values, normalized=normalized)
 

@@ -6,14 +6,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List
 
-from market_intelligence.models import FeatureVector, MarketRegime, RegimeState
+from market_intelligence.models import FeatureKey, FeatureVector, MarketRegime, RegimeState
 
 REGIME_MIN_CYCLES: Dict[MarketRegime, int] = {
-    MarketRegime.PANIC: 1,
+    MarketRegime.PANIC: 0,              # BLOCK 4: Мгновенная реакция на панику
     MarketRegime.HIGH_VOLATILITY: 1,
     MarketRegime.OVERHEATED: 1,
     MarketRegime.TREND_UP: 2,
-    MarketRegime.TREND_DOWN: 2,
+    MarketRegime.TREND_DOWN: 1,         # BLOCK 4: Нисходящий тренд быстрее подтверждается
     MarketRegime.RANGE: 3,
 }
 
@@ -78,16 +78,16 @@ class RegimeModel:
     def _classify(self, key: str, feature: FeatureVector) -> RegimeState:
         z = feature.normalized
         v = feature.values
-        adx_v = float(v.get("adx") or 0.0)
-        ema_cross_z = float(z.get("ema_cross") or 0.0)
-        rsi_v = float(v.get("rsi") or 50.0)
-        vol_z = float(z.get("rolling_volatility") or 0.0)
-        bb_z = float(z.get("bb_width") or 0.0)
-        funding_z = float(z.get("funding_rate") or 0.0)
-        liq_z = float(z.get("liquidation_cluster") or 0.0)
-        vol_trend_z = float(z.get("volume_trend") or 0.0)
+        adx_v = float(v.get(FeatureKey.ADX) or 0.0)
+        ema_cross_z = float(z.get(FeatureKey.EMA_CROSS) or 0.0)
+        rsi_v = float(v.get(FeatureKey.RSI) or 50.0)
+        vol_z = float(z.get(FeatureKey.ROLLING_VOLATILITY) or 0.0)
+        bb_z = float(z.get(FeatureKey.BB_WIDTH) or 0.0)
+        funding_z = float(z.get(FeatureKey.FUNDING_RATE) or 0.0)
+        liq_z = float(z.get(FeatureKey.LIQUIDATION_CLUSTER) or 0.0)
+        vol_trend_z = float(z.get(FeatureKey.VOLUME_TREND) or 0.0)
 
-        atr_pctile = float(v.get("atr_percentile") or 0.5)
+        atr_pctile = float(v.get(FeatureKey.ATR_PERCENTILE) or 0.5)
         atr_pctile_bonus = 0.3 * max(0.0, (atr_pctile - 0.7) / 0.3)
 
         logits: Dict[MarketRegime, float] = {
@@ -128,8 +128,33 @@ class RegimeModel:
         logits[MarketRegime.TREND_DOWN] += 0.15 * max(0.0, vol_trend_z)
         logits[MarketRegime.RANGE] += 0.1 * max(0.0, -vol_trend_z)
 
+        # NEW: Liquidation cascade risk (E2: enhanced version)
+        cascade_risk = float(v.get(FeatureKey.CASCADE_RISK) or 0.0)
+        cascade_direction = float(v.get(FeatureKey.CASCADE_DIRECTION) or 0.0)
+
+        if cascade_risk > 0.3:
+            logits[MarketRegime.PANIC] += 0.25 * cascade_risk * s
+            logits[MarketRegime.HIGH_VOLATILITY] += 0.15 * cascade_risk * s
+            if cascade_direction < 0:  # long squeeze
+                logits[MarketRegime.TREND_DOWN] += 0.1 * cascade_risk * s
+            elif cascade_direction > 0:  # short squeeze
+                logits[MarketRegime.TREND_UP] += 0.1 * cascade_risk * s
+
+        # NEW: Spread dynamics - widening spread = incoming volatility (E2)
+        spread_regime = float(v.get(FeatureKey.SPREAD_REGIME_CODE) or 0.0)
+        liq_withdrawal = float(v.get(FeatureKey.LIQUIDITY_WITHDRAWAL) or 0.0)
+        if spread_regime >= 2.0 or liq_withdrawal > 0.5:
+            logits[MarketRegime.HIGH_VOLATILITY] += 0.2 * s
+            logits[MarketRegime.RANGE] -= 0.15 * s
+
+        # NEW: Funding mean reversion signal (E2)
+        funding_mr = float(v.get(FeatureKey.FUNDING_MEAN_REVERSION_SIGNAL) or 0.0)
+        if funding_mr > 0.5:
+            # Strong mean reversion expected → regime shift likely
+            logits[MarketRegime.RANGE] += 0.15 * funding_mr * s
+
         # Market structure refinement
-        mkt_struct = v.get("market_structure_code")
+        mkt_struct = v.get(FeatureKey.MARKET_STRUCTURE_CODE)
         if mkt_struct is not None:
             if mkt_struct == 1.0:  # bullish
                 logits[MarketRegime.TREND_UP] += 0.15
@@ -141,7 +166,7 @@ class RegimeModel:
                 logits[MarketRegime.RANGE] += 0.1
 
         # Orderbook pressure: significant imbalance reinforces trend direction
-        ob_imb = v.get("orderbook_imbalance")
+        ob_imb = v.get(FeatureKey.ORDERBOOK_IMBALANCE)
         if ob_imb is not None:
             ob_val = float(ob_imb)
             if ob_val > 0.2:
@@ -152,7 +177,7 @@ class RegimeModel:
                 logits[MarketRegime.TREND_UP] -= 0.06 * min(1.0, abs(ob_val) / 0.5)
 
         # Funding acceleration: rapidly changing funding warns of regime shift
-        funding_slope_v = float(v.get("funding_slope") or 0.0)
+        funding_slope_v = float(v.get(FeatureKey.FUNDING_SLOPE) or 0.0)
         if abs(funding_slope_v) > 0.5:
             logits[MarketRegime.HIGH_VOLATILITY] += 0.15 * min(1.0, abs(funding_slope_v))
 
@@ -166,9 +191,9 @@ class RegimeModel:
         if feature is None:
             return False
         v = feature.values
-        rsi_v = float(v.get("rsi") or 50.0)
-        vol_spike_v = float(v.get("volume_spike") or 1.0)
-        vol_z = float(v.get("rolling_volatility") or 0.0)
+        rsi_v = float(v.get(FeatureKey.RSI) or 50.0)
+        vol_spike_v = float(v.get(FeatureKey.VOLUME_SPIKE) or 1.0)
+        vol_z = float(v.get(FeatureKey.ROLLING_VOLATILITY) or 0.0)
 
         if rsi_v <= 15.0 or rsi_v >= 85.0:
             return True
@@ -177,13 +202,29 @@ class RegimeModel:
         if abs(vol_z) >= 3.0:
             return True
         # Liquidation cascade
-        liq_z = float(feature.normalized.get("liquidation_cluster") or 0.0)
+        liq_z = float(feature.normalized.get(FeatureKey.LIQUIDATION_CLUSTER) or 0.0)
         if liq_z >= 2.5:
             return True
         # Funding extreme
-        funding_z = float(feature.normalized.get("funding_rate") or 0.0)
+        funding_z = float(feature.normalized.get(FeatureKey.FUNDING_RATE) or 0.0)
         if abs(funding_z) >= 3.0:
             return True
+
+        # NEW: Liquidation cascade
+        cascade_risk = float(v.get(FeatureKey.CASCADE_RISK) or 0.0)
+        if cascade_risk >= 0.6:
+            return True
+
+        # NEW: Liquidity withdrawal
+        liq_withdrawal = float(v.get(FeatureKey.LIQUIDITY_WITHDRAWAL) or 0.0)
+        if liq_withdrawal >= 0.7:
+            return True
+
+        # NEW: Funding extreme
+        funding_extreme = float(v.get(FeatureKey.FUNDING_EXTREME_FLAG) or 0.0)
+        if funding_extreme >= 1.0:
+            return True
+
         return False
 
     def _apply_stability(
@@ -306,9 +347,9 @@ class RegimeModel:
         # Avoid unrealistically perfect confidence; allow higher values only in true extremes.
         hard_cap = 0.92
         if feature is not None:
-            adx_v = float(feature.values.get("adx") or 0.0)
-            rsi_v = float(feature.values.get("rsi") or 50.0)
-            vol_z = float(feature.normalized.get("rolling_volatility") or 0.0)
+            adx_v = float(feature.values.get(FeatureKey.ADX) or 0.0)
+            rsi_v = float(feature.values.get(FeatureKey.RSI) or 50.0)
+            vol_z = float(feature.normalized.get(FeatureKey.ROLLING_VOLATILITY) or 0.0)
             extreme = adx_v >= 45 and (rsi_v >= 78 or rsi_v <= 22) and abs(vol_z) >= 2.0
             hard_cap = 0.97 if extreme else 0.92
         return max(0.0, min(hard_cap, conf))
@@ -320,14 +361,17 @@ class RegimeModel:
         when available. Returns 1.0 when no MTF data exists.
         """
         v = feature.values
-        local_ema = v.get("ema_cross")
-        local_rsi = v.get("rsi")
+        local_ema = v.get(FeatureKey.EMA_CROSS)
+        local_rsi = v.get(FeatureKey.RSI)
 
         mtf_checks: list[float] = []
         for tf in ("4H", "1D"):
-            htf_ema = v.get(f"ema_cross_{tf}")
-            htf_rsi = v.get(f"rsi_{tf}")
-            htf_adx = v.get(f"adx_{tf}")
+            htf_ema_key = FeatureKey.EMA_CROSS_4H if tf == "4H" else FeatureKey.EMA_CROSS_1D
+            htf_rsi_key = FeatureKey.RSI_4H if tf == "4H" else FeatureKey.RSI_1D
+            htf_adx_key = FeatureKey.ADX_4H if tf == "4H" else FeatureKey.ADX_1D
+            htf_ema = v.get(htf_ema_key)
+            htf_rsi = v.get(htf_rsi_key)
+            htf_adx = v.get(htf_adx_key)
             if htf_ema is None or htf_rsi is None:
                 continue
 

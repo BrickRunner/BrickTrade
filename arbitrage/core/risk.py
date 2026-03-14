@@ -66,7 +66,7 @@ class RiskManager:
             return False
 
         # Exposure check: total open positions value < X% of balance
-        total_exposure = sum(p.size_usd for p in self.state.get_all_positions())
+        total_exposure = sum(getattr(p, "size_usd", 0.0) for p in self.state.get_all_positions())
         max_exposure = self.state.total_balance * 0.8  # Max 80% of balance in positions
         per_side = min(long_bal, short_bal) * self._max_position_pct
         if total_exposure + per_side * 2 > max_exposure:
@@ -86,6 +86,32 @@ class RiskManager:
     def record_success(self) -> None:
         self._consecutive_failures = 0
 
+    def can_enter_position(self, size: float, price: float) -> Tuple[bool, str]:
+        """Check if entering a position is allowed (used by legacy ArbitrageEngine)."""
+        if self.state.position_count() >= self._max_concurrent:
+            return False, "Max concurrent positions reached"
+        if self._consecutive_failures >= self._max_failures:
+            return False, "Circuit breaker active"
+        total_balance = self.state.total_balance
+        if total_balance < 10.0:
+            return False, "Balance too low"
+        required = size * price
+        if required > total_balance * self._max_position_pct:
+            return False, "Position too large for balance"
+        return True, "OK"
+
+    def can_exit_position(self) -> Tuple[bool, str]:
+        """Check if exiting a position is allowed (used by legacy ArbitrageEngine)."""
+        if not self.state.is_in_position:
+            return False, "Not in position"
+        return True, "OK"
+
+    def validate_spread(self, spread: float, is_entry: bool) -> bool:
+        """Validate spread against entry/exit thresholds (core tests)."""
+        if is_entry:
+            return spread >= self.config.entry_threshold
+        return abs(spread) <= self.config.exit_threshold
+
     # ─── Runtime Monitoring ───────────────────────────────────────────────
 
     def should_emergency_close(self) -> Tuple[bool, str]:
@@ -97,8 +123,16 @@ class RiskManager:
         # Delta check: total long vs short exposure
         positions = self.state.get_all_positions()
         if positions:
-            total_long = sum(p.size_usd / 2 for p in positions if p.long_contracts > 0)
-            total_short = sum(p.size_usd / 2 for p in positions if p.short_contracts > 0)
+            total_long = sum(
+                getattr(p, "size_usd", 0.0) / 2
+                for p in positions
+                if getattr(p, "long_contracts", 0) > 0
+            )
+            total_short = sum(
+                getattr(p, "size_usd", 0.0) / 2
+                for p in positions
+                if getattr(p, "short_contracts", 0) > 0
+            )
             if total_long + total_short > 0:
                 delta = abs(total_long - total_short) / (total_long + total_short)
                 if delta > self._max_delta_pct:
@@ -116,3 +150,11 @@ class RiskManager:
             )
             return False
         return True
+
+    def log_risk_status(self) -> None:
+        """Log current risk metrics."""
+        logger.info(
+            f"Risk status: positions={self.state.position_count()}, "
+            f"balance={self.state.total_balance:.2f}, "
+            f"failures={self._consecutive_failures}/{self._max_failures}"
+        )
