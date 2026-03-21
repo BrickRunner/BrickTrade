@@ -54,14 +54,17 @@ class RiskEngine:
                             return RiskDecision(approved=False, reason="stale_spot_orderbook")
             balances = snapshot.balances or {}
             if balances:
-                vals = [v for v in balances.values() if v > 0]
-                if vals:
-                    max_bal = max(vals)
-                    min_bal = min(vals)
-                    if min_bal > 0:
-                        imbalance = (max_bal - min_bal) / max_bal
-                        if imbalance > self.config.max_inventory_imbalance_pct:
-                            return RiskDecision(approved=False, reason="inventory_imbalance")
+                # Only check imbalance between the TWO exchanges involved in this trade,
+                # not all exchanges globally. With 3+ exchanges, global imbalance is
+                # naturally high and would block all trades.
+                trade_exchanges = [intent.long_exchange, intent.short_exchange]
+                trade_vals = [balances.get(ex, 0.0) for ex in trade_exchanges if balances.get(ex, 0.0) > 0]
+                if len(trade_vals) == 2:
+                    max_bal = max(trade_vals)
+                    min_bal = min(trade_vals)
+                    imbalance = (max_bal - min_bal) / max_bal
+                    if imbalance > self.config.max_inventory_imbalance_pct:
+                        return RiskDecision(approved=False, reason="inventory_imbalance")
 
         drawdowns = await self.state.drawdowns()
         if drawdowns["daily_dd"] >= self.config.max_daily_drawdown_pct:

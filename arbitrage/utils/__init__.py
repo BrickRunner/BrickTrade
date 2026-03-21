@@ -13,7 +13,8 @@ from .helpers import (
     validate_orderbook,
     get_best_bid_ask,
     calculate_position_value,
-    calculate_pnl
+    calculate_pnl,
+    usdt_to_htx,
 )
 
 __all__ = [
@@ -31,5 +32,6 @@ __all__ = [
     'validate_orderbook',
     'get_best_bid_ask',
     'calculate_position_value',
-    'calculate_pnl'
+    'calculate_pnl',
+    'usdt_to_htx',
 ]

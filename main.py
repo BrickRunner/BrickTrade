@@ -12,7 +12,7 @@ from api import close_session
 from config import BOT_TOKEN
 from database import init_db
 from handlers import arbitrage_handlers_simple as arbitrage_handlers
-from handlers import basic, settings, stats_handlers, thresholds
+from handlers import basic, settings, stats_handlers, stock_handlers, thresholds
 from market_intelligence.integration import shutdown_market_intelligence
 from scheduler import scheduler_loop
 from states import DateForm, InlineThresholdForm
@@ -84,6 +84,37 @@ def register_handlers() -> None:
     dp.callback_query.register(arbitrage_handlers.cb_arb_settings, lambda c: c.data == "arb_settings")
     dp.callback_query.register(arbitrage_handlers.cb_arb_menu, lambda c: c.data == "arb_menu")
 
+    # Stock trading handlers (MOEX via BCS)
+    dp.message.register(stock_handlers.handle_stocks_menu, lambda m: m.text == "Stocks")
+    dp.callback_query.register(stock_handlers.cb_stock_start, lambda c: c.data == "stock_start")
+    dp.callback_query.register(stock_handlers.cb_stock_stop, lambda c: c.data == "stock_stop")
+    dp.callback_query.register(stock_handlers.cb_stock_stats, lambda c: c.data == "stock_stats")
+    dp.callback_query.register(stock_handlers.cb_stock_positions, lambda c: c.data == "stock_positions")
+    dp.callback_query.register(stock_handlers.cb_stock_signals, lambda c: c.data == "stock_signals")
+    dp.callback_query.register(stock_handlers.cb_stock_settings, lambda c: c.data == "stock_settings")
+    dp.callback_query.register(stock_handlers.cb_stock_mode_switch, lambda c: c.data == "stock_mode_switch")
+    dp.callback_query.register(stock_handlers.cb_stock_menu, lambda c: c.data == "stock_menu")
+    dp.callback_query.register(stock_handlers.cb_stock_confirm, lambda c: c.data and c.data.startswith("stock_confirm:"))
+    dp.callback_query.register(stock_handlers.cb_stock_reject, lambda c: c.data and c.data.startswith("stock_reject:"))
+    dp.callback_query.register(stock_handlers.cb_stock_emergency, lambda c: c.data == "stock_emergency")
+    dp.callback_query.register(stock_handlers.cb_stock_emergency_confirm, lambda c: c.data == "stock_emergency_confirm")
+    # Risk settings
+    dp.callback_query.register(stock_handlers.cb_stock_set_exposure, lambda c: c.data == "stock_set_exposure")
+    dp.callback_query.register(stock_handlers.cb_stock_set_per_pos, lambda c: c.data == "stock_set_per_pos")
+    dp.callback_query.register(stock_handlers.cb_stock_set_max_pos, lambda c: c.data == "stock_set_max_pos")
+    dp.callback_query.register(stock_handlers.cb_stock_set_max_trades, lambda c: c.data == "stock_set_max_trades")
+    dp.callback_query.register(stock_handlers.cb_stock_exposure_val, lambda c: c.data and c.data.startswith("stock_exposure_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_perpos_val, lambda c: c.data and c.data.startswith("stock_perpos_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_maxpos_val, lambda c: c.data and c.data.startswith("stock_maxpos_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_maxtrades_val, lambda c: c.data and c.data.startswith("stock_maxtrades_val:"))
+    # SL / TP / Trailing stop settings
+    dp.callback_query.register(stock_handlers.cb_stock_set_sl, lambda c: c.data == "stock_set_sl")
+    dp.callback_query.register(stock_handlers.cb_stock_set_tp, lambda c: c.data == "stock_set_tp")
+    dp.callback_query.register(stock_handlers.cb_stock_set_trail, lambda c: c.data == "stock_set_trail")
+    dp.callback_query.register(stock_handlers.cb_stock_sl_val, lambda c: c.data and c.data.startswith("stock_sl_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_tp_val, lambda c: c.data and c.data.startswith("stock_tp_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_trail_val, lambda c: c.data and c.data.startswith("stock_trail_val:"))
+
 
 async def shutdown(signal_name: str | None = None) -> None:
     global scheduler_task
@@ -102,6 +133,11 @@ async def shutdown(signal_name: str | None = None) -> None:
     try:
         from handlers import arbitrage_handlers_simple as arb
         await arb.shutdown_arbitrage()
+    except Exception:
+        pass
+
+    try:
+        await stock_handlers.shutdown_stocks()
     except Exception:
         pass
 

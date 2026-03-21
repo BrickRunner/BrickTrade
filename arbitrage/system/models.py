@@ -7,17 +7,7 @@ from typing import Any, Dict, Optional
 
 
 class StrategyId(str, Enum):
-    SPOT_ARBITRAGE = "spot_arbitrage"
-    CASH_CARRY = "cash_carry"
-    FUNDING_ARBITRAGE = "funding_arbitrage"
-    FUNDING_SPREAD = "funding_spread"
-    TRIANGULAR_ARBITRAGE = "triangular_arbitrage"
-    MULTI_TRIANGULAR_ARBITRAGE = "multi_triangular_arbitrage"
-    PREFUNDED_ARBITRAGE = "prefunded_arbitrage"
-    ORDERBOOK_IMBALANCE = "orderbook_imbalance"
-    SPREAD_CAPTURE = "spread_capture"
-    GRID = "grid"
-    INDICATOR = "indicator"
+    FUTURES_CROSS_EXCHANGE = "futures_cross_exchange"
 
 
 @dataclass(frozen=True)

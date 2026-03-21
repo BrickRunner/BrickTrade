@@ -242,6 +242,34 @@ class MarketDataEngine:
                             except (ValueError, TypeError):
                                 pass
 
+            elif exchange == "binance":
+                result = await client.get_instruments()
+                if isinstance(result, dict) and result.get("symbols"):
+                    for inst in result["symbols"]:
+                        sym = inst.get("symbol", "")
+                        if not sym.endswith("USDT") or inst.get("contractType") != "PERPETUAL":
+                            continue
+                        if inst.get("status") != "TRADING":
+                            continue
+                        symbols.add(sym)
+                        sizes[sym] = 1.0  # Binance linear uses base asset qty
+                        for f in inst.get("filters", []):
+                            if f.get("filterType") == "PRICE_FILTER":
+                                try:
+                                    self.tick_sizes.setdefault(exchange, {})[sym] = float(f.get("tickSize", 0) or 0)
+                                except (ValueError, TypeError):
+                                    pass
+                            if f.get("filterType") == "LOT_SIZE":
+                                try:
+                                    step = float(f.get("stepSize", 0) or 0)
+                                    sizes[sym] = step if step > 0 else 1.0
+                                except (ValueError, TypeError):
+                                    pass
+                                try:
+                                    self.min_order_sizes.setdefault(exchange, {})[sym] = float(f.get("minQty", 0) or 0)
+                                except (ValueError, TypeError):
+                                    pass
+
             self.contract_sizes[exchange] = sizes
         except Exception as e:
             logger.error(f"Instrument fetch error ({exchange}): {e}")
@@ -311,6 +339,29 @@ class MarketDataEngine:
                         min_qty = 10 ** (-amt_prec) if amt_prec > 0 else 0.0
                         self.spot_tick_sizes.setdefault(exchange, {})[sym] = tick
                         self.spot_min_order_sizes.setdefault(exchange, {})[sym] = min_qty
+            elif exchange == "binance":
+                result = await client.get_spot_instruments()
+                if isinstance(result, dict) and result.get("symbols"):
+                    for inst in result["symbols"]:
+                        sym = inst.get("symbol", "")
+                        if not sym.endswith("USDT") or inst.get("status") != "TRADING":
+                            continue
+                        for f in inst.get("filters", []):
+                            if f.get("filterType") == "PRICE_FILTER":
+                                try:
+                                    self.spot_tick_sizes.setdefault(exchange, {})[sym] = float(f.get("tickSize", 0) or 0)
+                                except (ValueError, TypeError):
+                                    pass
+                            if f.get("filterType") == "LOT_SIZE":
+                                try:
+                                    self.spot_min_order_sizes.setdefault(exchange, {})[sym] = float(f.get("minQty", 0) or 0)
+                                except (ValueError, TypeError):
+                                    pass
+                            if f.get("filterType") == "NOTIONAL":
+                                try:
+                                    self.spot_min_notional.setdefault(exchange, {})[sym] = float(f.get("minNotional", 0) or 0)
+                                except (ValueError, TypeError):
+                                    pass
         except Exception as e:
             logger.error(f"{exchange.upper()} spot instrument fetch error: {e}")
 
@@ -384,6 +435,24 @@ class MarketDataEngine:
                             pass
                     self.futures_prices["bybit"] = prices
 
+            elif exchange == "binance":
+                result = await client.get_tickers()
+                data = result.get("data", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+                prices = {}
+                for t in data:
+                    sym = t.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+                    try:
+                        bid = float(t.get("bidPrice") or 0)
+                        ask = float(t.get("askPrice") or 0)
+                        if bid > 0 and ask > 0:
+                            prices[sym] = TickerData(bid=bid, ask=ask, last=(bid + ask) / 2)
+                            updated += 1
+                    except (ValueError, TypeError):
+                        pass
+                self.futures_prices["binance"] = prices
+
         except Exception as e:
             logger.error(f"{exchange.upper()} futures fetch error: {e}")
 
@@ -451,6 +520,24 @@ class MarketDataEngine:
                             pass
                     self.spot_prices["bybit"] = prices
 
+            elif exchange == "binance":
+                result = await client.get_spot_tickers()
+                data = result.get("data", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+                prices = {}
+                for t in data:
+                    sym = t.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+                    try:
+                        bid = float(t.get("bidPrice") or 0)
+                        ask = float(t.get("askPrice") or 0)
+                        if bid > 0 and ask > 0:
+                            prices[sym] = (bid + ask) / 2
+                            updated += 1
+                    except (ValueError, TypeError):
+                        pass
+                self.spot_prices["binance"] = prices
+
         except Exception as e:
             logger.error(f"{exchange.upper()} spot fetch error: {e}")
 
@@ -465,7 +552,9 @@ class MarketDataEngine:
 
         try:
             if exchange == "okx":
-                result = await client.get_funding_rates_all()
+                # Pass configured symbols as OKX inst IDs for targeted fetch
+                okx_inst_ids = [self._sym_to_okx_inst(s) for s in self.common_pairs] if self.common_pairs else None
+                result = await client.get_funding_rates_all(symbols=okx_inst_ids)
                 if result.get("code") == "0":
                     rates = {}
                     for t in result.get("data", []):
@@ -491,9 +580,17 @@ class MarketDataEngine:
 
             elif exchange == "htx":
                 result = await client.get_funding_rates()
-                if result.get("status") == "ok":
+                # HTX v3 uses "code": 200, v1 uses "status": "ok"
+                is_ok = result.get("status") == "ok" or result.get("code") == 200 or str(result.get("code")) == "200"
+                if is_ok:
                     rates = {}
-                    for t in result.get("data", []):
+                    data = result.get("data", [])
+                    # v3 might wrap in {"data": {"data": [...]}}
+                    if isinstance(data, dict):
+                        data = data.get("data", [])
+                    if not isinstance(data, list):
+                        data = []
+                    for t in data:
                         cc = t.get("contract_code", "")
                         if not cc.endswith("-USDT"):
                             continue
@@ -513,6 +610,8 @@ class MarketDataEngine:
                         except (ValueError, TypeError):
                             pass
                     self.funding_rates["htx"] = rates
+                    if not rates:
+                        logger.warning(f"HTX funding: response OK but 0 rates parsed. Keys: {list(result.keys())}, data type: {type(result.get('data'))}")
 
             elif exchange == "bybit":
                 # Bybit tickers include fundingRate
@@ -538,6 +637,30 @@ class MarketDataEngine:
                         except (ValueError, TypeError):
                             pass
                     self.funding_rates["bybit"] = rates
+
+            elif exchange == "binance":
+                result = await client.get_funding_rates()
+                data = result.get("data", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+                rates = {}
+                for t in data:
+                    sym = t.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+                    try:
+                        rate_str = t.get("lastFundingRate")
+                        if not rate_str:
+                            continue
+                        rate = float(rate_str)
+                        next_ts = int(t.get("nextFundingTime", 0) or 0)
+                        rates[sym] = FundingData(
+                            rate=rate,
+                            rate_pct=rate * 100,
+                            next_time_ms=next_ts,
+                        )
+                        updated += 1
+                    except (ValueError, TypeError):
+                        pass
+                self.funding_rates["binance"] = rates
 
         except Exception as e:
             logger.error(f"{exchange.upper()} funding fetch error: {e}")
@@ -573,6 +696,10 @@ class MarketDataEngine:
                 book = result.get("result", {})
                 bids = [[float(row[0]), float(row[1])] for row in book.get("b", [])[:levels]]
                 asks = [[float(row[0]), float(row[1])] for row in book.get("a", [])[:levels]]
+            elif exchange == "binance":
+                result = await client.get_orderbook(symbol, limit=levels)
+                bids = [[float(row[0]), float(row[1])] for row in (result.get("bids") or [])[:levels]]
+                asks = [[float(row[0]), float(row[1])] for row in (result.get("asks") or [])[:levels]]
             else:
                 return None
             return {"bids": bids, "asks": asks, "timestamp": time.time()}
@@ -608,6 +735,10 @@ class MarketDataEngine:
                 book = result.get("result", {})
                 bids = [[float(row[0]), float(row[1])] for row in book.get("b", [])[:levels]]
                 asks = [[float(row[0]), float(row[1])] for row in book.get("a", [])[:levels]]
+            elif exchange == "binance":
+                result = await client.get_spot_orderbook(symbol, limit=levels)
+                bids = [[float(row[0]), float(row[1])] for row in (result.get("bids") or [])[:levels]]
+                asks = [[float(row[0]), float(row[1])] for row in (result.get("asks") or [])[:levels]]
             else:
                 return None
             return {"bids": bids, "asks": asks, "timestamp": time.time()}
@@ -637,10 +768,27 @@ class MarketDataEngine:
                     spot_sym = await client.get_trade_fee(inst_type="SPOT", inst_id=inst_spot)
                     perp_sym = await client.get_trade_fee(inst_type="SWAP", inst_id=inst_swap)
                     self._parse_okx_symbol_fees(exchange, sym, spot_sym, perp_sym)
+            elif exchange == "htx":
+                # HTX doesn't have a dedicated fee rate endpoint for linear swaps;
+                # use documented default taker rates.
+                # HTX USDT-M linear swap taker: 0.05% = 5 bps (VIP0).
+                # HTX spot taker: 0.20% = 20 bps (VIP0).
+                self.fee_bps.setdefault(exchange, {})
+                self.fee_bps[exchange]["perp"] = float(os.getenv("FEE_BPS_HTX_PERP", "5.0"))
+                self.fee_bps[exchange]["spot"] = float(os.getenv("FEE_BPS_HTX_SPOT", "20.0"))
             elif exchange == "bybit":
                 spot = await client.get_fee_rates(category="spot")
                 perp = await client.get_fee_rates(category="linear")
                 self._parse_bybit_fees(exchange, spot, perp)
+            elif exchange == "binance":
+                # Binance commission rate endpoint
+                try:
+                    result = await client.get_fee_rates()
+                    if isinstance(result, dict) and "takerCommissionRate" in result:
+                        taker = float(result.get("takerCommissionRate", 0) or 0) * 10_000
+                        self.fee_bps[exchange] = {"spot": taker, "perp": taker}
+                except Exception:
+                    self.fee_bps.setdefault(exchange, {"spot": 4.0, "perp": 4.0})
         except Exception as e:
             logger.error(f"{exchange.upper()} fee fetch error: {e}")
 
@@ -649,7 +797,8 @@ class MarketDataEngine:
             try:
                 data = resp.get("data", [])
                 if data:
-                    taker = float(data[0].get("taker", 0) or 0)
+                    # OKX returns taker fee as negative (e.g. -0.0005 = 5 bps)
+                    taker = abs(float(data[0].get("taker", 0) or 0))
                     return taker * 10_000
             except Exception:
                 pass
@@ -661,7 +810,8 @@ class MarketDataEngine:
             try:
                 data = resp.get("data", [])
                 if data:
-                    taker = float(data[0].get("taker", 0) or 0)
+                    # OKX returns taker fee as negative (e.g. -0.0005 = 5 bps)
+                    taker = abs(float(data[0].get("taker", 0) or 0))
                     return taker * 10_000
             except Exception:
                 pass
@@ -819,9 +969,17 @@ class MarketDataEngine:
         try:
             if exchange == "okx":
                 inst_id = self._sym_to_okx_inst(symbol)
+                inst_family = inst_id.replace("-SWAP", "")  # BTC-USDT
                 resp = await client._public_request("GET", "/api/v5/rubik/stat/contracts-long-short-account-ratio", {"instId": inst_id, "period": "5m"})
                 if resp.get("code") == "0" and resp.get("data"):
                     return float(resp["data"][0][1])
+                # Fallback: try instFamily-based endpoint
+                resp2 = await client._public_request("GET", "/api/v5/rubik/stat/long-short-account-ratio-contract-top-trader", {"instId": inst_id, "period": "5m"})
+                if resp2.get("code") == "0" and resp2.get("data"):
+                    row = resp2["data"][0]
+                    long_r = float(row[1]) if isinstance(row, list) else float(row.get("longAccountRatio", 0.5))
+                    short_r = float(row[2]) if isinstance(row, list) else float(row.get("shortAccountRatio", 0.5))
+                    return long_r / max(short_r, 1e-9)
             elif exchange == "htx":
                 cc = self._sym_to_htx_cc(symbol)
                 resp = await client._public_request("GET", "https://api.hbdm.com", "/linear-swap-api/v1/swap_elite_account_ratio", {"contract_code": cc, "period": "5min"})
@@ -844,7 +1002,8 @@ class MarketDataEngine:
         try:
             if exchange == "okx":
                 inst_id = self._sym_to_okx_inst(symbol)
-                resp = await client._public_request("GET", "/api/v5/public/liquidation-orders", {"instType": "SWAP", "instId": inst_id, "state": "filled"})
+                inst_family = inst_id.replace("-SWAP", "")  # BTC-USDT
+                resp = await client._public_request("GET", "/api/v5/public/liquidation-orders", {"instType": "SWAP", "instFamily": inst_family, "state": "filled"})
                 if resp.get("code") == "0":
                     total = 0.0
                     for item in resp.get("data", []):
@@ -978,13 +1137,23 @@ class MarketDataEngine:
                 if result.get("retCode") == 0 and result.get("result"):
                     for coin in result["result"].get("list", [{}])[0].get("coin", []):
                         if coin.get("coin") == "USDT":
-                            for field in ["availableToWithdraw", "walletBalance", "equity"]:
-                                val = coin.get(field, "")
+                            for fld in ["availableToWithdraw", "walletBalance", "equity"]:
+                                val = coin.get(fld, "")
                                 if val and val != "0":
                                     try:
                                         return float(val)
                                     except (ValueError, TypeError):
                                         continue
+
+            elif exchange == "binance":
+                result = await client.get_balance()
+                data = result if isinstance(result, list) else result.get("data", []) if isinstance(result, dict) else []
+                for item in data:
+                    if item.get("asset") == "USDT":
+                        try:
+                            return float(item.get("availableBalance") or item.get("balance") or 0)
+                        except (ValueError, TypeError):
+                            pass
         except Exception as e:
             logger.error(f"{exchange.upper()} balance fetch error: {e}")
 

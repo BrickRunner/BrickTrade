@@ -1,7 +1,6 @@
 """
 Система уведомлений для арбитражного бота
 """
-import asyncio
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -22,7 +21,6 @@ class NotificationManager:
         self.bot = bot
         self.user_id = user_id
         self.enabled = True
-        self.notification_queue = asyncio.Queue()
 
     def set_bot(self, bot, user_id: int):
         """Установить бота и пользователя"""
@@ -65,28 +63,6 @@ class NotificationManager:
             logger.debug(f"Notification sent to user {self.user_id}")
         except Exception as e:
             logger.error(f"Failed to send notification: {e}", exc_info=True)
-
-    async def notify_opportunity_found(
-        self,
-        symbol: str,
-        spread: float,
-        long_exchange: str,
-        short_exchange: str,
-        long_price: float,
-        short_price: float
-    ):
-        """Уведомление о найденной арбитражной возможности"""
-        message = (
-            f"💰 <b>Арбитражная возможность!</b>\n\n"
-            f"💱 Пара: <b>{symbol}</b>\n"
-            f"📊 Спред: <b>{spread:.2f}%</b>\n\n"
-            f"📈 LONG {long_exchange.upper()}\n"
-            f"   Цена: ${long_price:,.2f}\n\n"
-            f"📉 SHORT {short_exchange.upper()}\n"
-            f"   Цена: ${short_price:,.2f}\n\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await self.send(message)
 
     async def notify_position_opened(
         self,
@@ -175,16 +151,6 @@ class NotificationManager:
         )
         await self.send(message)
 
-    async def notify_hedge_executed(self, exchange: str, reason: str):
-        """Уведомление о выполнении хеджа"""
-        message = (
-            f"🛡 <b>Экстренный хедж!</b>\n\n"
-            f"Биржа: {exchange.upper()}\n"
-            f"Причина: {reason}\n\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await self.send(message)
-
     async def notify_bot_started(self, config):
         """Уведомление о запуске бота"""
         mode_emoji = "🔒" if config.mock_mode else "🔓"
@@ -217,136 +183,3 @@ class NotificationManager:
         )
         await self.send(message)
 
-    async def notify_daily_summary(self, stats: Dict[str, Any]):
-        """Ежедневная сводка"""
-        message = (
-            f"📈 <b>Дневная сводка</b>\n\n"
-            f"Сделок: {stats.get('total_trades', 0)}\n"
-            f"Успешных: {stats.get('successful_trades', 0)}\n"
-            f"PnL: {stats.get('total_pnl', 0):.2f} USDT\n"
-            f"Средний PnL: {stats.get('avg_pnl', 0):.2f} USDT\n\n"
-            f"Баланс: {stats.get('total_balance', 0):.2f} USDT\n\n"
-            f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        await self.send(message)
-
-    async def notify_balance_update(
-        self,
-        okx_balance: float,
-        htx_balance: float,
-        total_balance: float
-    ):
-        """Уведомление об обновлении баланса"""
-        message = (
-            f"💰 <b>Обновление баланса</b>\n\n"
-            f"OKX: {okx_balance:,.2f} USDT\n"
-            f"HTX: {htx_balance:,.2f} USDT\n"
-            f"Всего: <b>{total_balance:,.2f} USDT</b>\n\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await self.send(message)
-
-    async def notify_spread_alert(
-        self,
-        spread: float,
-        exchange1: str,
-        exchange2: str,
-        price1: float,
-        price2: float
-    ):
-        """Уведомление о высоком спреде (но не входим в позицию)"""
-        message = (
-            f"👀 <b>Интересный спред!</b>\n\n"
-            f"📊 Спред: <b>{spread:.3f}%</b>\n\n"
-            f"{exchange1.upper()}: ${price1:,.2f}\n"
-            f"{exchange2.upper()}: ${price2:,.2f}\n\n"
-            f"<i>Проверяю условия входа...</i>\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await self.send(message)
-
-    async def notify_opportunity_disappeared(
-        self,
-        symbol: str,
-        initial_spread: float,
-        final_spread: float,
-        duration_seconds: float,
-        long_exchange: str,
-        short_exchange: str
-    ):
-        """Уведомление об исчезновении арбитражной возможности"""
-        # Форматируем длительность
-        if duration_seconds < 60:
-            duration_text = f"{duration_seconds:.0f}с"
-        elif duration_seconds < 3600:
-            minutes = duration_seconds / 60
-            duration_text = f"{minutes:.1f}м"
-        else:
-            hours = duration_seconds / 3600
-            duration_text = f"{hours:.1f}ч"
-
-        # Определяем эмодзи в зависимости от изменения спреда
-        if final_spread < 0.15:
-            emoji = "📉"
-            status = "исчезла"
-        elif final_spread < initial_spread * 0.5:
-            emoji = "⬇️"
-            status = "значительно упала"
-        else:
-            emoji = "🔄"
-            status = "изменилась"
-
-        message = (
-            f"{emoji} <b>Возможность {status}</b>\n\n"
-            f"💱 Пара: <b>{symbol}</b>\n\n"
-            f"📊 Начальный спред: <b>{initial_spread:.3f}%</b>\n"
-            f"📊 Конечный спред: <b>{final_spread:.3f}%</b>\n\n"
-            f"📈 LONG {long_exchange.upper()}\n"
-            f"📉 SHORT {short_exchange.upper()}\n\n"
-            f"⏱ Держалась: <b>{duration_text}</b>\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await self.send(message)
-
-    async def notify_opportunity_updated(
-        self,
-        symbol: str,
-        old_spread: float,
-        new_spread: float,
-        duration_seconds: float,
-        long_exchange: str,
-        short_exchange: str
-    ):
-        """Уведомление об обновлении арбитражной возможности"""
-        # Форматируем длительность
-        if duration_seconds < 60:
-            duration_text = f"{duration_seconds:.0f}с"
-        elif duration_seconds < 3600:
-            minutes = duration_seconds / 60
-            duration_text = f"{minutes:.1f}м"
-        else:
-            hours = duration_seconds / 3600
-            duration_text = f"{hours:.1f}ч"
-
-        # Определяем направление изменения
-        if new_spread > old_spread:
-            emoji = "📈"
-            change = "увеличился"
-            change_value = new_spread - old_spread
-        else:
-            emoji = "📉"
-            change = "уменьшился"
-            change_value = old_spread - new_spread
-
-        message = (
-            f"{emoji} <b>Спред {change}</b>\n\n"
-            f"💱 Пара: <b>{symbol}</b>\n\n"
-            f"📊 Было: {old_spread:.3f}%\n"
-            f"📊 Стало: <b>{new_spread:.3f}%</b>\n"
-            f"{'🔺' if new_spread > old_spread else '🔻'} Изменение: {change_value:.3f}%\n\n"
-            f"📈 LONG {long_exchange.upper()}\n"
-            f"📉 SHORT {short_exchange.upper()}\n\n"
-            f"⏱ Держится: <b>{duration_text}</b>\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}"
-        )
-        await self.send(message)

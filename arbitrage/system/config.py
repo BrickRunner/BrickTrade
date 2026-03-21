@@ -42,25 +42,28 @@ class ApiCredentials:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    max_total_exposure_pct: float = 0.65
-    max_strategy_allocation_pct: float = 0.35
-    max_leverage: float = 3.0
+    max_total_exposure_pct: float = 0.30        # max 30% of capital at risk
+    max_strategy_allocation_pct: float = 0.10   # max 10% per trade
+    max_leverage: float = 5.0                   # leverage 2-5x
     max_daily_drawdown_pct: float = 0.05
     max_portfolio_drawdown_pct: float = 0.12
     max_order_slippage_bps: float = 25.0
-    api_latency_limit_ms: int = 8_000
+    api_latency_limit_ms: int = 400             # per strategy spec
     api_latency_breach_limit: int = 5
     kill_switch_enabled: bool = True
-    max_open_positions: int = 20
-    max_orderbook_age_sec: float = 30.0  # REST polling needs larger tolerance than WS
+    max_open_positions: int = 3                 # max 3 simultaneous arbs
+    max_orderbook_age_sec: float = 10.0         # tighter for arb
     max_inventory_imbalance_pct: float = 0.80
     max_realized_slippage_bps: float = 18.0
+    max_loss_per_trade_pct: float = 0.02  # kill switch if single trade loses >2% equity
 
 
 @dataclass(frozen=True)
 class ExecutionConfig:
     order_timeout_ms: int = 3000
     hedge_retries: int = 3
+    hedge_timeout_seconds: float = 15.0  # max total time for hedge sequence
+    hedge_settle_seconds: float = 0.3    # pause after hedge order before verification
     cycle_interval_seconds: float = 0.5
     dry_run: bool = True
     max_new_positions_per_cycle: int = 1
@@ -70,22 +73,21 @@ class ExecutionConfig:
 class StrategyConfig:
     enabled: List[str] = field(
         default_factory=lambda: [
-            "spot_arbitrage",
-            "cash_carry",
-            "funding_arbitrage",
-            "funding_spread",
-            "triangular_arbitrage",
-            "multi_triangular_arbitrage",
-            "prefunded_arbitrage",
-            "orderbook_imbalance",
-            "spread_capture",
-            "grid",
-            "indicator",
+            "futures_cross_exchange",
         ]
     )
-    min_edge_bps: float = 3.0
-    funding_threshold_bps: float = 1.0
+    min_edge_bps: float = 3.5
+    funding_threshold_bps: float = 5.0
     basis_threshold_bps: float = 5.0
+    # Futures cross-exchange arbitrage parameters
+    min_spread_pct: float = 0.50
+    target_profit_pct: float = 0.30
+    max_spread_risk_pct: float = 0.40
+    exit_spread_pct: float = 0.05
+    funding_rate_threshold_pct: float = 0.01
+    max_entry_latency_ms: float = 400.0
+    min_book_depth_multiplier: float = 3.0
+    # Legacy (kept for backward compat but unused)
     grid_levels: int = 8
     indicator_rsi_window: int = 14
     indicator_ema_fast: int = 21
@@ -98,27 +100,20 @@ class StrategyConfig:
             enabled = [s.strip().lower() for s in raw_enabled.split(",") if s.strip()]
         else:
             enabled = [
-                "spot_arbitrage",
-                "cash_carry",
-                "funding_arbitrage",
-                "funding_spread",
-                "triangular_arbitrage",
-                "multi_triangular_arbitrage",
-                "prefunded_arbitrage",
-                "orderbook_imbalance",
-                "spread_capture",
-                "grid",
-                "indicator",
+                "futures_cross_exchange",
             ]
         return cls(
             enabled=enabled,
-            min_edge_bps=_as_float(os.getenv("STRATEGY_MIN_EDGE_BPS"), 3.0),
-            funding_threshold_bps=_as_float(os.getenv("STRATEGY_FUNDING_THRESHOLD_BPS"), 1.0),
+            min_edge_bps=_as_float(os.getenv("STRATEGY_MIN_EDGE_BPS"), 3.5),
+            funding_threshold_bps=_as_float(os.getenv("STRATEGY_FUNDING_THRESHOLD_BPS"), 5.0),
             basis_threshold_bps=_as_float(os.getenv("STRATEGY_BASIS_THRESHOLD_BPS"), 5.0),
-            grid_levels=_as_int(os.getenv("STRATEGY_GRID_LEVELS"), 8),
-            indicator_rsi_window=_as_int(os.getenv("STRATEGY_INDICATOR_RSI_WINDOW"), 14),
-            indicator_ema_fast=_as_int(os.getenv("STRATEGY_INDICATOR_EMA_FAST"), 21),
-            indicator_ema_slow=_as_int(os.getenv("STRATEGY_INDICATOR_EMA_SLOW"), 55),
+            min_spread_pct=_as_float(os.getenv("ARB_MIN_SPREAD_PCT"), 0.50),
+            target_profit_pct=_as_float(os.getenv("ARB_TARGET_PROFIT_PCT"), 0.30),
+            max_spread_risk_pct=_as_float(os.getenv("ARB_MAX_SPREAD_RISK_PCT"), 0.40),
+            exit_spread_pct=_as_float(os.getenv("ARB_EXIT_SPREAD_PCT"), 0.05),
+            funding_rate_threshold_pct=_as_float(os.getenv("ARB_FUNDING_THRESHOLD_PCT"), 0.01),
+            max_entry_latency_ms=_as_float(os.getenv("ARB_MAX_LATENCY_MS"), 400.0),
+            min_book_depth_multiplier=_as_float(os.getenv("ARB_MIN_DEPTH_MULTIPLIER"), 3.0),
         )
 
 
@@ -130,16 +125,26 @@ class TradingSystemConfig:
     starting_equity: float
     trade_all_symbols: bool = False
     max_symbols: int = 30
+    symbol_blacklist: List[str] = field(default_factory=list)
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     strategy: StrategyConfig = field(default_factory=StrategyConfig)
 
     @classmethod
     def from_env(cls) -> "TradingSystemConfig":
-        raw_symbols = _first_env("SYMBOLS", "SYMBOL", default="BTCUSDT,ETHUSDT").strip()
+        raw_symbols = _first_env(
+            "SYMBOLS", "SYMBOL",
+            default=(
+                "BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,"
+                "ADAUSDT,DOGEUSDT,LINKUSDT,AVAXUSDT,LTCUSDT,"
+                "DOTUSDT,MATICUSDT,UNIUSDT,ATOMUSDT,NEARUSDT,"
+                "APTUSDT,ARBUSDT,OPUSDT,FILUSDT,SUIUSDT,"
+                "PEPEUSDT,SHIBUSDT,TRXUSDT,TONUSDT,INJUSDT"
+            ),
+        ).strip()
         trade_all_symbols = raw_symbols.upper() in {"ALL", "*", "AUTO"}
         symbols = [] if trade_all_symbols else [s.strip().upper() for s in raw_symbols.split(",") if s.strip()]
-        exchanges = [e.strip().lower() for e in os.getenv("EXCHANGES", "okx,htx").split(",") if e.strip()]
+        exchanges = [e.strip().lower() for e in os.getenv("EXCHANGES", "bybit,okx,htx").split(",") if e.strip()]
         credentials: Dict[str, ApiCredentials] = {}
         for exchange in exchanges:
             prefix = exchange.upper()
@@ -154,6 +159,9 @@ class TradingSystemConfig:
             False,
         )
 
+        raw_blacklist = os.getenv("SYMBOL_BLACKLIST", "").strip()
+        blacklist = [s.strip().upper() for s in raw_blacklist.split(",") if s.strip()] if raw_blacklist else []
+
         return cls(
             symbols=symbols,
             exchanges=exchanges,
@@ -161,6 +169,7 @@ class TradingSystemConfig:
             starting_equity=_as_float(os.getenv("STARTING_EQUITY"), 10_000.0),
             trade_all_symbols=trade_all_symbols,
             max_symbols=_as_int(os.getenv("MAX_SYMBOLS"), 30),
+            symbol_blacklist=blacklist,
             risk=RiskConfig(
                 max_total_exposure_pct=_as_float(os.getenv("RISK_MAX_TOTAL_EXPOSURE_PCT"), 0.65),
                 max_strategy_allocation_pct=_as_float(os.getenv("RISK_MAX_STRATEGY_ALLOC_PCT"), 0.35),
@@ -175,10 +184,13 @@ class TradingSystemConfig:
                 max_orderbook_age_sec=_as_float(os.getenv("RISK_MAX_ORDERBOOK_AGE_SEC"), 30.0),
                 max_inventory_imbalance_pct=_as_float(os.getenv("RISK_MAX_INVENTORY_IMBALANCE_PCT"), 0.80),
                 max_realized_slippage_bps=_as_float(os.getenv("RISK_MAX_REALIZED_SLIPPAGE_BPS"), 18.0),
+                max_loss_per_trade_pct=_as_float(os.getenv("RISK_MAX_LOSS_PER_TRADE_PCT"), 0.02),
             ),
             execution=ExecutionConfig(
                 order_timeout_ms=_as_int(os.getenv("EXEC_ORDER_TIMEOUT_MS"), 3000),
                 hedge_retries=_as_int(os.getenv("EXEC_HEDGE_RETRIES"), 3),
+                hedge_timeout_seconds=_as_float(os.getenv("EXEC_HEDGE_TIMEOUT_SECONDS"), 15.0),
+                hedge_settle_seconds=_as_float(os.getenv("EXEC_HEDGE_SETTLE_SECONDS"), 0.3),
                 cycle_interval_seconds=_as_float(os.getenv("EXEC_CYCLE_INTERVAL"), 0.5),
                 dry_run=exec_dry_run,
                 max_new_positions_per_cycle=_as_int(os.getenv("EXEC_MAX_NEW_POSITIONS_PER_CYCLE"), 1),

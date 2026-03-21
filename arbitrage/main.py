@@ -52,7 +52,7 @@ async def run() -> None:
     await provider.initialize()
 
     if config.trade_all_symbols:
-        selected = usdt_symbol_universe(market_data, config.max_symbols)
+        selected = usdt_symbol_universe(market_data, config.max_symbols, config.symbol_blacklist)
         config = replace(config, symbols=selected)
         logger.info(
             "Auto symbol universe enabled: selected=%s of common=%s",

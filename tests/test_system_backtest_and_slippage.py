@@ -16,7 +16,7 @@ from arbitrage.system.simulation.market_data import ReplayMarketDataProvider
 from arbitrage.system.slippage import SlippageModel
 from arbitrage.system.state import SystemState
 from arbitrage.system.strategy_runner import StrategyRunner
-from arbitrage.system.strategies.spot_arbitrage import SpotArbitrageStrategy
+from arbitrage.system.strategies import FuturesCrossExchangeStrategy
 
 
 def _frame(symbol: str) -> MarketSnapshot:
@@ -52,13 +52,13 @@ def test_slippage_model_increases_with_latency_and_size():
 
 @pytest.mark.asyncio
 async def test_backtest_engine_runs_and_executes():
-    state = SystemState(10_000)
+    state = SystemState(10_000, positions_file=":memory:")
     monitor = InMemoryMonitoring(logging.getLogger("test"))
     venue = SimulatedExecutionVenue()
     execution = AtomicExecutionEngine(ExecutionConfig(dry_run=True), venue, SlippageModel(), state, monitor)
     risk = RiskEngine(RiskConfig(), state)
     allocator = CapitalAllocator(RiskConfig())
-    runner = StrategyRunner([SpotArbitrageStrategy(min_edge_bps=2.0)], monitor)
+    runner = StrategyRunner([FuturesCrossExchangeStrategy()], monitor)
     backtest = BacktestEngine(["BTCUSDT"], runner, risk, allocator, execution)
     provider = ReplayMarketDataProvider({"BTCUSDT": [_frame("BTCUSDT"), _frame("BTCUSDT")]})
     result = await backtest.run(provider)

@@ -182,16 +182,47 @@ class OKXRestClient:
             "GET", "/api/v5/public/funding-rate", {"instId": inst_id}
         )
 
-    async def get_funding_rates_all(self) -> Dict[str, Any]:
+    async def get_funding_rates_all(self, symbols: list[str] | None = None) -> Dict[str, Any]:
         """
-        Получить ставки финансирования для всех SWAP инструментов.
-        OKX не имеет batch-эндпоинта — используем тикеры SWAP,
-        которые содержат поле 'fundingRate'.
+        Получить ставки финансирования для SWAP инструментов.
+        OKX requires per-instrument /api/v5/public/funding-rate calls.
+        We fetch only the symbols we need (from config).
         """
-        result = await self._public_request(
-            "GET", "/api/v5/market/tickers", {"instType": "SWAP"}
-        )
-        return result
+        if not symbols:
+            # Fallback: get all USDT-SWAP instruments
+            instruments = await self._public_request(
+                "GET", "/api/v5/public/instruments", {"instType": "SWAP"}
+            )
+            symbols = []
+            if instruments.get("code") == "0":
+                for inst in instruments.get("data", []):
+                    inst_id = inst.get("instId", "")
+                    if "-USDT-SWAP" in inst_id:
+                        symbols.append(inst_id)
+
+        all_rates = []
+        # Fetch in parallel with semaphore to avoid rate limits
+        sem = asyncio.Semaphore(5)
+
+        async def _fetch_one(inst_id: str):
+            async with sem:
+                try:
+                    resp = await self._public_request(
+                        "GET", "/api/v5/public/funding-rate",
+                        {"instId": inst_id}
+                    )
+                    if resp.get("code") == "0" and resp.get("data"):
+                        return resp["data"]
+                except Exception:
+                    pass
+                return []
+
+        tasks = [_fetch_one(s) for s in symbols]
+        results = await asyncio.gather(*tasks)
+        for batch in results:
+            all_rates.extend(batch)
+
+        return {"code": "0", "data": all_rates}
 
     async def get_orderbook(self, inst_id: str, sz: int = 5) -> Dict[str, Any]:
         """

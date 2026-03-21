@@ -5,7 +5,6 @@ from typing import Dict, List
 
 from arbitrage.system.capital_allocator import CapitalAllocator
 from arbitrage.system.execution import AtomicExecutionEngine
-from arbitrage.system.models import StrategyId
 from arbitrage.system.risk import RiskEngine
 from arbitrage.system.strategy_runner import StrategyRunner
 

@@ -18,13 +18,13 @@ Emergency actions:
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import Any, Tuple
 
 from arbitrage.utils import get_arbitrage_logger, ArbitrageConfig
 from arbitrage.core.state import BotState
 
-if TYPE_CHECKING:
-    from arbitrage.strategies.base import Opportunity
+# Type alias for Opportunity (legacy strategies removed)
+Opportunity = Any
 
 logger = get_arbitrage_logger("risk")
 

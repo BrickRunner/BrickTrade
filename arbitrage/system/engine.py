@@ -4,11 +4,12 @@ import asyncio
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field
 from typing import List
 
 from arbitrage.system.capital_allocator import CapitalAllocator
+from arbitrage.system.circuit_breaker import ExchangeCircuitBreaker
 from arbitrage.system.config import TradingSystemConfig
 from arbitrage.system.execution import AtomicExecutionEngine
 from arbitrage.system.interfaces import MarketDataProvider, MonitoringSink
@@ -16,51 +17,24 @@ from arbitrage.system.models import StrategyId
 from arbitrage.system.risk import RiskEngine
 from arbitrage.system.state import SystemState
 from arbitrage.system.strategy_runner import StrategyRunner
-from arbitrage.system.strategies.cash_carry import CashCarryStrategy
-from arbitrage.system.strategies.funding_arbitrage import FundingArbitrageStrategy
-from arbitrage.system.strategies.funding_spread import FundingSpreadStrategy
-from arbitrage.system.strategies.grid import GridStrategy
-from arbitrage.system.strategies.indicator import IndicatorStrategy
-from arbitrage.system.strategies.spot_arbitrage import SpotArbitrageStrategy
-from arbitrage.system.strategies.triangular_arbitrage import (
-    MultiTriangularArbitrageStrategy,
-    TriangularArbitrageStrategy,
-)
-from arbitrage.system.strategies.prefunded_arbitrage import PreFundedArbitrageStrategy
-from arbitrage.system.strategies.orderbook_imbalance import OrderbookImbalanceStrategy
-from arbitrage.system.strategies.spread_capture import SpreadCaptureStrategy
+from arbitrage.system.strategies.futures_cross_exchange import FuturesCrossExchangeStrategy
 
 logger = logging.getLogger("trading_system")
 
 
 def build_strategies(config: TradingSystemConfig, market_data=None) -> List:
+    """Build enabled strategies. Only futures_cross_exchange is active."""
     mapping = {
-        StrategyId.SPOT_ARBITRAGE.value: SpotArbitrageStrategy(config.strategy.min_edge_bps),
-        StrategyId.CASH_CARRY.value: CashCarryStrategy(config.strategy.basis_threshold_bps),
-        StrategyId.FUNDING_ARBITRAGE.value: FundingArbitrageStrategy(config.strategy.funding_threshold_bps),
-        StrategyId.FUNDING_SPREAD.value: FundingSpreadStrategy(config.strategy.funding_threshold_bps),
-        StrategyId.PREFUNDED_ARBITRAGE.value: PreFundedArbitrageStrategy(config.strategy.min_edge_bps),
-        StrategyId.ORDERBOOK_IMBALANCE.value: OrderbookImbalanceStrategy(),
-        StrategyId.SPREAD_CAPTURE.value: SpreadCaptureStrategy(),
-        StrategyId.GRID.value: GridStrategy(),
-        StrategyId.INDICATOR.value: IndicatorStrategy(),
+        StrategyId.FUTURES_CROSS_EXCHANGE.value: FuturesCrossExchangeStrategy(
+            min_spread_pct=config.strategy.min_spread_pct,
+            target_profit_pct=config.strategy.target_profit_pct,
+            max_spread_risk_pct=config.strategy.max_spread_risk_pct,
+            exit_spread_pct=config.strategy.exit_spread_pct,
+            funding_threshold_pct=config.strategy.funding_rate_threshold_pct,
+            max_latency_ms=config.strategy.max_entry_latency_ms,
+            min_book_depth_multiplier=config.strategy.min_book_depth_multiplier,
+        ),
     }
-    if market_data is not None:
-        mapping[StrategyId.TRIANGULAR_ARBITRAGE.value] = TriangularArbitrageStrategy(
-            market_data=market_data,
-            exchanges=config.exchanges,
-        )
-        mapping[StrategyId.MULTI_TRIANGULAR_ARBITRAGE.value] = MultiTriangularArbitrageStrategy(
-            market_data=market_data,
-            exchanges=config.exchanges,
-        )
-    spot_enabled = os.getenv("ENABLE_SPOT_EXECUTION", "false").strip().lower() in {"1", "true", "yes", "on"}
-    if not spot_enabled:
-        mapping.pop(StrategyId.SPOT_ARBITRAGE.value, None)
-        mapping.pop(StrategyId.CASH_CARRY.value, None)
-        mapping.pop(StrategyId.TRIANGULAR_ARBITRAGE.value, None)
-        mapping.pop(StrategyId.MULTI_TRIANGULAR_ARBITRAGE.value, None)
-        mapping.pop(StrategyId.SPREAD_CAPTURE.value, None)
     return [mapping[name] for name in config.strategy.enabled if name in mapping]
 
 
@@ -73,12 +47,16 @@ class TradingSystemEngine:
     allocator: CapitalAllocator
     execution: AtomicExecutionEngine
     strategies: StrategyRunner
+    circuit_breaker: ExchangeCircuitBreaker = field(default_factory=ExchangeCircuitBreaker)
     _cycle_count: int = 0
     _symbol_cooldown_until: dict[str, float] = field(default_factory=dict)
     _last_position_monitor_log_ts: dict[str, float] = field(default_factory=dict)
     _symbol_loss_streak: dict[str, int] = field(default_factory=dict)
-    _auto_strategy_select: bool = field(default_factory=lambda: os.getenv("AUTO_STRATEGY_SELECT", "true").strip().lower() in {"1", "true", "yes", "on"})
-    _temp_replace_spot: bool = field(default_factory=lambda: os.getenv("TEMP_REPLACE_SPOT", "true").strip().lower() in {"1", "true", "yes", "on"})
+    _balance_synced: bool = False
+    _position_close_failures: dict[str, int] = field(default_factory=dict)
+    _prev_balances: dict[str, float] = field(default_factory=dict)
+    _unstable_exchanges: dict[str, float] = field(default_factory=dict)  # exchange -> cooldown_until
+    _margin_rejected_exchanges: dict[str, float] = field(default_factory=dict)  # exchange -> cooldown_until
 
     @classmethod
     def create(
@@ -105,6 +83,16 @@ class TradingSystemEngine:
 
     async def run_forever(self) -> None:
         self.config.validate()
+        # Fix #3: cancel orphaned orders from previous crash
+        if hasattr(self.execution.venue, "cancel_orphaned_orders"):
+            try:
+                await self.execution.venue.cancel_orphaned_orders(self.config.symbols)
+            except Exception as exc:
+                logger.warning("orphan_cleanup_failed: %s", exc)
+        # Fix #8: scan for orphaned POSITIONS (not just orders) on all exchanges.
+        # If an exchange has open contracts that we don't track, it means margin is
+        # locked and any new trade will fail with "Insufficient margin".
+        await self._scan_orphaned_positions()
         while True:
             try:
                 await self.run_cycle()
@@ -118,6 +106,10 @@ class TradingSystemEngine:
     async def run_cycle(self) -> None:
         self._cycle_count += 1
         cycle_start = time.time()
+        # Fix #4: sync balance from exchange on first cycle
+        if not self._balance_synced:
+            await self._sync_balance_on_startup()
+            self._balance_synced = True
         state_snapshot = await self.risk.state.snapshot()
         api_health = await self.provider.health()
         latency_ms = max(api_health.values(), default=0.0)
@@ -143,9 +135,6 @@ class TradingSystemEngine:
             if await self.risk.state.kill_switch_triggered():
                 await self.monitor.emit("kill_switch", {"symbol": symbol, "message": "engine_paused"})
                 return
-            elif self._cycle_count > 1 and hasattr(self.risk.state, '_kill_switch_ts') and self.risk.state._kill_switch_ts > 0:
-                logger.info("kill_switch auto-reset after cooldown, resuming trading")
-                self.risk.state._kill_switch_ts = 0.0
             allocation = self.allocator.allocate(
                 equity=state_snapshot["equity"],
                 avg_funding_bps=max(snapshot.funding_rates.values(), default=0.0) * 10_000,
@@ -157,7 +146,7 @@ class TradingSystemEngine:
             selected_ids = self._select_strategy_ids(snapshot)
             available_ids = {s.strategy_id for s in self.strategies.strategies}
             logger.info(
-                f"[STRATEGY_SELECT] symbol={symbol} auto={self._auto_strategy_select} "
+                f"[STRATEGY_SELECT] symbol={symbol} "
                 f"available={[x.value for x in available_ids]} "
                 f"selected={[x.value for x in selected_ids]} "
                 f"vol={snapshot.volatility:.4f} trend={snapshot.trend_strength:.4f} "
@@ -171,10 +160,20 @@ class TradingSystemEngine:
                 {
                     "symbol": symbol,
                     "selected": [x.value for x in selected_ids],
-                    "auto": self._auto_strategy_select,
+                    "auto": True,
                 },
             )
-            intents = await self.strategies.generate_intents(snapshot, enabled_ids=selected_ids)
+            # Filter out exchanges with insufficient balance from orderbooks
+            # so the strategy never generates intents involving underfunded exchanges.
+            # This prevents the costly "first leg fills → second leg rejects → hedge back" cycle.
+            tradeable_snapshot = self._filter_underfunded_exchanges(snapshot, symbol)
+            if len(tradeable_snapshot.orderbooks) < 2:
+                logger.debug(
+                    "[SKIP_UNDERFUNDED] symbol=%s only %d funded exchanges, need 2",
+                    symbol, len(tradeable_snapshot.orderbooks),
+                )
+                continue
+            intents = await self.strategies.generate_intents(tradeable_snapshot, enabled_ids=selected_ids)
             intents.sort(key=lambda x: x.expected_edge_bps * x.confidence, reverse=True)
             intents_seen += len(intents)
 
@@ -197,18 +196,29 @@ class TradingSystemEngine:
             for intent in intents:
                 if opened_in_cycle >= self.config.execution.max_new_positions_per_cycle:
                     break
+                # Fix #1: skip intent if either exchange is circuit-broken
+                if not self.circuit_breaker.is_available(intent.long_exchange):
+                    logger.info("[CIRCUIT_BREAKER] skipping %s — %s tripped", symbol, intent.long_exchange)
+                    continue
+                if not self.circuit_breaker.is_available(intent.short_exchange):
+                    logger.info("[CIRCUIT_BREAKER] skipping %s — %s tripped", symbol, intent.short_exchange)
+                    continue
                 alloc_cap = allocation.strategy_allocations.get(intent.strategy_id, 0.0)
-                # For small accounts: allow up to 30% of equity per trade (capped by risk engine).
-                # For larger accounts the allocator cap will be the binding constraint.
-                equity_cap = state_snapshot["equity"] * 0.30
+                max_equity_pct = float(os.getenv("MAX_EQUITY_PER_TRADE_PCT", "0.30"))
+                equity_cap = state_snapshot["equity"] * max_equity_pct
                 proposed_notional = min(alloc_cap, equity_cap) if alloc_cap > 0 else equity_cap
                 # Ensure proposed_notional is at least the exchange minimum notional
                 # so small accounts can still place one-contract orders.
                 min_notional_hint = self._get_min_notional(intent)
                 min_notional_override = False
                 if proposed_notional < min_notional_hint and equity_cap >= min_notional_hint:
-                    proposed_notional = min_notional_hint
-                    min_notional_override = True
+                    # Allow override to exchange minimum, but never exceed
+                    # the allocation cap to prevent over-leveraging.
+                    if alloc_cap > 0:
+                        proposed_notional = min(min_notional_hint, alloc_cap)
+                    else:
+                        proposed_notional = min_notional_hint
+                    min_notional_override = proposed_notional >= min_notional_hint
                 if intent.metadata.get("legs"):
                     proposed_notional = min(
                         proposed_notional,
@@ -267,14 +277,35 @@ class TradingSystemEngine:
                     {"symbol": symbol, "strategy": intent.strategy_id.value, "success": report.success, "message": report.message},
                 )
                 if not report.success and report.message == "first_leg_failed":
+                    # Record error on the exchange that likely rejected
+                    self.circuit_breaker.record_error(intent.long_exchange, "first_leg_failed")
+                    self.circuit_breaker.record_error(intent.short_exchange, "first_leg_failed")
                     # Avoid hammering the same unaffordable/rejected symbol every cycle.
                     self._symbol_cooldown_until[symbol] = max(
                         self._symbol_cooldown_until.get(symbol, 0.0),
                         time.time() + 300,
                     )
                 if not report.success and report.message == "second_leg_failed":
+                    # Record error on second exchange
+                    self.circuit_breaker.record_error(intent.short_exchange, "second_leg_failed")
                     # Cooldown noisy symbols with repeated dual-leg failures.
                     self._symbol_cooldown_until[symbol] = time.time() + 120
+                    # If second leg was rejected (not just unfilled), the exchange
+                    # likely has a margin or API issue.  Block the EXCHANGE entirely
+                    # for 30 minutes to prevent repeated costly hedge cycles.
+                    # Determine which exchange was the second leg:
+                    reliability_rank = {"okx": 0, "bybit": 1, "htx": 2, "binance": 3}
+                    first_leg = min(
+                        [intent.long_exchange, intent.short_exchange],
+                        key=lambda ex: reliability_rank.get(ex, 99),
+                    )
+                    second_leg_ex = intent.short_exchange if first_leg == intent.long_exchange else intent.long_exchange
+                    cooldown_seconds = 1800  # 30 minutes
+                    self._margin_rejected_exchanges[second_leg_ex] = time.time() + cooldown_seconds
+                    logger.warning(
+                        "[MARGIN_REJECT_COOLDOWN] %s blocked for %d min after second_leg_failed on %s",
+                        second_leg_ex, cooldown_seconds // 60, symbol,
+                    )
                 if not report.success and report.message == "second_leg_failed" and not report.hedged:
                     await self.monitor.emit(
                         "execution_critical",
@@ -287,6 +318,8 @@ class TradingSystemEngine:
                     await self.risk.state.trigger_kill_switch(permanent=True)
                     return
                 if report.success:
+                    self.circuit_breaker.record_success(intent.long_exchange)
+                    self.circuit_breaker.record_success(intent.short_exchange)
                     exp_long = float(intent.metadata.get("long_price", 0.0) or 0.0)
                     exp_short = float(intent.metadata.get("short_price", 0.0) or 0.0)
                     if exp_long > 0 and exp_short > 0 and report.fill_price_long > 0 and report.fill_price_short > 0:
@@ -336,18 +369,29 @@ class TradingSystemEngine:
                 short_ob = snapshot.orderbooks.get(pos.short_exchange)
                 if not long_ob or not short_ob:
                     continue
+                max_ob_age = self.config.risk.max_orderbook_age_sec or 10.0
+                if now - long_ob.timestamp > max_ob_age or now - short_ob.timestamp > max_ob_age:
+                    continue
 
-                long_mid = long_ob.mid
-                short_mid = short_ob.mid
-                entry_long = float(pos.metadata.get("entry_long_price", long_mid) or long_mid)
-                entry_short = float(pos.metadata.get("entry_short_price", short_mid) or short_mid)
+                # Use executable prices for realistic PnL: sell long at bid, buy back short at ask.
+                long_exit_px = long_ob.bid
+                short_exit_px = short_ob.ask
+                entry_long = float(pos.metadata.get("entry_long_price", long_exit_px) or long_exit_px)
+                entry_short = float(pos.metadata.get("entry_short_price", short_exit_px) or short_exit_px)
 
                 # Approx mark-to-market PnL in quote currency on each leg.
-                long_pnl = ((long_mid - entry_long) / max(entry_long, 1e-9)) * pos.notional_usd
-                short_pnl = ((entry_short - short_mid) / max(entry_short, 1e-9)) * pos.notional_usd
-                pnl_usd = long_pnl + short_pnl
-                mid_ref = max((long_mid + short_mid) / 2, 1e-9)
-                edge_bps = ((short_mid - long_mid) / mid_ref) * 10_000
+                long_pnl = ((long_exit_px - entry_long) / max(entry_long, 1e-9)) * pos.notional_usd
+                short_pnl = ((entry_short - short_exit_px) / max(entry_short, 1e-9)) * pos.notional_usd
+                # Subtract estimated exit fees (entry fees already paid).
+                # total_fees_pct = full round-trip (entry+exit). Exit = half of that.
+                # Default 0.20 (typical taker both legs ×2) if missing from metadata.
+                exit_fee_pct = float(pos.metadata.get("total_fees_pct", 0.20) or 0.20) / 2
+                estimated_exit_fees = pos.notional_usd * exit_fee_pct / 100.0
+                pnl_usd = long_pnl + short_pnl - estimated_exit_fees
+                # Use realistic exit prices: sell long at bid, buy back short at ask.
+                # Mid prices are optimistic — bid/ask reflects actual executable edge.
+                mid_ref = max((long_ob.bid + short_ob.ask) / 2, 1e-9)
+                edge_bps = ((short_ob.ask - long_ob.bid) / mid_ref) * 10_000
                 age_sec = now - pos.opened_at
 
                 last_log = self._last_position_monitor_log_ts.get(pos.position_id, 0.0)
@@ -366,13 +410,32 @@ class TradingSystemEngine:
                     )
 
                 # Strategy-specific overrides from intent metadata.
-                tp_local = float(pos.metadata.get("take_profit_usd", take_profit_usd) or take_profit_usd)
-                sl_local = float(pos.metadata.get("stop_loss_usd", stop_loss_usd) or stop_loss_usd)
+                # Prefer percentage-based TP/SL (computed from notional) over fixed USD.
+                tp_pct = float(pos.metadata.get("take_profit_pct", 0) or 0)
+                sl_pct = float(pos.metadata.get("stop_loss_pct", 0) or 0)
+                if tp_pct > 0:
+                    tp_local = tp_pct * pos.notional_usd
+                else:
+                    tp_local = float(pos.metadata.get("take_profit_usd", take_profit_usd) or take_profit_usd)
+                if sl_pct > 0:
+                    sl_local = sl_pct * pos.notional_usd
+                else:
+                    sl_local = float(pos.metadata.get("stop_loss_usd", stop_loss_usd) or stop_loss_usd)
                 max_hold_local = int(pos.metadata.get("max_holding_seconds", max_holding_seconds) or max_holding_seconds)
                 close_edge_local = float(pos.metadata.get("close_edge_bps", close_edge_bps) or close_edge_bps)
 
+                # Fix #2: Per-trade max loss — kill switch if single trade loses too much
+                equity = (await self.risk.state.snapshot())["equity"]
+                max_trade_loss = equity * self.config.risk.max_loss_per_trade_pct
                 close_reason = None
-                if pnl_usd >= tp_local:
+                if pnl_usd <= -max_trade_loss:
+                    close_reason = "per_trade_max_loss"
+                    await self.monitor.emit(
+                        "per_trade_max_loss",
+                        {"position_id": pos.position_id, "pnl_usd": round(pnl_usd, 6), "limit_usd": round(max_trade_loss, 6)},
+                    )
+                    await self.risk.state.trigger_kill_switch(permanent=True)
+                elif pnl_usd >= tp_local:
                     close_reason = "take_profit"
                 elif pnl_usd <= -sl_local:
                     close_reason = "stop_loss"
@@ -380,16 +443,24 @@ class TradingSystemEngine:
                     close_reason = "max_holding_time"
                 elif edge_bps <= close_edge_local:
                     close_reason = "edge_converged"
-                elif pos.strategy_id == StrategyId.INDICATOR:
-                    signal_side = float(pos.metadata.get("signal_side", 0.0) or 0.0)
-                    ema_fast = snapshot.indicators.get("ema_fast", 0.0)
-                    ema_slow = snapshot.indicators.get("ema_slow", 0.0)
-                    macd = snapshot.indicators.get("macd", 0.0)
-                    macd_signal = snapshot.indicators.get("macd_signal", 0.0)
-                    if signal_side > 0 and (ema_fast < ema_slow or macd < macd_signal):
-                        close_reason = "indicator_reversal"
-                    elif signal_side < 0 and (ema_fast > ema_slow or macd > macd_signal):
-                        close_reason = "indicator_reversal"
+
+                # Funding arb: exit if funding rate advantage has reversed or halved
+                if not close_reason and pos.metadata.get("arb_type") == "funding_rate":
+                    fr_long = snapshot.funding_rates.get(pos.long_exchange)
+                    fr_short = snapshot.funding_rates.get(pos.short_exchange)
+                    if fr_long is not None and fr_short is not None:
+                        entry_diff = float(pos.metadata.get("funding_rate_diff_pct", 0) or 0)
+                        current_diff = (fr_short * 100 - fr_long * 100)  # short should be higher
+                        if entry_diff > 0 and current_diff < entry_diff * 0.3:
+                            close_reason = "funding_reversed"
+                            await self.monitor.emit(
+                                "funding_reversed",
+                                {
+                                    "position_id": pos.position_id,
+                                    "entry_diff_pct": round(entry_diff, 4),
+                                    "current_diff_pct": round(current_diff, 4),
+                                },
+                            )
 
                 if not close_reason:
                     continue
@@ -407,12 +478,31 @@ class TradingSystemEngine:
                 )
                 closed = await self.execution.execute_dual_exit(pos, close_reason)
                 if not closed:
+                    # Track consecutive close failures per position
+                    fail_count = self._position_close_failures.get(pos.position_id, 0) + 1
+                    self._position_close_failures[pos.position_id] = fail_count
                     await self.monitor.emit(
                         "position_close_failed",
-                        {"position_id": pos.position_id, "symbol": pos.symbol, "reason": close_reason},
+                        {"position_id": pos.position_id, "symbol": pos.symbol, "reason": close_reason, "fail_count": fail_count},
                     )
+                    # After 3 consecutive failures, verify if position actually exists on exchange.
+                    # If no real contracts found → phantom position from crash/test data. Remove it.
+                    if fail_count >= 3:
+                        is_phantom = await self._check_phantom_position(pos)
+                        if is_phantom:
+                            logger.warning(
+                                "phantom_position_removed: %s %s (no real contracts on %s/%s after %d close failures)",
+                                pos.position_id, pos.symbol, pos.long_exchange, pos.short_exchange, fail_count,
+                            )
+                            await self.risk.state.remove_position(pos.position_id)
+                            self._position_close_failures.pop(pos.position_id, None)
+                            await self.monitor.emit(
+                                "phantom_position_removed",
+                                {"position_id": pos.position_id, "symbol": pos.symbol},
+                            )
                     continue
 
+                self._position_close_failures.pop(pos.position_id, None)
                 removed = await self.risk.state.remove_position(pos.position_id)
                 if removed:
                     realized_pnl_usd = await self._compute_realized_pnl_from_balances(
@@ -460,9 +550,23 @@ class TradingSystemEngine:
                 )
 
     async def _compute_realized_pnl_from_balances(self, pos, fallback_pnl_usd: float) -> float:
-        # User-requested realized PnL model:
-        # take balance deltas on both exchanges since entry, then compute
-        # "where more came in" minus "where less came in".
+        """Compute realized PnL as the sum of balance deltas on both exchanges.
+
+        Falls back to mark-to-market PnL when balance method is unreliable
+        (multiple concurrent positions would pollute the delta).
+        """
+        # If other positions are open on the same exchanges, balance deltas
+        # include their P&L + funding, making the result inaccurate.
+        other_positions = await self.risk.state.list_positions()
+        same_exchange_count = sum(
+            1 for p in other_positions
+            if p.position_id != pos.position_id
+            and (p.long_exchange in (pos.long_exchange, pos.short_exchange)
+                 or p.short_exchange in (pos.long_exchange, pos.short_exchange))
+        )
+        if same_exchange_count > 0:
+            return fallback_pnl_usd
+
         try:
             balances_now = await self.execution.venue.get_balances()
             long_ex = pos.long_exchange
@@ -480,57 +584,207 @@ class TradingSystemEngine:
 
             delta_long = long_after - long_before
             delta_short = short_after - short_before
-            balance_delta_pnl = max(delta_long, delta_short) - min(delta_long, delta_short)
-            return float(balance_delta_pnl)
+            return float(delta_long + delta_short)
         except Exception:
             return fallback_pnl_usd
 
     def _select_strategy_ids(self, snapshot) -> set[StrategyId]:
-        available = {s.strategy_id for s in self.strategies.strategies}
-        if not self._auto_strategy_select:
-            selected = set(available)
-            return self._apply_spot_replacement(selected, available)
+        """All available strategies are always enabled (single strategy mode)."""
+        return {s.strategy_id for s in self.strategies.strategies}
 
-        selected: set[StrategyId] = set()
-        ind = snapshot.indicators
-        vol = snapshot.volatility
-        rsi = ind.get("rsi", 50.0)
-        basis_bps = abs(ind.get("basis_bps", 0.0))
-        funding_spread_bps = abs(ind.get("funding_spread_bps", 0.0))
+    async def _sync_balance_on_startup(self) -> None:
+        """Fix #4: Fetch fresh balance from exchanges before first trade."""
+        try:
+            balances = await self.execution.venue.get_balances()
+            if balances:
+                total = sum(balances.values())
+                if total > 0:
+                    old_equity = (await self.risk.state.snapshot())["equity"]
+                    if abs(total - old_equity) / max(old_equity, 1.0) > 0.01:
+                        logger.warning(
+                            "balance_sync: equity adjusted %.2f -> %.2f (exchange balances: %s)",
+                            old_equity, total, balances,
+                        )
+                        await self.risk.state.set_equity(total)
+                    else:
+                        logger.info("balance_sync: equity confirmed at %.2f", total)
+                else:
+                    logger.warning("balance_sync: total balance is 0, keeping configured equity")
+            else:
+                logger.warning("balance_sync: failed to fetch balances, keeping configured equity")
+        except Exception as exc:
+            logger.error("balance_sync: error fetching balances: %s", exc)
 
-        # Regime-style routing from live market data.
-        # Thresholds are relaxed — each strategy has its own internal filters.
-        if StrategyId.FUNDING_ARBITRAGE in available and funding_spread_bps >= self.config.strategy.funding_threshold_bps * 0.5:
-            selected.add(StrategyId.FUNDING_ARBITRAGE)
-        if StrategyId.FUNDING_SPREAD in available and funding_spread_bps >= self.config.strategy.funding_threshold_bps * 0.3:
-            selected.add(StrategyId.FUNDING_SPREAD)
-        if StrategyId.CASH_CARRY in available and basis_bps >= self.config.strategy.basis_threshold_bps * 0.5:
-            selected.add(StrategyId.CASH_CARRY)
+    def _filter_underfunded_exchanges(self, snapshot, symbol: str):
+        """Remove exchanges from snapshot where balance < min notional or balance is unstable.
 
-        if StrategyId.INDICATOR in available:
-            if vol <= 3.0:
-                selected.add(StrategyId.INDICATOR)
+        Returns a new MarketSnapshot with only funded+stable exchanges in orderbooks.
+        This prevents the strategy from generating intents that will fail on
+        the second leg due to insufficient margin.
+        """
+        from arbitrage.system.models import MarketSnapshot
+        balances = snapshot.balances or {}
+        if not balances:
+            return snapshot
 
-        if StrategyId.TRIANGULAR_ARBITRAGE in available and vol <= 3.0:
-            selected.add(StrategyId.TRIANGULAR_ARBITRAGE)
-        if StrategyId.MULTI_TRIANGULAR_ARBITRAGE in available and vol <= 2.0:
-            selected.add(StrategyId.MULTI_TRIANGULAR_ARBITRAGE)
-        if StrategyId.PREFUNDED_ARBITRAGE in available:
-            selected.add(StrategyId.PREFUNDED_ARBITRAGE)
-        if StrategyId.ORDERBOOK_IMBALANCE in available:
-            selected.add(StrategyId.ORDERBOOK_IMBALANCE)
-        if StrategyId.SPREAD_CAPTURE in available and vol <= 2.0:
-            selected.add(StrategyId.SPREAD_CAPTURE)
+        # Detect balance instability: if balance changed >80% since last check,
+        # mark exchange as unstable for 5 minutes.  This catches cases where
+        # HTX API intermittently reports wrong balances.
+        now = time.time()
+        for exchange, current_bal in balances.items():
+            prev_bal = self._prev_balances.get(exchange)
+            if prev_bal is not None and prev_bal > 0 and current_bal > 0:
+                change_pct = abs(current_bal - prev_bal) / max(prev_bal, current_bal)
+                if change_pct > 0.80:
+                    logger.warning(
+                        "[BALANCE_UNSTABLE] %s: %.2f → %.2f (%.0f%% change), cooling down 5min",
+                        exchange, prev_bal, current_bal, change_pct * 100,
+                    )
+                    self._unstable_exchanges[exchange] = now + 300  # 5 min cooldown
+            self._prev_balances[exchange] = current_bal
 
-        if StrategyId.GRID in available:
-            if vol <= 2.0 and 20.0 <= rsi <= 80.0:
-                selected.add(StrategyId.GRID)
+        funded_exchanges = set()
+        for exchange in snapshot.orderbooks:
+            # Skip exchanges with unstable balance
+            if self._unstable_exchanges.get(exchange, 0) > now:
+                logger.debug("[UNSTABLE_SKIP] %s on %s: balance unstable, in cooldown", symbol, exchange)
+                continue
+            # Skip exchanges that recently had margin rejections
+            if self._margin_rejected_exchanges.get(exchange, 0) > now:
+                logger.debug("[MARGIN_REJECT_SKIP] %s on %s: margin rejected, in cooldown", symbol, exchange)
+                continue
 
-        # Fallback when no specialized strategy is selected — enable all.
-        if not selected:
-            selected = set(available)
+            avail = balances.get(exchange, 0.0)
+            # Get minimum notional for this exchange+symbol
+            min_notional = self._get_min_notional_for_exchange(exchange, symbol)
+            # Also apply safety buffer: need at least min_notional + reserve
+            buf_pct = float(os.getenv("EXEC_MARGIN_SAFETY_BUFFER_PCT", "0.05"))
+            reserve = float(os.getenv("EXEC_MARGIN_SAFETY_RESERVE_USD", "0.50"))
+            needed = min_notional + reserve + (min_notional * buf_pct)
+            if avail >= needed:
+                funded_exchanges.add(exchange)
+            else:
+                logger.debug(
+                    "[UNDERFUNDED] %s on %s: balance=%.2f needed=%.2f (min_notional=%.2f)",
+                    symbol, exchange, avail, needed, min_notional,
+                )
 
-        return self._apply_spot_replacement(selected, available)
+        if funded_exchanges == set(snapshot.orderbooks.keys()):
+            return snapshot  # All exchanges funded, no filtering needed
+
+        filtered_obs = {ex: ob for ex, ob in snapshot.orderbooks.items() if ex in funded_exchanges}
+        filtered_spot = {ex: ob for ex, ob in snapshot.spot_orderbooks.items() if ex in funded_exchanges}
+        filtered_depth = {ex: d for ex, d in snapshot.orderbook_depth.items() if ex in funded_exchanges}
+        filtered_spot_depth = {ex: d for ex, d in snapshot.spot_orderbook_depth.items() if ex in funded_exchanges}
+        filtered_funding = {ex: r for ex, r in snapshot.funding_rates.items() if ex in funded_exchanges}
+        filtered_fees = {ex: f for ex, f in snapshot.fee_bps.items() if ex in funded_exchanges}
+
+        return replace(
+            snapshot,
+            orderbooks=filtered_obs,
+            spot_orderbooks=filtered_spot,
+            orderbook_depth=filtered_depth,
+            spot_orderbook_depth=filtered_spot_depth,
+            funding_rates=filtered_funding,
+            fee_bps=filtered_fees,
+        )
+
+    def _get_min_notional_for_exchange(self, exchange: str, symbol: str) -> float:
+        """Get minimum notional USD for a given exchange+symbol."""
+        market_data = getattr(self.provider, "market_data", None)
+        if not market_data:
+            return 5.0
+        ticker = market_data.get_futures_price(exchange, symbol)
+        if not ticker:
+            return 5.0
+        px = (ticker.bid + ticker.ask) / 2
+        ct = market_data.get_contract_size(exchange, symbol)
+        if px <= 0 or ct <= 0:
+            return 5.0
+        if exchange in ("bybit", "binance"):
+            return max(5.0, px * ct)
+        # OKX/HTX: one contract minimum
+        return max(1.0, px * ct)
+
+    async def _scan_orphaned_positions(self) -> None:
+        """Fix #8: At startup, scan all exchanges for open positions not tracked in state.
+
+        If an exchange has open contracts that aren't in our tracked positions,
+        it means margin is locked by an untracked position. Block that exchange
+        from trading until the position is resolved (closed manually or by us).
+        """
+        if not hasattr(self.execution.venue, "open_contracts"):
+            logger.info("orphan_position_scan: venue has no open_contracts method, skipping")
+            return
+
+        tracked_positions = await self.risk.state.list_positions()
+        # Build a set of (exchange, symbol) pairs that we track
+        tracked_pairs: set[tuple[str, str]] = set()
+        for pos in tracked_positions:
+            tracked_pairs.add((pos.long_exchange, pos.symbol))
+            tracked_pairs.add((pos.short_exchange, pos.symbol))
+
+        venue = self.execution.venue
+        exchange_names = list(venue.exchanges.keys()) if hasattr(venue, "exchanges") else []
+        if not exchange_names:
+            logger.info("orphan_position_scan: no exchanges configured, skipping")
+            return
+
+        orphaned_found = []
+        for exchange in exchange_names:
+            for symbol in self.config.symbols:
+                try:
+                    contracts = await venue.open_contracts(exchange, symbol)
+                    if contracts > 0:
+                        if (exchange, symbol) not in tracked_pairs:
+                            orphaned_found.append((exchange, symbol, contracts))
+                            logger.warning(
+                                "[ORPHAN_POSITION] %s has %.4f open contracts on %s "
+                                "NOT tracked in state — margin is locked! "
+                                "Blocking exchange for 60 min.",
+                                exchange, contracts, symbol,
+                            )
+                            # Block this exchange from trading for 60 minutes
+                            self._margin_rejected_exchanges[exchange] = time.time() + 3600
+                        else:
+                            logger.info(
+                                "orphan_position_scan: %s/%s has %.4f contracts (tracked, OK)",
+                                exchange, symbol, contracts,
+                            )
+                except Exception as exc:
+                    logger.warning("orphan_position_scan: error checking %s/%s: %s", exchange, symbol, exc)
+
+        if orphaned_found:
+            logger.error(
+                "[ORPHAN_POSITION_SUMMARY] Found %d orphaned positions: %s. "
+                "These exchanges are blocked from trading. "
+                "Close positions manually or restart after closing.",
+                len(orphaned_found),
+                [(ex, sym, f"{ct:.4f}") for ex, sym, ct in orphaned_found],
+            )
+            await self.monitor.emit("orphan_positions_detected", {
+                "count": len(orphaned_found),
+                "details": [{"exchange": ex, "symbol": sym, "contracts": ct} for ex, sym, ct in orphaned_found],
+            })
+        else:
+            logger.info("orphan_position_scan: no orphaned positions found, all clear")
+
+    async def _check_phantom_position(self, pos) -> bool:
+        """Check if a tracked position actually exists on exchanges.
+
+        Returns True if NO real contracts are found on either exchange
+        (i.e., the position is phantom / leftover from test data or crash).
+        """
+        try:
+            if not hasattr(self.execution.venue, "open_contracts"):
+                return False
+            long_contracts = await self.execution.venue.open_contracts(pos.long_exchange, pos.symbol)
+            short_contracts = await self.execution.venue.open_contracts(pos.short_exchange, pos.symbol)
+            # If both sides show zero contracts, it's a phantom
+            return long_contracts <= 0 and short_contracts <= 0
+        except Exception as exc:
+            logger.warning("phantom_check_error: %s %s: %s", pos.position_id, pos.symbol, exc)
+            return False
 
     def _get_min_notional(self, intent) -> float:
         """Return a rough minimum notional USD for the intent's exchanges."""
@@ -550,16 +804,3 @@ class TradingSystemEngine:
                 best = max(best, 1.0)
         return best
 
-    def _apply_spot_replacement(self, selected: set[StrategyId], available: set[StrategyId]) -> set[StrategyId]:
-        if not self._temp_replace_spot:
-            return selected
-        if StrategyId.SPOT_ARBITRAGE not in selected:
-            return selected
-        selected.discard(StrategyId.SPOT_ARBITRAGE)
-        if StrategyId.CASH_CARRY in available:
-            selected.add(StrategyId.CASH_CARRY)
-        elif StrategyId.FUNDING_SPREAD in available:
-            selected.add(StrategyId.FUNDING_SPREAD)
-        elif StrategyId.INDICATOR in available:
-            selected.add(StrategyId.INDICATOR)
-        return selected

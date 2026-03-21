@@ -8,6 +8,7 @@ import asyncio
 import aiohttp
 import hmac
 import hashlib
+import json
 import time
 from typing import Dict, Any, Optional
 
@@ -130,7 +131,6 @@ class BybitRestClient:
                         return await resp.json(content_type=None)
                 else:
                     # POST: подпись на JSON body
-                    import json
                     body = json.dumps(data or {})
                     headers = self._auth_headers(body)
                     async with session.post(

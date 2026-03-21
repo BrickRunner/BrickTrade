@@ -16,22 +16,12 @@ from typing import Callable, Optional, Dict, Any
 import websockets
 from websockets.client import WebSocketClientProtocol
 
-from arbitrage.utils import get_arbitrage_logger
+from arbitrage.utils import get_arbitrage_logger, usdt_to_htx as _usdt_to_htx
 
 logger = get_arbitrage_logger("htx_ws")
 
 # HTX Linear Swap WebSocket URL
 WS_URL = "wss://api.hbdm.com/linear-swap-ws"
-
-
-def _usdt_to_htx(symbol: str) -> str:
-    """Конвертировать BTCUSDT → BTC-USDT"""
-    if "-" in symbol:
-        return symbol.upper()
-    if symbol.upper().endswith("USDT"):
-        base = symbol[:-4].upper()
-        return f"{base}-USDT"
-    return symbol.upper()
 
 
 class HTXWebSocket:

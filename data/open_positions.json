@@ -1,0 +1,40 @@
+[
+  {
+    "position_id": "d5d203a6-3301-4051-a61b-55c77706af96",
+    "strategy_id": "futures_cross_exchange",
+    "symbol": "BARDUSDT",
+    "long_exchange": "htx",
+    "short_exchange": "okx",
+    "notional_usd": 5.52960517735089,
+    "entry_mid": 0.5427500000000001,
+    "stop_loss_bps": 40.0,
+    "opened_at": 1774034378.7944164,
+    "realized_pnl": 0.0,
+    "unrealized_pnl": 0.0,
+    "metadata": {
+      "spread_pct": 1.4442,
+      "net_spread_pct": 1.2442,
+      "total_fees_pct": 0.2,
+      "long_price": 0.5401,
+      "short_price": 0.5479,
+      "entry_long_price": 0.53755,
+      "entry_short_price": 0.54795,
+      "entry_mid": 0.544,
+      "target_profit_pct": 0.3,
+      "exit_spread_pct": 0.05,
+      "max_spread_risk_pct": 0.4,
+      "entry_spread_pct": 1.444177004258476,
+      "arb_type": "price_spread",
+      "take_profit_pct": 0.008709,
+      "stop_loss_pct": 0.004,
+      "max_holding_seconds": 3600,
+      "close_edge_bps": 5.0,
+      "size_okx": 12.0,
+      "size_htx": 10.0,
+      "notional_leg_first": 6.907295149203173,
+      "notional_leg_second": 5.52960517735089,
+      "balance_entry_htx": 5.9068094611864845,
+      "balance_entry_okx": 9.311104802824094
+    }
+  }
+]

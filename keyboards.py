@@ -50,7 +50,7 @@ def main_menu() -> ReplyKeyboardMarkup:
     """Создание главного меню"""
     kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚡ Арбитраж")],
+            [KeyboardButton(text="⚡ Арбитраж"), KeyboardButton(text="Stocks")],
             [KeyboardButton(text="📊 Курсы валют сейчас")],
             [KeyboardButton(text="📉 Пороговые значения"), KeyboardButton(text="📈 Статистика")],
             [KeyboardButton(text="⚙ Настройки")]

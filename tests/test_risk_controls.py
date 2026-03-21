@@ -31,10 +31,10 @@ def _snapshot(stale: bool = False, imbalance: bool = False):
 
 
 def test_stale_book_killswitch():
-    state = SystemState(starting_equity=1000.0)
+    state = SystemState(starting_equity=1000.0, positions_file=":memory:")
     risk = RiskEngine(RiskConfig(max_orderbook_age_sec=1.0), state)
     intent = TradeIntent(
-        strategy_id=StrategyId.PREFUNDED_ARBITRAGE,
+        strategy_id=StrategyId.FUTURES_CROSS_EXCHANGE,
         symbol="BTCUSDT",
         long_exchange="okx",
         short_exchange="htx",
@@ -43,7 +43,7 @@ def test_stale_book_killswitch():
         expected_edge_bps=10.0,
         stop_loss_bps=5.0,
     )
-    plan = AllocationPlan(strategy_allocations={StrategyId.PREFUNDED_ARBITRAGE: 100.0}, total_allocatable_capital=100.0)
+    plan = AllocationPlan(strategy_allocations={StrategyId.FUTURES_CROSS_EXCHANGE: 100.0}, total_allocatable_capital=100.0)
     decision = asyncio.run(
         risk.validate_intent(
             intent=intent,
@@ -59,10 +59,10 @@ def test_stale_book_killswitch():
 
 
 def test_inventory_imbalance_rejects():
-    state = SystemState(starting_equity=1000.0)
+    state = SystemState(starting_equity=1000.0, positions_file=":memory:")
     risk = RiskEngine(RiskConfig(max_inventory_imbalance_pct=0.2), state)
     intent = TradeIntent(
-        strategy_id=StrategyId.PREFUNDED_ARBITRAGE,
+        strategy_id=StrategyId.FUTURES_CROSS_EXCHANGE,
         symbol="BTCUSDT",
         long_exchange="okx",
         short_exchange="htx",
@@ -71,7 +71,7 @@ def test_inventory_imbalance_rejects():
         expected_edge_bps=10.0,
         stop_loss_bps=5.0,
     )
-    plan = AllocationPlan(strategy_allocations={StrategyId.PREFUNDED_ARBITRAGE: 100.0}, total_allocatable_capital=100.0)
+    plan = AllocationPlan(strategy_allocations={StrategyId.FUTURES_CROSS_EXCHANGE: 100.0}, total_allocatable_capital=100.0)
     decision = asyncio.run(
         risk.validate_intent(
             intent=intent,

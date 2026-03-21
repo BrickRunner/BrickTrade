@@ -1,11 +1,14 @@
 """Shared factory functions for building exchange clients and the trading engine."""
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Dict
 
+logger = logging.getLogger("trading_system")
+
 from arbitrage.core.market_data import MarketDataEngine
-from arbitrage.exchanges import BybitRestClient, HTXRestClient, OKXRestClient
+from arbitrage.exchanges import BinanceRestClient, BybitRestClient, HTXRestClient, OKXRestClient
 from arbitrage.system.config import TradingSystemConfig
 from arbitrage.utils import ExchangeConfig
 
@@ -14,6 +17,7 @@ _CLIENT_CLASSES = {
     "okx": OKXRestClient,
     "htx": HTXRestClient,
     "bybit": BybitRestClient,
+    "binance": BinanceRestClient,
 }
 
 
@@ -41,7 +45,7 @@ def build_exchange_clients(
         if not creds:
             continue
 
-        if validate_credentials and not config.execution.dry_run and exchange in {"okx", "htx"}:
+        if validate_credentials and not config.execution.dry_run and exchange in {"okx", "htx", "binance"}:
             if not creds.api_key or not creds.api_secret:
                 raise ValueError(f"Missing API credentials for {exchange} in live mode")
             if exchange == "okx" and not creds.passphrase:
@@ -64,7 +68,17 @@ def build_exchange_clients(
     return clients
 
 
-def usdt_symbol_universe(market_data: MarketDataEngine, max_symbols: int = 30) -> list[str]:
-    """Return sorted USDT-margined common pairs, capped at *max_symbols*."""
-    universe = sorted(s for s in market_data.common_pairs if s.endswith("USDT"))
+def usdt_symbol_universe(
+    market_data: MarketDataEngine,
+    max_symbols: int = 30,
+    blacklist: list[str] | None = None,
+) -> list[str]:
+    """Return sorted USDT-margined common pairs, excluding blacklisted, capped at *max_symbols*."""
+    bl = set(blacklist or [])
+    universe = sorted(
+        s for s in market_data.common_pairs
+        if s.endswith("USDT") and s not in bl
+    )
+    if bl:
+        logger.info("symbol_universe: blacklisted %d pairs: %s", len(bl), ", ".join(sorted(bl)))
     return universe[:max(1, max_symbols)]

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable
+
+logger = logging.getLogger("trading_system")
 
 from arbitrage.core.market_data import MarketDataEngine
 from arbitrage.system.interfaces import ExecutionVenue, MarketDataProvider
@@ -39,6 +42,7 @@ class LiveMarketDataProvider(MarketDataProvider):
     _last_spot_ts: float = 0.0
     _last_funding_ts: float = 0.0
     _last_depth_ts: float = 0.0
+    _per_symbol_depth_ts: Dict[str, float] = field(default_factory=dict)
     _last_balance_ts: float = 0.0
     _last_fee_ts: float = 0.0
     _futures_refresh_seconds: float = field(default_factory=lambda: float(os.getenv("FUTURES_REFRESH_SECONDS", "1.0")))
@@ -128,16 +132,27 @@ class LiveMarketDataProvider(MarketDataProvider):
                     timestamp=time.time(),
                 )
 
-        if now - self._last_depth_ts >= self._depth_refresh_seconds:
-            for exchange in self.exchanges:
-                depth = await self.market_data.fetch_orderbook_depth(exchange, symbol, levels=10)
+        symbol_depth_ts = self._per_symbol_depth_ts.get(symbol, 0.0)
+        if now - symbol_depth_ts >= self._depth_refresh_seconds:
+            enable_spot = os.getenv("ENABLE_SPOT_EXECUTION", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+            async def _fetch_depth(ex: str):
+                d = await self.market_data.fetch_orderbook_depth(ex, symbol, levels=10)
+                sd = None
+                if enable_spot:
+                    sd = await self.market_data.fetch_spot_orderbook_depth(ex, symbol, levels=10)
+                return ex, d, sd
+
+            results = await asyncio.gather(*[_fetch_depth(ex) for ex in self.exchanges], return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    continue
+                ex, depth, spot_depth = r
                 if depth:
-                    orderbook_depth[exchange] = depth
-                if os.getenv("ENABLE_SPOT_EXECUTION", "false").strip().lower() in {"1", "true", "yes", "on"}:
-                    spot_depth = await self.market_data.fetch_spot_orderbook_depth(exchange, symbol, levels=10)
-                    if spot_depth:
-                        spot_orderbook_depth[exchange] = spot_depth
-            self._last_depth_ts = now
+                    orderbook_depth[ex] = depth
+                if spot_depth:
+                    spot_orderbook_depth[ex] = spot_depth
+            self._per_symbol_depth_ts[symbol] = now
 
         if now - self._last_balance_ts >= self._balance_refresh_seconds:
             try:
@@ -281,15 +296,20 @@ class LiveExecutionVenue(ExecutionVenue):
         min_size = self.market_data.get_min_order_size(exchange, symbol)
         if px <= 0 or ct <= 0:
             return 0.0
-        if exchange == "bybit":
+        if exchange in ("bybit", "binance"):
             qty = notional_usd / px
             step = max(ct, 1e-8)
-            rounded = max(step, int(qty / step) * step)
+            rounded = max(step, round(qty / step) * step)
             if min_size > 0:
                 return max(rounded, min_size)
             return rounded
         # OKX/HTX operate in contract units; HTX is strict about integer volume.
         contracts = int(notional_usd / (px * ct))
+        if contracts < 1:
+            # Caller requested less than one contract; only allow if notional covers it
+            one_contract_cost = px * ct
+            if notional_usd < one_contract_cost * 0.5:
+                return 0.0
         contracts = max(1, contracts)
         if exchange == "htx":
             size = float(int(contracts))
@@ -379,6 +399,16 @@ class LiveExecutionVenue(ExecutionVenue):
                 offset=offset,
                 lever_rate=1,
             )
+        elif exchange == "binance":
+            response = await client.place_order(
+                symbol=symbol,
+                side=side,
+                size=size,
+                order_type=mapped_order_type,
+                price=px,
+                time_in_force=tif,
+                offset=offset,
+            )
         else:
             response = await client.place_order(
                 symbol=symbol,
@@ -397,11 +427,16 @@ class LiveExecutionVenue(ExecutionVenue):
             ok = response.get("status") == "ok"
         elif exchange == "bybit":
             ok = response.get("retCode") == 0
+        elif exchange == "binance":
+            ok = response.get("orderId") is not None and response.get("code") is None
         else:
             ok = False
 
-        ticker = self.market_data.get_futures_price(exchange, symbol)
-        fill_price = (ticker.bid + ticker.ask) / 2 if ticker else 0.0
+        fill_price = self._extract_fill_price(exchange, response)
+        if fill_price <= 0:
+            # Fallback to mid-price if exchange didn't report fill price
+            ticker = self.market_data.get_futures_price(exchange, symbol)
+            fill_price = (ticker.bid + ticker.ask) / 2 if ticker else 0.0
         message = self._extract_error_message(exchange, response)
         order_id = self._extract_order_id(exchange, response)
         return {
@@ -460,6 +495,16 @@ class LiveExecutionVenue(ExecutionVenue):
                 price=px,
             )
             ok = response.get("status") == "ok"
+        elif exchange == "binance":
+            response = await client.place_spot_order(
+                symbol=symbol,
+                side=side,
+                size=size,
+                order_type=mapped_order_type,
+                price=px,
+                time_in_force=tif,
+            )
+            ok = response.get("orderId") is not None and response.get("code") is None
         else:
             response = await client.place_spot_order(
                 symbol=symbol,
@@ -560,9 +605,14 @@ class LiveExecutionVenue(ExecutionVenue):
             "raw": response,
         }
 
-    async def cancel_order(self, exchange: str, order_id: str) -> None:
-        # Symbol is required by exchange APIs; cancellations are currently not used by the new engine path.
-        return None
+    async def cancel_order(self, exchange: str, order_id: str, symbol: str = "") -> None:
+        if not order_id or not symbol:
+            return
+        try:
+            client = self.exchanges[exchange]
+            await client.cancel_order(symbol, order_id)
+        except Exception:
+            pass
 
     async def get_order(self, exchange: str, symbol: str, order_id: str) -> Dict:
         client = self.exchanges[exchange]
@@ -574,6 +624,51 @@ class LiveExecutionVenue(ExecutionVenue):
 
     async def get_balances(self) -> Dict[str, float]:
         return await self._get_balances()
+
+    async def cancel_orphaned_orders(self, symbols: list[str]) -> int:
+        """Fix #3: Cancel any unfilled orders left from a previous crash."""
+        cancelled = 0
+        for exchange, client in self.exchanges.items():
+            for symbol in symbols:
+                try:
+                    if exchange == "okx":
+                        resp = await client.get_open_orders(symbol) if hasattr(client, "get_open_orders") else None
+                        if resp and resp.get("code") == "0":
+                            for order in resp.get("data", []):
+                                oid = order.get("ordId", "")
+                                if oid:
+                                    await client.cancel_order(symbol, oid)
+                                    logger.warning("orphan_cleanup: cancelled OKX order %s on %s", oid, symbol)
+                                    cancelled += 1
+                    elif exchange == "bybit":
+                        resp = await client.get_open_orders(symbol) if hasattr(client, "get_open_orders") else None
+                        if resp and resp.get("retCode") == 0:
+                            for order in resp.get("result", {}).get("list", []):
+                                oid = order.get("orderId", "")
+                                if oid:
+                                    await client.cancel_order(symbol, oid)
+                                    logger.warning("orphan_cleanup: cancelled Bybit order %s on %s", oid, symbol)
+                                    cancelled += 1
+                    elif exchange == "htx":
+                        # HTX doesn't have a simple open orders endpoint for linear swaps;
+                        # skip for now — orders auto-cancel on timeout
+                        pass
+                    elif exchange == "binance":
+                        resp = await client.get_open_orders(symbol) if hasattr(client, "get_open_orders") else None
+                        if resp and isinstance(resp, list):
+                            for order in resp:
+                                oid = str(order.get("orderId", ""))
+                                if oid:
+                                    await client.cancel_order(symbol, oid)
+                                    logger.warning("orphan_cleanup: cancelled Binance order %s on %s", oid, symbol)
+                                    cancelled += 1
+                except Exception as exc:
+                    logger.warning("orphan_cleanup: error on %s/%s: %s", exchange, symbol, exc)
+        if cancelled:
+            logger.info("orphan_cleanup: cancelled %d orphaned orders total", cancelled)
+        else:
+            logger.info("orphan_cleanup: no orphaned orders found")
+        return cancelled
 
     async def close(self) -> None:
         for client in self.exchanges.values():
@@ -602,6 +697,12 @@ class LiveExecutionVenue(ExecutionVenue):
                     for pos in result.get("result", {}).get("list", []):
                         total += abs(_safe_float(pos.get("size", 0.0)))
                     return total
+            elif exchange == "binance":
+                data = result.get("data", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+                total = 0.0
+                for pos in data:
+                    total += abs(_safe_float(pos.get("positionAmt", 0.0)))
+                return total
         except Exception:
             pass
         return 0.0
@@ -619,6 +720,7 @@ class LiveExecutionVenue(ExecutionVenue):
         if not order_id:
             return False
         deadline = time.time() + (timeout_ms / 1000)
+        poll_interval = 0.25
         while time.time() < deadline:
             try:
                 if spot:
@@ -631,8 +733,13 @@ class LiveExecutionVenue(ExecutionVenue):
                         return True
             except Exception:
                 pass
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(poll_interval)
+            poll_interval = min(poll_interval * 1.5, 1.0)
         return False
+
+    def invalidate_balance_cache(self) -> None:
+        """Force next _get_balances() to fetch fresh data from exchange."""
+        self._last_balance_ts = 0.0
 
     async def _get_balances(self) -> Dict[str, float]:
         now = time.time()
@@ -650,8 +757,8 @@ class LiveExecutionVenue(ExecutionVenue):
         px = (ticker.bid + ticker.ask) / 2 if ticker else 0.0
         ct = self.market_data.get_contract_size(exchange, symbol)
         min_size = self.market_data.get_min_order_size(exchange, symbol)
-        if exchange == "bybit":
-            # Bybit linear minimum is generally around 5 USDT notional.
+        if exchange in ("bybit", "binance"):
+            # Bybit/Binance linear minimum is generally around 5 USDT notional.
             return max(5.0, (min_size * px) if min_size > 0 and px > 0 else 5.0)
         if px > 0 and ct > 0:
             # One contract minimum for OKX/HTX.
@@ -675,6 +782,11 @@ class LiveExecutionVenue(ExecutionVenue):
         if exchange == "okx":
             if wants_limit:
                 tif = "ioc" if kind in {"ioc", "fok"} else "gtc"
+                return "limit", tif, limit_price
+            return "market", "", 0.0
+        if exchange == "binance":
+            if wants_limit:
+                tif = "IOC" if kind in {"ioc", "fok"} else "GTC"
                 return "limit", tif, limit_price
             return "market", "", 0.0
         # bybit and others
@@ -716,7 +828,42 @@ class LiveExecutionVenue(ExecutionVenue):
             return ""
         if exchange == "bybit":
             return str(response.get("result", {}).get("orderId") or response.get("orderId") or "")
+        if exchange == "binance":
+            return str(response.get("orderId") or "")
         return ""
+
+    @staticmethod
+    def _extract_fill_price(exchange: str, response: Dict[str, Any]) -> float:
+        """Extract actual average fill price from exchange order response."""
+        try:
+            if exchange == "okx":
+                data = response.get("data") or []
+                if isinstance(data, list) and data:
+                    px = _safe_float(data[0].get("avgPx") or data[0].get("fillPx", 0))
+                    if px > 0:
+                        return px
+            elif exchange == "htx":
+                data = response.get("data")
+                if isinstance(data, dict):
+                    px = _safe_float(data.get("trade_avg_price") or data.get("price", 0))
+                    if px > 0:
+                        return px
+                if isinstance(data, list) and data:
+                    px = _safe_float(data[0].get("trade_avg_price") or data[0].get("price", 0))
+                    if px > 0:
+                        return px
+            elif exchange == "bybit":
+                result = response.get("result", {})
+                px = _safe_float(result.get("avgPrice") or result.get("price", 0))
+                if px > 0:
+                    return px
+            elif exchange == "binance":
+                px = _safe_float(response.get("avgPrice") or response.get("price", 0))
+                if px > 0:
+                    return px
+        except Exception:
+            pass
+        return 0.0
 
     @staticmethod
     def _order_filled(exchange: str, response: Dict[str, Any], expected_size: float | None) -> bool:
@@ -744,6 +891,10 @@ class LiveExecutionVenue(ExecutionVenue):
             data = response.get("result", {})
             filled = float(data.get("cumExecQty", 0) or 0)
             return str(data.get("orderStatus") or "") in {"Filled", "filled"} and (expected_size is None or filled >= expected_size * 0.98)
+        if exchange == "binance":
+            status = str(response.get("status") or "")
+            filled = float(response.get("executedQty", 0) or 0)
+            return status == "FILLED" and (expected_size is None or filled >= expected_size * 0.98)
         return False
 
     @staticmethod
@@ -766,6 +917,10 @@ class LiveExecutionVenue(ExecutionVenue):
             data = response.get("result", {})
             filled = float(data.get("cumExecQty", 0) or 0)
             return str(data.get("orderStatus") or "") in {"Filled", "filled"} and (expected_size is None or filled >= expected_size * 0.98)
+        if exchange == "binance":
+            status = str(response.get("status") or "")
+            filled = float(response.get("executedQty", 0) or 0)
+            return status == "FILLED" and (expected_size is None or filled >= expected_size * 0.98)
         return False
 
     def _round_spot_size(self, exchange: str, symbol: str, size: float) -> float:
@@ -804,4 +959,8 @@ class LiveExecutionVenue(ExecutionVenue):
             )
         if exchange == "bybit":
             return str(response.get("retMsg") or response.get("retCode") or "bybit_reject")
+        if exchange == "binance":
+            if response.get("orderId") and response.get("code") is None:
+                return ""
+            return str(response.get("msg") or response.get("code") or "binance_reject")
         return ""

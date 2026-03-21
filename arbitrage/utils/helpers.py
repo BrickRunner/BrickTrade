@@ -174,3 +174,13 @@ def calculate_pnl(entry_price: float, exit_price: float, size: float, side: str)
         return (exit_price - entry_price) * size
     else:  # SHORT
         return (entry_price - exit_price) * size
+
+
+def usdt_to_htx(symbol: str) -> str:
+    """Convert BTCUSDT -> BTC-USDT (HTX format)."""
+    if "-" in symbol:
+        return symbol.upper()
+    if symbol.upper().endswith("USDT"):
+        base = symbol[:-4].upper()
+        return f"{base}-USDT"
+    return symbol.upper()

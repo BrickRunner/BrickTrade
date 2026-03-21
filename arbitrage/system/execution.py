@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Dict
@@ -10,6 +11,8 @@ from arbitrage.system.interfaces import ExecutionVenue, MonitoringSink
 from arbitrage.system.models import ExecutionReport, OpenPosition, TradeIntent
 from arbitrage.system.slippage import SlippageModel
 from arbitrage.system.state import SystemState
+
+logger = logging.getLogger("trading_system")
 
 
 @dataclass
@@ -38,6 +41,9 @@ class AtomicExecutionEngine:
             if self.config.dry_run:
                 return await self._open_dry_position(intent, notional_usd, slippage_bps)
             try:
+                # Invalidate cache to get FRESH balances for preflight check
+                if hasattr(self.venue, "invalidate_balance_cache"):
+                    self.venue.invalidate_balance_cache()
                 balances_before_entry = await self._safe_get_balances()
                 if intent.long_exchange == intent.short_exchange:
                     first_leg = intent.long_exchange
@@ -46,6 +52,76 @@ class AtomicExecutionEngine:
                     second_side = "sell"
                 else:
                     first_leg, first_side, second_leg, second_side = self._determine_leg_order(intent)
+                # Pre-flight: verify BOTH exchanges have sufficient margin BEFORE
+                # placing any orders.  This prevents the costly scenario where leg-1
+                # fills, leg-2 is rejected for insufficient margin, and we have to
+                # hedge leg-1 back — paying fees for a zero-sum round-trip.
+                if balances_before_entry:
+                    for check_ex in [first_leg, second_leg]:
+                        avail = max(0.0, balances_before_entry.get(check_ex, 0.0))
+                        # Use the venue's safety parameters if available
+                        buf_pct = getattr(self.venue, "safety_buffer_pct", 0.05)
+                        reserve = getattr(self.venue, "safety_reserve_usd", 0.50)
+                        max_safe = max(0.0, avail * (1.0 - buf_pct) - reserve)
+                        # Check against min notional for this exchange
+                        min_notional = 1.0
+                        if hasattr(self.venue, "_min_notional_usd"):
+                            min_notional = self.venue._min_notional_usd(check_ex, intent.symbol)
+                        if avail < min_notional or max_safe < min_notional:
+                            await self.monitor.emit(
+                                "execution_reject",
+                                {
+                                    "leg": 0,
+                                    "reason": f"preflight_margin_check: {check_ex} available={avail:.2f} min_notional={min_notional:.2f} max_safe={max_safe:.2f}",
+                                },
+                            )
+                            return ExecutionReport(
+                                success=False,
+                                position_id=None,
+                                fill_price_long=0.0,
+                                fill_price_short=0.0,
+                                notional_usd=notional_usd,
+                                slippage_bps=slippage_bps,
+                                message="first_leg_failed",
+                            )
+
+                # Fix #8: Check for orphaned positions on BOTH exchanges.
+                # If an exchange has untracked open contracts, its margin is locked
+                # and the trade WILL fail — reject before placing any orders.
+                if hasattr(self.venue, "open_contracts"):
+                    tracked_positions = await self.state.list_positions()
+                    tracked_pairs: set[tuple[str, str]] = set()
+                    for tp in tracked_positions:
+                        tracked_pairs.add((tp.long_exchange, tp.symbol))
+                        tracked_pairs.add((tp.short_exchange, tp.symbol))
+                    for check_ex in [first_leg, second_leg]:
+                        try:
+                            contracts = await self.venue.open_contracts(check_ex, intent.symbol)
+                            if contracts > 0 and (check_ex, intent.symbol) not in tracked_pairs:
+                                logger.warning(
+                                    "[PREFLIGHT_ORPHAN] %s has %.4f untracked contracts on %s — "
+                                    "margin is locked, rejecting trade",
+                                    check_ex, contracts, intent.symbol,
+                                )
+                                await self.monitor.emit(
+                                    "execution_reject",
+                                    {
+                                        "leg": 0,
+                                        "reason": f"preflight_orphan_position: {check_ex} has {contracts:.4f} untracked contracts on {intent.symbol}",
+                                    },
+                                )
+                                return ExecutionReport(
+                                    success=False,
+                                    position_id=None,
+                                    fill_price_long=0.0,
+                                    fill_price_short=0.0,
+                                    notional_usd=notional_usd,
+                                    slippage_bps=slippage_bps,
+                                    message="orphan_position_blocks_trade",
+                                )
+                        except Exception:
+                            pass  # If check fails, continue — other safeguards still apply
+
                 leg_kinds = dict(intent.metadata.get("leg_kinds") or {})
                 raw_limit_prices = dict(intent.metadata.get("limit_prices") or {})
                 # Add slippage buffer to IOC limit prices so they have a better
@@ -127,30 +203,34 @@ class AtomicExecutionEngine:
                         message="first_leg_failed",
                     )
 
+                # Invalidate balance cache so second leg sees updated margin
+                if hasattr(self.venue, "invalidate_balance_cache"):
+                    self.venue.invalidate_balance_cache()
+
+                # CRITICAL: Second leg MUST fill — if it doesn't, we have to hedge
+                # the first leg back at a loss (fees + slippage).  Strategy:
+                # 1. Try market order directly (guaranteed fill, fastest)
+                # 2. Only hedge if market order fails (exchange down / no liquidity)
+                #
+                # Why market order for second leg:
+                # - First leg already filled, we are COMMITTED
+                # - IOC limit can fail if price moved during first leg execution
+                # - Market order slippage on small sizes is negligible
+                # - Failed second leg + hedge costs MORE than market slippage
+                second_filled = False
+                second = {}
+
                 if leg_kinds.get(second_leg) == "spot":
                     qty = _spot_qty(second_leg)
-                    if qty <= 0:
-                        await self.monitor.emit("execution_reject", {"leg": 2, "reason": "spot_qty_unavailable"})
-                        return ExecutionReport(
-                            success=False,
-                            position_id=None,
-                            fill_price_long=0.0,
-                            fill_price_short=0.0,
-                            notional_usd=notional_usd,
-                            slippage_bps=slippage_bps,
-                            message="second_leg_failed",
+                    if qty > 0:
+                        second = await self.venue.place_spot_order(
+                            second_leg, intent.symbol, second_side, qty, "market", 0.0
                         )
-                    second_limit = float(limit_prices.get(second_side, 0.0) or 0.0)
-                    second_order_type = "ioc" if second_limit > 0 else order_type
-                    second = await self.venue.place_spot_order(
-                        second_leg, intent.symbol, second_side, qty, second_order_type, second_limit
-                    )
                 else:
-                    second_limit = float(limit_prices.get(second_side, 0.0) or 0.0)
-                    second_order_type = "ioc" if second_limit > 0 else order_type
                     second = await self.venue.place_order(
-                        second_leg, intent.symbol, second_side, notional_usd, second_order_type, second_limit
+                        second_leg, intent.symbol, second_side, notional_usd, "market", 0.0
                     )
+
                 if second.get("success"):
                     second_order_id = str(second.get("order_id") or "")
                     if await self.venue.wait_for_fill(
@@ -161,71 +241,68 @@ class AtomicExecutionEngine:
                         spot=leg_kinds.get(second_leg) == "spot",
                         expected_size=float(second.get("size", 0.0) or 0.0) or None,
                     ):
-                        if intent.side == "spread_capture":
+                        second_filled = True
+                    else:
+                        # Market order placed but fill not confirmed — check if position
+                        # actually exists before hedging to avoid creating orphaned positions.
+                        if hasattr(self.venue, "open_contracts"):
+                            try:
+                                contracts = await self.venue.open_contracts(second_leg, intent.symbol)
+                                if contracts > 0:
+                                    # Position exists on second leg — treat as filled
+                                    second_filled = True
+                                    await self.monitor.emit(
+                                        "execution_fill_recovery",
+                                        {"leg": 2, "exchange": second_leg, "contracts": contracts},
+                                    )
+                            except Exception:
+                                pass
+                        if not second_filled:
                             await self.monitor.emit(
-                                "execution_fill",
-                                {"dry_run": False, "symbol": intent.symbol, "strategy": intent.strategy_id.value, "spread_capture": True},
+                                "execution_reject",
+                                {"leg": 2, "reason": "market_order_not_confirmed", "exchange": second_leg},
                             )
-                            return ExecutionReport(
-                                success=True,
-                                position_id=None,
-                                fill_price_long=float(first.get("fill_price", 0.0) or 0.0),
-                                fill_price_short=float(second.get("fill_price", 0.0) or 0.0),
-                                notional_usd=notional_usd,
-                                slippage_bps=slippage_bps,
-                                message="spread_capture_filled",
-                            )
-                        return await self._open_live_position(
-                            intent,
-                            notional_usd,
-                            slippage_bps,
-                            first,
-                            second,
-                            balances_before_entry,
-                        )
-                    await self.monitor.emit("execution_reject", {"leg": 2, "reason": "second_leg_not_filled"})
+                else:
+                    await self.monitor.emit(
+                        "execution_reject",
+                        {"leg": 2, "reason": second.get("message", "unknown"), "exchange": second_leg},
+                    )
+
+                if second_filled:
+                    return await self._open_live_position(
+                        intent,
+                        notional_usd,
+                        slippage_bps,
+                        first,
+                        second,
+                        balances_before_entry,
+                    )
+
+                # Market order failed — must hedge first leg
                 await self.monitor.emit(
                     "execution_reject",
-                    {"leg": 2, "reason": second.get("message", "unknown"), "exchange": second_leg},
+                    {"leg": 2, "reason": "second_leg_failed_hedging", "exchange": second_leg},
                 )
 
-                # Hedge / unwind if second leg failed.
+                # Hedge / unwind if second leg failed — wrapped in timeout.
                 hedge_side = "sell" if first_side == "buy" else "buy"
                 hedged = False
                 hedge_verified = False
                 remaining_contracts = None
                 first_size = float(first.get("size", 0.0) or 0.0)
-                for _ in range(self.config.hedge_retries):
-                    if leg_kinds.get(first_leg) == "spot":
-                        unwind = await self.venue.place_spot_order(
-                            first_leg,
-                            intent.symbol,
-                            hedge_side,
-                            first_size if first_size > 0 else _spot_qty(first_leg),
-                            "ioc",
-                        )
-                    else:
-                        unwind = await self.venue.place_order(
-                            first_leg,
-                            intent.symbol,
-                            hedge_side,
-                            notional_usd,
-                            "ioc",
-                            quantity_contracts=first_size if first_size > 0 else None,
-                            offset="close",
-                        )
-                    if unwind.get("success"):
-                        if hasattr(self.venue, "open_contracts"):
-                            try:
-                                remaining_contracts = await self.venue.open_contracts(first_leg, intent.symbol)
-                                hedge_verified = True
-                            except Exception:
-                                remaining_contracts = None
-                                hedge_verified = False
-                        if hedge_verified and remaining_contracts is not None and remaining_contracts <= 0:
-                            hedged = True
-                            break
-                    await asyncio.sleep(self.config.order_timeout_ms / 1000)
+                try:
+                    hedged, hedge_verified, remaining_contracts = await asyncio.wait_for(
+                        self._hedge_first_leg(
+                            first_leg, intent.symbol, hedge_side, notional_usd,
+                            first_size, _spot_qty, leg_kinds,
+                        ),
+                        timeout=self.config.hedge_timeout_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    await self.monitor.emit(
+                        "execution_hedge_timeout",
+                        {"symbol": intent.symbol, "exchange": first_leg, "timeout_sec": self.config.hedge_timeout_seconds},
+                    )
 
                 await self.monitor.emit(
                     "execution_hedge",
@@ -613,7 +690,7 @@ class AtomicExecutionEngine:
     @staticmethod
     def _determine_leg_order(intent: TradeIntent) -> tuple[str, str, str, str]:
         # Reliability preference: OKX first, then Bybit, then HTX.
-        reliability_rank = {"okx": 0, "bybit": 1, "htx": 2}
+        reliability_rank = {"okx": 0, "bybit": 1, "htx": 2, "binance": 3}
         exchanges = [intent.long_exchange, intent.short_exchange]
         first_leg = min(exchanges, key=lambda ex: reliability_rank.get(ex, 99))
         second_leg = intent.short_exchange if first_leg == intent.long_exchange else intent.long_exchange
@@ -630,7 +707,7 @@ class AtomicExecutionEngine:
         short_size: float,
     ) -> tuple[str, str, float, str, str, float]:
         # Reliability preference: OKX first, then Bybit, then HTX.
-        reliability_rank = {"okx": 0, "bybit": 1, "htx": 2}
+        reliability_rank = {"okx": 0, "bybit": 1, "htx": 2, "binance": 3}
         candidates = [
             (position.long_exchange, long_side, long_size),
             (position.short_exchange, short_side, short_size),
@@ -685,7 +762,7 @@ class AtomicExecutionEngine:
         position_id = str(uuid.uuid4())
         fill_long = first["fill_price"] if first["exchange"] == intent.long_exchange else second["fill_price"]
         fill_short = first["fill_price"] if first["exchange"] == intent.short_exchange else second["fill_price"]
-        actual_notional = max(
+        actual_notional = min(
             float(first.get("effective_notional", notional_usd)),
             float(second.get("effective_notional", notional_usd)),
         )
@@ -734,13 +811,63 @@ class AtomicExecutionEngine:
             position_id=position_id,
             fill_price_long=fill_long,
             fill_price_short=fill_short,
-            notional_usd=notional_usd,
+            notional_usd=actual_notional,
             slippage_bps=slippage_bps,
             message="filled",
         )
 
+    async def _hedge_first_leg(
+        self,
+        first_leg: str,
+        symbol: str,
+        hedge_side: str,
+        notional_usd: float,
+        first_size: float,
+        _spot_qty,
+        leg_kinds: dict,
+    ) -> tuple[bool, bool, float | None]:
+        """Execute hedge with retries. Returns (hedged, verified, remaining_contracts)."""
+        remaining_contracts = None
+        for _ in range(self.config.hedge_retries):
+            if leg_kinds.get(first_leg) == "spot":
+                unwind = await self.venue.place_spot_order(
+                    first_leg,
+                    symbol,
+                    hedge_side,
+                    first_size if first_size > 0 else _spot_qty(first_leg),
+                    "ioc",
+                )
+            else:
+                unwind = await self.venue.place_order(
+                    first_leg,
+                    symbol,
+                    hedge_side,
+                    notional_usd,
+                    "ioc",
+                    quantity_contracts=first_size if first_size > 0 else None,
+                    offset="close",
+                )
+            if unwind.get("success"):
+                await asyncio.sleep(self.config.hedge_settle_seconds)
+                hedge_verified = False
+                if hasattr(self.venue, "open_contracts"):
+                    try:
+                        remaining_contracts = await self.venue.open_contracts(first_leg, symbol)
+                        hedge_verified = True
+                    except Exception:
+                        remaining_contracts = None
+                        hedge_verified = False
+                if hedge_verified and remaining_contracts is not None and remaining_contracts <= 0:
+                    return True, True, remaining_contracts
+                if not hedge_verified:
+                    return True, False, remaining_contracts
+            await asyncio.sleep(self.config.order_timeout_ms / 1000)
+        return False, False, remaining_contracts
+
     async def _safe_get_balances(self) -> Dict[str, float]:
         try:
             return await self.venue.get_balances()
-        except Exception:
+        except Exception as exc:
+            import logging
+            logging.getLogger("trading_system").warning("balance_fetch_failed: %s", exc)
             return {}

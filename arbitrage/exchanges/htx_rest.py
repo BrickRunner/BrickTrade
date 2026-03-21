@@ -17,28 +17,13 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-from arbitrage.utils import get_arbitrage_logger, ExchangeConfig
+from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, usdt_to_htx as _usdt_to_htx
 
 logger = get_arbitrage_logger("htx_rest")
 
 # Base URLs
 FUTURES_BASE_URL = "https://api.hbdm.com"    # Linear swap (USDT-margined)
 SPOT_BASE_URL    = "https://api.htx.com"      # Spot market
-
-
-def _usdt_to_htx(symbol: str) -> str:
-    """Конвертировать BTCUSDT → BTC-USDT"""
-    if "-" in symbol:
-        return symbol.upper()
-    if symbol.upper().endswith("USDT"):
-        base = symbol[:-4].upper()
-        return f"{base}-USDT"
-    return symbol.upper()
-
-
-def _htx_to_usdt(contract_code: str) -> str:
-    """Конвертировать BTC-USDT → BTCUSDT"""
-    return contract_code.replace("-", "").upper()
 
 
 class HTXRestClient:

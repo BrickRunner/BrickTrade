@@ -17,11 +17,11 @@ from arbitrage.system.state import SystemState
 
 @pytest.mark.asyncio
 async def test_risk_engine_rejects_exposure_breach():
-    state = SystemState(10_000)
+    state = SystemState(10_000, positions_file=":memory:")
     risk = RiskEngine(RiskConfig(max_total_exposure_pct=0.1), state)
-    plan = AllocationPlan(strategy_allocations={StrategyId.SPOT_ARBITRAGE: 2_000}, total_allocatable_capital=2_000)
+    plan = AllocationPlan(strategy_allocations={StrategyId.FUTURES_CROSS_EXCHANGE: 2_000}, total_allocatable_capital=2_000)
     intent = TradeIntent(
-        strategy_id=StrategyId.SPOT_ARBITRAGE,
+        strategy_id=StrategyId.FUTURES_CROSS_EXCHANGE,
         symbol="BTCUSDT",
         long_exchange="okx",
         short_exchange="htx",
@@ -37,12 +37,12 @@ async def test_risk_engine_rejects_exposure_breach():
 
 @pytest.mark.asyncio
 async def test_risk_engine_global_drawdown_kill_switch():
-    state = SystemState(10_000)
+    state = SystemState(10_000, positions_file=":memory:")
     await state.set_equity(8_000)
     risk = RiskEngine(RiskConfig(max_daily_drawdown_pct=0.5, max_portfolio_drawdown_pct=0.1), state)
-    plan = AllocationPlan(strategy_allocations={StrategyId.SPOT_ARBITRAGE: 500}, total_allocatable_capital=500)
+    plan = AllocationPlan(strategy_allocations={StrategyId.FUTURES_CROSS_EXCHANGE: 500}, total_allocatable_capital=500)
     intent = TradeIntent(
-        strategy_id=StrategyId.SPOT_ARBITRAGE,
+        strategy_id=StrategyId.FUTURES_CROSS_EXCHANGE,
         symbol="BTCUSDT",
         long_exchange="okx",
         short_exchange="htx",
@@ -60,7 +60,7 @@ async def test_risk_engine_global_drawdown_kill_switch():
 @pytest.mark.asyncio
 async def test_atomic_execution_dual_success_dry_run():
     monitor = InMemoryMonitoring(logging.getLogger("test"))
-    state = SystemState(10_000)
+    state = SystemState(10_000, positions_file=":memory:")
     execution = AtomicExecutionEngine(
         config=ExecutionConfig(dry_run=True),
         venue=SimulatedExecutionVenue(),
@@ -69,7 +69,7 @@ async def test_atomic_execution_dual_success_dry_run():
         monitor=monitor,
     )
     intent = TradeIntent(
-        strategy_id=StrategyId.SPOT_ARBITRAGE,
+        strategy_id=StrategyId.FUTURES_CROSS_EXCHANGE,
         symbol="BTCUSDT",
         long_exchange="okx",
         short_exchange="htx",
@@ -85,16 +85,14 @@ async def test_atomic_execution_dual_success_dry_run():
     assert len(positions) == 1
 
 
-def test_capital_allocator_dynamic_rotation():
+def test_capital_allocator_simple():
     allocator = CapitalAllocator(RiskConfig(max_total_exposure_pct=0.5, max_strategy_allocation_pct=0.3))
     plan = allocator.allocate(
         equity=10_000,
         avg_funding_bps=8.0,
         volatility_regime=0.7,
         trend_strength=0.6,
-        enabled=[StrategyId.FUNDING_ARBITRAGE, StrategyId.GRID, StrategyId.INDICATOR],
+        enabled=[StrategyId.FUTURES_CROSS_EXCHANGE],
     )
     assert plan.total_allocatable_capital == 5_000
-    assert plan.strategy_allocations[StrategyId.FUNDING_ARBITRAGE] > 0
-    assert plan.strategy_allocations[StrategyId.GRID] > 0
-    assert plan.strategy_allocations[StrategyId.INDICATOR] > 0
+    assert plan.strategy_allocations[StrategyId.FUTURES_CROSS_EXCHANGE] > 0

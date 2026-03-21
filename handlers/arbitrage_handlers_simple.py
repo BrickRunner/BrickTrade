@@ -127,48 +127,100 @@ class TelegramMonitoringSink(InMemoryMonitoring):
     @staticmethod
     def _format_event_message(event: str, payload: dict) -> Optional[str]:
         if event == "execution_fill" and not payload.get("dry_run", True):
+            long_px = payload.get('entry_long_price', 0)
+            short_px = payload.get('entry_short_price', 0)
+            spread_pct = 0.0
+            if long_px and short_px and long_px > 0:
+                spread_pct = (short_px - long_px) / long_px * 100
             return (
-                "✅ <b>Позиция открыта (обе ноги исполнены)</b>\n"
-                f"Символ: <b>{payload.get('symbol')}</b>\n"
-                f"Стратегия: <b>{payload.get('strategy')}</b>\n"
-                f"Long: {payload.get('long_exchange')} @ {payload.get('entry_long_price', 0):.6f}\n"
-                f"Short: {payload.get('short_exchange')} @ {payload.get('entry_short_price', 0):.6f}\n"
-                f"ID: <code>{payload.get('position_id')}</code>"
+                "✅ <b>Позиция открыта</b>\n\n"
+                f"📍 Пара: <b>{payload.get('symbol')}</b>\n"
+                f"📈 Long: <b>{str(payload.get('long_exchange', '')).upper()}</b> @ <code>{long_px:.4f}</code>\n"
+                f"📉 Short: <b>{str(payload.get('short_exchange', '')).upper()}</b> @ <code>{short_px:.4f}</code>\n"
+                f"📊 Спред: <code>{spread_pct:.4f}%</code>\n"
+                f"🆔 <code>{payload.get('position_id', '')[:8]}</code>"
+            )
+        if event == "execution_fill" and payload.get("dry_run", True):
+            return (
+                "📝 <b>DRY RUN — позиция открыта</b>\n"
+                f"📍 <b>{payload.get('symbol')}</b> | {payload.get('strategy')}\n"
+                f"💰 Notional: <code>${payload.get('notional', 0):.2f}</code>"
             )
         if event == "position_close_signal":
+            pnl = payload.get('pnl_usd', 0)
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            reason_map = {
+                "take_profit": "✅ Тейк-профит",
+                "stop_loss": "🛑 Стоп-лосс",
+                "max_holding_time": "⏰ Макс. время",
+                "edge_converged": "📊 Спред сошёлся",
+                "per_trade_max_loss": "🚨 Макс. убыток",
+                "funding_reversed": "💸 Фандинг развернулся",
+            }
+            reason = reason_map.get(payload.get('reason', ''), payload.get('reason', ''))
+            age = int(payload.get('age_sec', 0))
+            age_str = f"{age // 60}м {age % 60}с" if age >= 60 else f"{age}с"
             return (
-                "🔎 <b>Сигнал на закрытие позиции</b>\n"
-                f"Символ: <b>{payload.get('symbol')}</b>\n"
-                f"Причина: {payload.get('reason')}\n"
-                f"PnL: {payload.get('pnl_usd', 0):.6f} USDT\n"
-                f"Age: {payload.get('age_sec', 0)}s"
+                f"🔎 <b>Закрытие позиции</b>\n\n"
+                f"📍 <b>{payload.get('symbol')}</b>\n"
+                f"Причина: {reason}\n"
+                f"{pnl_emoji} PnL: <code>{pnl:.4f} USDT</code>\n"
+                f"⏱ Удержание: {age_str}"
             )
         if event == "position_closed":
+            pnl = payload.get('realized_pnl_usd', 0)
+            pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+            pnl_sign = "+" if pnl > 0 else ""
+            reason_map = {
+                "take_profit": "✅ Тейк-профит",
+                "stop_loss": "🛑 Стоп-лосс",
+                "max_holding_time": "⏰ Макс. время",
+                "edge_converged": "📊 Спред сошёлся",
+                "per_trade_max_loss": "🚨 Макс. убыток",
+                "funding_reversed": "💸 Фандинг развернулся",
+            }
+            reason = reason_map.get(payload.get('reason', ''), payload.get('reason', ''))
             return (
-                "🧾 <b>Позиция закрыта</b>\n"
-                f"Символ: <b>{payload.get('symbol')}</b>\n"
-                f"Причина: {payload.get('reason')}\n"
-                f"Realized PnL: {payload.get('realized_pnl_usd', 0):.6f} USDT\n"
-                f"ID: <code>{payload.get('position_id')}</code>"
+                f"🧾 <b>Позиция закрыта</b>\n\n"
+                f"📍 <b>{payload.get('symbol')}</b>\n"
+                f"Причина: {reason}\n"
+                f"{pnl_emoji} Realized PnL: <b>{pnl_sign}{pnl:.4f} USDT</b>\n"
+                f"🆔 <code>{str(payload.get('position_id', ''))[:8]}</code>"
             )
         if event == "execution_critical":
             return (
-                "🚨 <b>Критическая ошибка исполнения</b>\n"
-                f"Символ: <b>{payload.get('symbol')}</b>\n"
+                "🚨🚨 <b>КРИТИЧЕСКАЯ ОШИБКА</b>\n\n"
+                f"📍 <b>{payload.get('symbol')}</b>\n"
                 f"Стратегия: {payload.get('strategy')}\n"
-                f"Причина: <code>{payload.get('reason')}</code>\n"
-                "Kill-switch активирован."
+                f"Причина: <code>{payload.get('reason')}</code>\n\n"
+                "⛔ Kill-switch активирован.\n"
+                "Торговля остановлена до ручного сброса."
             )
         if event == "symbol_cooldown":
             cd_sec = int(payload.get("cooldown_seconds", 0) or 0)
             cd_hours = cd_sec / 3600
             return (
-                "⛔ <b>Пара временно отключена</b>\n"
-                f"Символ: <b>{payload.get('symbol')}</b>\n"
-                f"Причина: {payload.get('reason')}\n"
-                f"Убыточных закрытий подряд: {payload.get('loss_streak', 0)}\n"
-                f"Блокировка: {cd_hours:.1f} ч"
+                "⛔ <b>Пара временно отключена</b>\n\n"
+                f"📍 <b>{payload.get('symbol')}</b>\n"
+                f"Причина: серия из {payload.get('loss_streak', 0)} убытков подряд\n"
+                f"⏱ Блокировка: {cd_hours:.1f} ч"
             )
+        if event == "per_trade_max_loss":
+            return (
+                "🚨 <b>Макс. убыток по сделке</b>\n\n"
+                f"PnL: <code>{payload.get('pnl_usd', 0):.4f} USDT</code>\n"
+                f"Лимит: <code>{payload.get('limit_usd', 0):.4f} USDT</code>\n"
+                "⛔ Kill-switch активирован."
+            )
+        if event == "execution_hedge":
+            if not payload.get("hedged"):
+                return (
+                    "⚠️ <b>Хедж НЕ УДАЛСЯ</b>\n\n"
+                    f"📍 <b>{payload.get('position_symbol')}</b>\n"
+                    f"Биржа: {str(payload.get('first_leg_exchange', '')).upper()}\n"
+                    "Требуется ручная проверка позиций!"
+                )
+            return None
         return None
 
 
@@ -346,7 +398,7 @@ async def _start_engine(bot, user_id: int) -> str:
         await provider.initialize()
 
         if config.trade_all_symbols:
-            selected = usdt_symbol_universe(market_data, config.max_symbols)
+            selected = usdt_symbol_universe(market_data, config.max_symbols, config.symbol_blacklist)
             config = replace(config, symbols=selected)
 
         # Align working equity with real available balances to avoid oversizing.
@@ -355,43 +407,29 @@ async def _start_engine(bot, user_id: int) -> str:
         if live_equity > 0:
             config = replace(config, starting_equity=live_equity)
 
+        # Prioritize affordable symbols (put them first), but keep ALL symbols
+        # so the engine can monitor spreads and trade when margin allows.
         affordable = _filter_affordable_symbols(
             market_data, config.symbols, config.exchanges, balances, headroom=1.0
         )
-        if not affordable:
-            universe = usdt_symbol_universe(market_data, max_symbols=9999)
-            affordable_universe = _filter_affordable_symbols(
-                market_data, universe, config.exchanges, balances, headroom=1.0
+        if affordable:
+            # Put affordable symbols first for priority scanning
+            remaining = [s for s in config.symbols if s not in affordable]
+            config = replace(config, symbols=affordable + remaining)
+            logger.info(
+                "Symbol priority: %d affordable first, %d total symbols",
+                len(affordable), len(config.symbols),
             )
-            if affordable_universe:
-                config = replace(config, symbols=affordable_universe[: max(1, config.max_symbols)])
-                logger.warning(
-                    "Configured symbols are not affordable; switched to %s affordable symbols from common universe.",
-                    len(config.symbols),
-                )
-            else:
-                hints = _min_required_balance_hint(
-                    market_data, config.symbols, config.exchanges, headroom=1.0
-                )
-                best_symbol, joint_hint = _best_joint_requirement_hint(
-                    market_data, universe if universe else config.symbols, config.exchanges, headroom=1.0
-                )
-                joint_text = "n/a"
-                if best_symbol and joint_hint:
-                    req_text = ", ".join(
-                        f"{ex.upper()}~${joint_hint.get(ex, 0.0):.2f}+" for ex in config.exchanges
-                    )
-                    joint_text = f"{best_symbol}: {req_text}"
-                bal_text = ", ".join(f"{ex.upper()}=${max(0.0, balances.get(ex, 0.0)):.2f}" for ex in config.exchanges)
-                hint_text = ", ".join(f"{ex.upper()}~${amt:.2f}+" for ex, amt in hints.items()) if hints else "n/a"
-                raise ValueError(
-                    "No affordable symbols for current balances on both exchanges. "
-                    f"Balances from API: {bal_text}. "
-                    f"Approx minimum (per-exchange minima): {hint_text}. "
-                    f"Best joint symbol requirement: {joint_text}."
-                )
         else:
-            config = replace(config, symbols=affordable)
+            # No symbols are affordable right now, but keep all symbols anyway.
+            # The engine's margin guard will reject orders it can't afford,
+            # and the bot will enter positions when spreads appear on cheap pairs.
+            logger.warning(
+                "No symbols currently affordable (balances: %s), "
+                "keeping all %d symbols — engine will filter by margin at execution time.",
+                {ex: f"${max(0.0, balances.get(ex, 0.0)):.2f}" for ex in config.exchanges},
+                len(config.symbols),
+            )
 
         state = SystemState(starting_equity=config.starting_equity)
         monitor = TelegramMonitoringSink(tg_logger=logging.getLogger("trading_system"), bot=bot, user_id=user_id)
@@ -502,24 +540,45 @@ async def cb_arb_scan_now(call: types.CallbackQuery):
     if not _es.engine or not _es.provider:
         await _safe_edit(call.message, "📊 Бот не запущен", reply_markup=_main_keyboard(False))
         return
-    lines = ["📊 <b>Top сигналов (новые стратегии)</b>", ""]
+    lines = ["📊 <b>Возможности арбитража</b>", ""]
     found = 0
-    for symbol in _es.config.symbols[:10]:
+    for symbol in _es.config.symbols[:15]:
         try:
             snapshot = await _es.provider.get_snapshot(symbol)
             intents = await _es.engine.strategies.generate_intents(snapshot)
             intents.sort(key=lambda x: x.expected_edge_bps * x.confidence, reverse=True)
             for intent in intents[:2]:
                 found += 1
-                lines.append(
-                    f"{symbol} | {intent.strategy_id.value} | edge={intent.expected_edge_bps:.2f}bps | conf={intent.confidence:.2f}"
-                )
+                meta = intent.metadata
+                arb_type = meta.get("arb_type", "spread")
+                net_spread = meta.get("net_spread_pct", 0)
+                raw_spread = meta.get("spread_pct", meta.get("funding_rate_diff_pct", 0))
+                fees = meta.get("total_fees_pct", 0)
+                profitable = "✅" if net_spread > 0 else "⚠️"
+
+                if arb_type == "funding_rate":
+                    lines.append(
+                        f"{profitable} <b>{symbol}</b> — funding arb\n"
+                        f"  Long {intent.long_exchange.upper()} ← Short {intent.short_exchange.upper()}\n"
+                        f"  FR diff: <code>{raw_spread:.4f}%</code> | Комиссии: <code>{fees:.4f}%</code>\n"
+                        f"  Edge: <code>{intent.expected_edge_bps:.1f} bps</code> | Уверенность: <code>{intent.confidence:.0%}</code>"
+                    )
+                else:
+                    lines.append(
+                        f"{profitable} <b>{symbol}</b> — спред арбитраж\n"
+                        f"  Buy {intent.long_exchange.upper()} @ <code>{meta.get('long_price', 0):.4f}</code>\n"
+                        f"  Sell {intent.short_exchange.upper()} @ <code>{meta.get('short_price', 0):.4f}</code>\n"
+                        f"  Спред: <code>{raw_spread:.4f}%</code> | Нетто: <code>{net_spread:.4f}%</code> | Комиссии: <code>{fees:.4f}%</code>"
+                    )
+                lines.append("")
         except Exception:
             continue
-        if found >= 20:
+        if found >= 10:
             break
     if found == 0:
-        lines.append("Нет валидных сигналов в текущем цикле")
+        lines.append("Нет валидных сигналов в текущем цикле.\n"
+                      "Минимальный спред для входа: "
+                      f"<code>{_es.config.strategy.min_spread_pct:.2f}%</code> (после комиссий)")
     await _safe_edit(
         call.message,
         "\n".join(lines),
@@ -539,26 +598,44 @@ async def cb_arb_stats(call: types.CallbackQuery):
         return
     snap = await _es.state.snapshot()
     dd = await _es.state.drawdowns()
-    text = (
-        "📈 <b>Статистика нового engine</b>\n\n"
-        f"Режим: {'DRY_RUN' if _es.config.execution.dry_run else 'LIVE'}\n"
-        f"Task: {_es.task_state_str()}\n"
-        f"Биржи: {_es.exchange_names()}\n"
-        f"Символов: {len(_es.config.symbols)}\n"
-        f"Стратегии: {', '.join(_es.config.strategy.enabled)}\n\n"
-        f"Equity: ${snap['equity']:.2f}\n"
-        f"Open positions: {snap['open_positions']}\n"
-        f"Total exposure: ${snap['total_exposure']:.2f}\n"
-        f"Realized PnL: ${snap['realized_pnl']:.2f}\n"
-        f"Daily DD: {dd['daily_dd']*100:.2f}%\n"
-        f"Portfolio DD: {dd['portfolio_dd']*100:.2f}%\n"
-        f"Kill switch: {'ON' if snap['kill_switch'] else 'OFF'}"
-    )
+    positions = await _es.state.list_positions()
+
+    mode_label = "🟡 DRY RUN" if _es.config.execution.dry_run else "🟢 LIVE"
+    pnl_emoji = "🟢" if snap['realized_pnl'] >= 0 else "🔴"
+    ks_label = "🔴 АКТИВЕН" if snap['kill_switch'] else "🟢 Выкл"
+
+    lines = [
+        f"📈 <b>Статистика</b>\n",
+        f"Режим: <b>{mode_label}</b>",
+        f"Статус: <b>{_es.task_state_str()}</b>",
+        f"Биржи: <b>{_es.exchange_names()}</b>",
+        f"Символов: <code>{len(_es.config.symbols)}</code>",
+        f"Стратегии: {', '.join(_es.config.strategy.enabled)}\n",
+        f"💰 Equity: <code>${snap['equity']:.2f}</code>",
+        f"{pnl_emoji} Realized PnL: <code>${snap['realized_pnl']:.2f}</code>",
+        f"📊 Exposure: <code>${snap['total_exposure']:.2f}</code>",
+        f"📉 Daily DD: <code>{dd['daily_dd']*100:.2f}%</code>",
+        f"📉 Portfolio DD: <code>{dd['portfolio_dd']*100:.2f}%</code>",
+        f"🛡 Kill switch: {ks_label}",
+    ]
+
+    if positions:
+        lines.append(f"\n📂 <b>Открытые позиции ({len(positions)}):</b>")
+        for pos in positions:
+            age_min = (asyncio.get_event_loop().time() - pos.opened_at) / 60 if pos.opened_at > 0 else 0
+            lines.append(
+                f"  • {pos.symbol} | {pos.long_exchange}↔{pos.short_exchange} | "
+                f"<code>${pos.notional_usd:.2f}</code> | {age_min:.0f}м"
+            )
+    else:
+        lines.append("\n📂 Открытых позиций нет")
+
     if _es.last_error:
-        text += f"\n\nОшибка task:\n<code>{_es.last_error}</code>"
+        lines.append(f"\n⚠️ Ошибка:\n<code>{_es.last_error[:200]}</code>")
+
     await _safe_edit(
         call.message,
-        text,
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_stats")],
@@ -588,15 +665,68 @@ async def cb_arb_pair_stats(call: types.CallbackQuery):
 
 
 async def cb_arb_funding(call: types.CallbackQuery):
-    await call.answer()
-    await _safe_edit(call.message, "💸 Funding view доступен в «Возможности» (scan).",
-                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
+    await call.answer("Загрузка...")
+    if not _es.provider or not _es.config:
+        await _safe_edit(call.message, "💸 Бот не запущен", reply_markup=_main_keyboard(False))
+        return
+    lines = ["💸 <b>Funding Rates</b>", ""]
+    for symbol in _es.config.symbols[:10]:
+        try:
+            snapshot = await _es.provider.get_snapshot(symbol)
+            if not snapshot.funding_rates:
+                continue
+            parts = []
+            for ex, rate in sorted(snapshot.funding_rates.items()):
+                rate_pct = rate * 100
+                emoji = "🟢" if rate_pct > 0 else "🔴" if rate_pct < 0 else "⚪"
+                parts.append(f"{emoji} {ex.upper()}: <code>{rate_pct:+.4f}%</code>")
+            if len(snapshot.funding_rates) >= 2:
+                vals = list(snapshot.funding_rates.values())
+                diff = (max(vals) - min(vals)) * 100
+                lines.append(f"<b>{symbol}</b> (diff: <code>{diff:.4f}%</code>)")
+            else:
+                lines.append(f"<b>{symbol}</b>")
+            lines.extend(f"  {p}" for p in parts)
+            lines.append("")
+        except Exception:
+            continue
+    if len(lines) <= 2:
+        lines.append("Нет данных по funding rates")
+    await _safe_edit(call.message, "\n".join(lines),
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                         [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_funding")],
+                         [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
+                     ]))
 
 
 async def cb_arb_basis(call: types.CallbackQuery):
-    await call.answer()
-    await _safe_edit(call.message, "📉 Basis view доступен в «Возможности» (scan).",
-                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")]]))
+    await call.answer("Загрузка...")
+    if not _es.provider or not _es.config:
+        await _safe_edit(call.message, "📉 Бот не запущен", reply_markup=_main_keyboard(False))
+        return
+    lines = ["📉 <b>Базис (Futures - Spot)</b>", ""]
+    for symbol in _es.config.symbols[:10]:
+        try:
+            snapshot = await _es.provider.get_snapshot(symbol)
+            basis_bps = snapshot.indicators.get("basis_bps", 0)
+            spot_px = snapshot.indicators.get("spot_price", 0)
+            perp_px = snapshot.indicators.get("perp_price", 0)
+            if spot_px <= 0:
+                continue
+            emoji = "🟢" if basis_bps > 0 else "🔴" if basis_bps < 0 else "⚪"
+            lines.append(
+                f"{emoji} <b>{symbol}</b>: <code>{basis_bps:.2f} bps</code>\n"
+                f"  Spot: <code>{spot_px:.4f}</code> | Perp: <code>{perp_px:.4f}</code>"
+            )
+        except Exception:
+            continue
+    if len(lines) <= 2:
+        lines.append("Нет данных по базису")
+    await _safe_edit(call.message, "\n".join(lines),
+                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                         [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_basis")],
+                         [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
+                     ]))
 
 
 async def cb_arb_stat_arb(call: types.CallbackQuery):
