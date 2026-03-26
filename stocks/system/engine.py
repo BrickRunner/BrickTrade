@@ -105,15 +105,26 @@ class StockTradingEngine:
                 continue
 
             intents = await self.strategies.generate_intents(snapshot)
+
+            # --- Quality filter: reject low-confidence and low-edge signals ---
+            min_conf = self.config.risk.min_confidence
+            min_edge = self.config.risk.min_edge_pct
+            raw_count = len(intents)
+            intents = [
+                i for i in intents
+                if i.confidence >= min_conf and i.expected_edge_pct >= min_edge
+            ]
+
             # Sort by confidence descending.
             intents.sort(key=lambda i: i.confidence, reverse=True)
 
-            if intents:
+            if raw_count > 0:
                 logger.info(
-                    "stock_engine: %s -> %d signal(s): %s",
+                    "stock_engine: %s -> %d signal(s) (%d filtered): %s",
                     ticker,
                     len(intents),
-                    ", ".join(f"{i.strategy_id.value} {i.side} conf={i.confidence:.2f}" for i in intents[:3]),
+                    raw_count - len(intents),
+                    ", ".join(f"{i.strategy_id.value} {i.side} conf={i.confidence:.2f} edge={i.expected_edge_pct:.2f}%" for i in intents[:3]),
                 )
 
             for intent in intents:
@@ -142,11 +153,12 @@ class StockTradingEngine:
                         )
                     continue
 
-                # Cooldown — don't send the same signal more than once per 2 min.
+                # Cooldown — don't send the same signal too frequently.
                 cooldown_key = f"{intent.strategy_id.value}:{ticker}:{intent.side}"
                 now = time.time()
                 last_sent = self._signal_cooldowns.get(cooldown_key, 0)
-                if now - last_sent < 120:  # 2 min
+                cooldown_sec = self.config.risk.signal_cooldown_sec
+                if now - last_sent < cooldown_sec:
                     continue
                 self._signal_cooldowns[cooldown_key] = now
 

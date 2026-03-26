@@ -65,7 +65,11 @@ async def handle_stats_for_callback(cb: types.CallbackQuery):
 
 async def cb_stats_period(cb: types.CallbackQuery):
     """Обработка выбора валюты для статистики"""
-    currency = cb.data.split(":", 1)[1].strip()
+    try:
+        currency = cb.data.split(":", 1)[1].strip()
+    except (IndexError, AttributeError):
+        await cb.answer("Ошибка данных")
+        return
     kb = build_stats_period_kb(currency)
     try:
         await cb.message.edit_text(f"Выберите период для {currency}:", reply_markup=kb)

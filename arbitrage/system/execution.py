@@ -25,6 +25,12 @@ class AtomicExecutionEngine:
 
     def __post_init__(self) -> None:
         self._lock = asyncio.Lock()
+        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_symbol_lock(self, symbol: str) -> asyncio.Lock:
+        if symbol not in self._symbol_locks:
+            self._symbol_locks[symbol] = asyncio.Lock()
+        return self._symbol_locks[symbol]
 
     async def execute_dual_entry(
         self,
@@ -35,7 +41,7 @@ class AtomicExecutionEngine:
         latency_ms: float,
         order_type: str = "ioc",
     ) -> ExecutionReport:
-        async with self._lock:
+        async with self._get_symbol_lock(intent.symbol):
             t0 = asyncio.get_event_loop().time()
             slippage_bps = self.slippage.estimate(notional_usd, est_book_depth_usd, volatility, latency_ms)
             if self.config.dry_run:
@@ -112,196 +118,19 @@ class AtomicExecutionEngine:
                                 )
                                 return ExecutionReport(
                                     success=False,
-                                    position_id=None,
-                                    fill_price_long=0.0,
-                                    fill_price_short=0.0,
-                                    notional_usd=notional_usd,
-                                    slippage_bps=slippage_bps,
-                                    message="orphan_position_blocks_trade",
-                                )
-                        except Exception:
-                            pass  # If check fails, continue — other safeguards still apply
-
-                leg_kinds = dict(intent.metadata.get("leg_kinds") or {})
-                raw_limit_prices = dict(intent.metadata.get("limit_prices") or {})
-                # Add slippage buffer to IOC limit prices so they have a better
-                # chance of filling despite REST latency.  Buy prices are nudged
-                # up, sell prices are nudged down by ~15 bps.
-                _SLIPPAGE_BUFFER = 0.0015  # 15 bps
-                limit_prices: dict = {}
-                for side_key, px in raw_limit_prices.items():
-                    px = float(px or 0.0)
-                    if px <= 0:
-                        limit_prices[side_key] = 0.0
-                    elif side_key == "buy":
-                        limit_prices[side_key] = px * (1 + _SLIPPAGE_BUFFER)
-                    else:
-                        limit_prices[side_key] = px * (1 - _SLIPPAGE_BUFFER)
-
-                def _spot_qty(exchange: str) -> float:
-                    price = float(intent.metadata.get("spot_price", 0.0) or 0.0)
-                    if exchange == intent.long_exchange:
-                        price = float(intent.metadata.get("long_price", price) or price)
-                    if exchange == intent.short_exchange:
-                        price = float(intent.metadata.get("short_price", price) or price)
-                    if price <= 0:
-                        return 0.0
-                    return notional_usd / price
-
-                if leg_kinds.get(first_leg) == "spot":
-                    qty = _spot_qty(first_leg)
-                    if qty <= 0:
-                        await self.monitor.emit("execution_reject", {"leg": 1, "reason": "spot_qty_unavailable"})
-                        return ExecutionReport(
-                            success=False,
-                            position_id=None,
-                            fill_price_long=0.0,
-                            fill_price_short=0.0,
-                            notional_usd=notional_usd,
-                            slippage_bps=slippage_bps,
-                            message="first_leg_failed",
-                        )
-                    first_limit = float(limit_prices.get(first_side, 0.0) or 0.0)
-                    first_order_type = "ioc" if first_limit > 0 else order_type
-                    first = await self.venue.place_spot_order(
-                        first_leg, intent.symbol, first_side, qty, first_order_type, first_limit
-                    )
-                else:
-                    first_limit = float(limit_prices.get(first_side, 0.0) or 0.0)
-                    first_order_type = "ioc" if first_limit > 0 else order_type
-                    first = await self.venue.place_order(
-                        first_leg, intent.symbol, first_side, notional_usd, first_order_type, first_limit
-                    )
-                if not first.get("success"):
-                    await self.monitor.emit("execution_reject", {"leg": 1, "reason": first.get("message", "unknown")})
-                    return ExecutionReport(
-                        success=False,
-                        position_id=None,
-                        fill_price_long=0.0,
-                        fill_price_short=0.0,
-                        notional_usd=notional_usd,
-                        slippage_bps=slippage_bps,
-                        message="first_leg_failed",
-                    )
-                first_order_id = str(first.get("order_id") or "")
-                if not await self.venue.wait_for_fill(
-                    first_leg,
-                    intent.symbol,
-                    first_order_id,
-                    self.config.order_timeout_ms,
-                    spot=leg_kinds.get(first_leg) == "spot",
-                    expected_size=float(first.get("size", 0.0) or 0.0) or None,
-                ):
-                    await self.monitor.emit("execution_reject", {"leg": 1, "reason": "first_leg_not_filled"})
-                    return ExecutionReport(
-                        success=False,
-                        position_id=None,
-                        fill_price_long=0.0,
-                        fill_price_short=0.0,
-                        notional_usd=notional_usd,
-                        slippage_bps=slippage_bps,
-                        message="first_leg_failed",
-                    )
-
-                # Invalidate balance cache so second leg sees updated margin
-                if hasattr(self.venue, "invalidate_balance_cache"):
-                    self.venue.invalidate_balance_cache()
-
-                # CRITICAL: Second leg MUST fill — if it doesn't, we have to hedge
-                # the first leg back at a loss (fees + slippage).  Strategy:
-                # 1. Try market order directly (guaranteed fill, fastest)
-                # 2. Only hedge if market order fails (exchange down / no liquidity)
-                #
-                # Why market order for second leg:
-                # - First leg already filled, we are COMMITTED
-                # - IOC limit can fail if price moved during first leg execution
-                # - Market order slippage on small sizes is negligible
-                # - Failed second leg + hedge costs MORE than market slippage
-                second_filled = False
-                second = {}
-
-                if leg_kinds.get(second_leg) == "spot":
-                    qty = _spot_qty(second_leg)
-                    if qty > 0:
-                        second = await self.venue.place_spot_order(
-                            second_leg, intent.symbol, second_side, qty, "market", 0.0
-                        )
-                else:
-                    second = await self.venue.place_order(
-                        second_leg, intent.symbol, second_side, notional_usd, "market", 0.0
-                    )
-
-                if second.get("success"):
-                    second_order_id = str(second.get("order_id") or "")
-                    if await self.venue.wait_for_fill(
-                        second_leg,
-                        intent.symbol,
-                        second_order_id,
-                        self.config.order_timeout_ms,
-                        spot=leg_kinds.get(second_leg) == "spot",
-                        expected_size=float(second.get("size", 0.0) or 0.0) or None,
-                    ):
-                        second_filled = True
-                    else:
-                        # Market order placed but fill not confirmed — check if position
-                        # actually exists before hedging to avoid creating orphaned positions.
-                        if hasattr(self.venue, "open_contracts"):
-                            try:
-                                contracts = await self.venue.open_contracts(second_leg, intent.symbol)
-                                if contracts > 0:
-                                    # Position exists on second leg — treat as filled
-                                    second_filled = True
-                                    await self.monitor.emit(
-                                        "execution_fill_recovery",
-                                        {"leg": 2, "exchange": second_leg, "contracts": contracts},
-                                    )
-                            except Exception:
-                                pass
-                        if not second_filled:
-                            await self.monitor.emit(
-                                "execution_reject",
-                                {"leg": 2, "reason": "market_order_not_confirmed", "exchange": second_leg},
-                            )
-                else:
-                    await self.monitor.emit(
-                        "execution_reject",
-                        {"leg": 2, "reason": second.get("message", "unknown"), "exchange": second_leg},
-                    )
-
-                if second_filled:
-                    return await self._open_live_position(
-                        intent,
-                        notional_usd,
-                        slippage_bps,
-                        first,
-                        second,
-                        balances_before_entry,
-                    )
-
-                # Market order failed — must hedge first leg
-                await self.monitor.emit(
-                    "execution_reject",
-                    {"leg": 2, "reason": "second_leg_failed_hedging", "exchange": second_leg},
-                )
-
-                # Hedge / unwind if second leg failed — wrapped in timeout.
-                hedge_side = "sell" if first_side == "buy" else "buy"
-                hedged = False
-                hedge_verified = False
-                remaining_contracts = None
-                first_size = float(first.get("size", 0.0) or 0.0)
+                filled_size = float((filled_result or {}).get("size", 0.0) or 0.0)
                 try:
                     hedged, hedge_verified, remaining_contracts = await asyncio.wait_for(
                         self._hedge_first_leg(
-                            first_leg, intent.symbol, hedge_side, notional_usd,
-                            first_size, _spot_qty, leg_kinds,
+                            filled_leg, intent.symbol, hedge_side, notional_usd,
+                            filled_size, _spot_qty, leg_kinds,
                         ),
                         timeout=self.config.hedge_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     await self.monitor.emit(
                         "execution_hedge_timeout",
-                        {"symbol": intent.symbol, "exchange": first_leg, "timeout_sec": self.config.hedge_timeout_seconds},
+                        {"symbol": intent.symbol, "exchange": filled_leg, "timeout_sec": self.config.hedge_timeout_seconds},
                     )
 
                 await self.monitor.emit(
@@ -309,7 +138,7 @@ class AtomicExecutionEngine:
                     {
                         "position_symbol": intent.symbol,
                         "hedged": hedged,
-                        "first_leg_exchange": first_leg,
+                        "first_leg_exchange": filled_leg,
                         "verified": hedge_verified,
                         "remaining_contracts": remaining_contracts,
                     },
@@ -359,7 +188,7 @@ class AtomicExecutionEngine:
         reason: str,
         order_type: str = "ioc",
     ) -> bool:
-        async with self._lock:
+        async with self._get_symbol_lock(position.symbol):
             leg_kinds = dict(position.metadata.get("leg_kinds") or {})
             long_side = "sell"
             short_side = "buy"
@@ -554,7 +383,7 @@ class AtomicExecutionEngine:
                 slippage_bps=0.0,
                 message="rfq_failed",
             )
-        async with self._lock:
+        async with self._get_symbol_lock(intent.symbol):
             if self.config.dry_run:
                 await self.monitor.emit(
                     "execution_fill",
@@ -684,7 +513,8 @@ class AtomicExecutionEngine:
                     "ioc",
                     0.0,
                 )
-            except Exception:
+            except Exception as exc:
+                logger.warning("unwind_spot_leg_failed: %s %s: %s", leg.get("exchange"), leg.get("symbol"), exc)
                 continue
 
     @staticmethod
@@ -816,6 +646,88 @@ class AtomicExecutionEngine:
             message="filled",
         )
 
+    async def _place_maker_leg(
+        self,
+        exchange: str,
+        symbol: str,
+        side: str,
+        notional_usd: float,
+        reference_price: float,
+    ) -> dict:
+        """Place a post-only maker order with retry and cancel/replace logic.
+
+        The maker order is placed slightly inside the spread (by maker_price_offset_bps)
+        to increase fill probability while keeping post-only status.
+        If it doesn't fill within maker_timeout_ms, cancel and re-place up to
+        maker_max_retries times.  If all retries fail, fall back to a taker IOC.
+
+        Returns the same dict format as venue.place_order().
+        """
+        offset_mult = self.config.maker_price_offset_bps / 10_000
+        # Nudge maker price towards the spread to increase fill chance
+        if side == "buy":
+            # Buy maker: place slightly above current best bid (but below ask)
+            maker_price = reference_price * (1 - offset_mult)
+        else:
+            # Sell maker: place slightly below current best ask (but above bid)
+            maker_price = reference_price * (1 + offset_mult)
+
+        for attempt in range(self.config.maker_max_retries + 1):
+            result = await self.venue.place_order(
+                exchange, symbol, side, notional_usd,
+                "post_only", maker_price,
+            )
+            if not result.get("success"):
+                # Post-only rejected (would have crossed) — fall back to taker
+                logger.info(
+                    "[MAKER_REJECTED] %s %s on %s attempt=%d — falling back to taker",
+                    side, symbol, exchange, attempt + 1,
+                )
+                return await self.venue.place_order(
+                    exchange, symbol, side, notional_usd, "ioc", reference_price,
+                )
+
+            order_id = str(result.get("order_id") or "")
+            if not order_id:
+                return result  # Can't track — return as-is
+
+            # Wait for fill with maker-specific timeout
+            filled = await self.venue.wait_for_fill(
+                exchange, symbol, order_id, self.config.maker_timeout_ms,
+                expected_size=float(result.get("size", 0.0) or 0.0) or None,
+            )
+            if filled:
+                logger.info(
+                    "[MAKER_FILLED] %s %s on %s attempt=%d — saved taker fees",
+                    side, symbol, exchange, attempt + 1,
+                )
+                return result
+
+            # Not filled — cancel and retry or fall back
+            if hasattr(self.venue, "cancel_order"):
+                await self.venue.cancel_order(exchange, order_id, symbol)
+
+            if attempt < self.config.maker_max_retries:
+                logger.info(
+                    "[MAKER_RETRY] %s %s on %s attempt=%d/%d — cancelling and re-placing",
+                    side, symbol, exchange, attempt + 1, self.config.maker_max_retries + 1,
+                )
+                # Adjust price slightly more aggressively on each retry
+                adjustment = offset_mult * (attempt + 2)
+                if side == "buy":
+                    maker_price = reference_price * (1 - adjustment / 2)
+                else:
+                    maker_price = reference_price * (1 + adjustment / 2)
+
+        # All maker attempts exhausted — fall back to taker IOC
+        logger.info(
+            "[MAKER_FALLBACK] %s %s on %s — all %d maker attempts failed, using taker",
+            side, symbol, exchange, self.config.maker_max_retries + 1,
+        )
+        return await self.venue.place_order(
+            exchange, symbol, side, notional_usd, "ioc", reference_price,
+        )
+
     async def _hedge_first_leg(
         self,
         first_leg: str,
@@ -854,7 +766,8 @@ class AtomicExecutionEngine:
                     try:
                         remaining_contracts = await self.venue.open_contracts(first_leg, symbol)
                         hedge_verified = True
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning("hedge_verify_failed: %s %s: %s", first_leg, symbol, exc)
                         remaining_contracts = None
                         hedge_verified = False
                 if hedge_verified and remaining_contracts is not None and remaining_contracts <= 0:

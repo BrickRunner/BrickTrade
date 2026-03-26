@@ -74,31 +74,40 @@ class DivergenceStrategy(StockBaseStrategy):
 
         # Bearish divergence: price HH, RSI LH.
         if len(swing_highs_price) >= 2:
-            if swing_highs_price[-1] > swing_highs_price[-2] and current_rsi < 60:
-                # Price higher high but RSI is weakening.
+            price_hh = swing_highs_price[-1] > swing_highs_price[-2]
+            # Need actual RSI values at swing points — approximate with current RSI.
+            # Require RSI to be genuinely weak (below 50) while price makes new high.
+            rsi_weak = current_rsi < 50
+            # Require meaningful price divergence (>0.3% between swing highs).
+            price_diff_pct = abs(swing_highs_price[-1] - swing_highs_price[-2]) / swing_highs_price[-2] * 100
+            if price_hh and rsi_weak and price_diff_pct > 0.3:
                 intents.append(
-                    self._make_intent(ticker, "sell", current_rsi, price, "bearish_div", bb_width)
+                    self._make_intent(ticker, "sell", current_rsi, price, "bearish_div", bb_width, price_diff_pct)
                 )
 
         # Bullish divergence: price LL, RSI HL.
         if len(swing_lows_price) >= 2:
-            if swing_lows_price[-1] < swing_lows_price[-2] and current_rsi > 40:
-                # Price lower low but RSI is strengthening.
+            price_ll = swing_lows_price[-1] < swing_lows_price[-2]
+            # Require RSI to be genuinely strong (above 50) while price makes new low.
+            rsi_strong = current_rsi > 50
+            price_diff_pct = abs(swing_lows_price[-1] - swing_lows_price[-2]) / swing_lows_price[-2] * 100
+            if price_ll and rsi_strong and price_diff_pct > 0.3:
                 intents.append(
-                    self._make_intent(ticker, "buy", current_rsi, price, "bullish_div", bb_width)
+                    self._make_intent(ticker, "buy", current_rsi, price, "bullish_div", bb_width, price_diff_pct)
                 )
 
         return intents
 
     def _make_intent(
         self, ticker: str, side: str, rsi_val: float, price: float,
-        div_type: str, bb_width: float,
+        div_type: str, bb_width: float, price_diff_pct: float = 0.0,
     ) -> StockTradeIntent:
-        # Confidence based on BB width (relative). Wider bands = more volatile = higher conf.
-        # Typical MOEX bb_width: 0.005–0.05.  Skip only ultra-tight range.
-        confidence = 0.0
-        if bb_width > 0.002:
-            confidence = min(1.0, bb_width * 20)
+        # Confidence based on RSI extremity and price divergence strength.
+        # RSI component: how far RSI is from neutral (50).
+        rsi_extremity = abs(rsi_val - 50.0) / 50.0  # 0..1
+        # Price divergence component: bigger swing diff = stronger signal.
+        div_strength = min(1.0, price_diff_pct / 1.5)  # 0..1 (1.5% = max)
+        confidence = min(1.0, 0.3 * rsi_extremity + 0.7 * div_strength)
 
         return StockTradeIntent(
             strategy_id=self._strategy_id,
@@ -106,13 +115,14 @@ class DivergenceStrategy(StockBaseStrategy):
             side=side,
             quantity_lots=self._quantity_lots,
             confidence=confidence,
-            expected_edge_pct=1.5,
-            stop_loss_pct=3.5,
-            take_profit_pct=5.0,
+            expected_edge_pct=max(0.2, price_diff_pct * 0.5),
+            stop_loss_pct=4.0,
+            take_profit_pct=6.0,
             mode=self.default_mode,
             metadata={
                 "divergence_type": div_type,
                 "rsi": round(rsi_val, 2),
                 "bb_width": round(bb_width, 4),
+                "price_diff_pct": round(price_diff_pct, 2),
             },
         )

@@ -10,9 +10,10 @@ import base64
 from datetime import datetime
 from typing import Dict, Any, Optional
 
-from arbitrage.utils import get_arbitrage_logger, ExchangeConfig
+from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, get_rate_limiter
 
 logger = get_arbitrage_logger("okx_rest")
+_EXCHANGE = "okx"
 
 
 class OKXRestClient:
@@ -70,6 +71,9 @@ class OKXRestClient:
     async def _public_request(self, method: str, endpoint: str,
                               params: Optional[Dict] = None) -> Dict[str, Any]:
         """Выполнить публичный HTTP запрос (без аутентификации)"""
+        limiter = get_rate_limiter()
+        await limiter.acquire(_EXCHANGE)
+
         session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
 
@@ -80,6 +84,13 @@ class OKXRestClient:
                 params=params,
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
+                if response.status == 429:
+                    backoff = limiter.record_429(_EXCHANGE)
+                    logger.warning("OKX 429 on %s, backoff %.1fs", endpoint, backoff)
+                    return {"code": "429", "msg": "rate_limited"}
+
+                limiter.record_success(_EXCHANGE)
+
                 try:
                     result = await response.json()
                 except Exception:
@@ -105,6 +116,9 @@ class OKXRestClient:
     async def _request(self, method: str, endpoint: str, params: Optional[Dict] = None,
                        data: Optional[Dict] = None) -> Dict[str, Any]:
         """Выполнить HTTP запрос (с аутентификацией)"""
+        limiter = get_rate_limiter()
+        await limiter.acquire(_EXCHANGE)
+
         session = await self._get_session()
         url = f"{self.base_url}{endpoint}"
 
@@ -129,6 +143,12 @@ class OKXRestClient:
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
+                if response.status == 429:
+                    backoff = limiter.record_429(_EXCHANGE)
+                    logger.warning("OKX 429 on %s, backoff %.1fs", endpoint, backoff)
+                    return {"code": "429", "msg": "rate_limited"}
+
+                limiter.record_success(_EXCHANGE)
                 result = await response.json()
 
                 if result.get("code") != "0":

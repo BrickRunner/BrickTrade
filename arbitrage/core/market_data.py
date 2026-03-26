@@ -95,6 +95,22 @@ class MarketDataEngine:
             count = len(self.instruments.get(name, set()))
             logger.info(f"{name.upper()}: {count} instruments")
         logger.info(f"Common pairs across exchanges: {len(self.common_pairs)}")
+
+        if not self.common_pairs:
+            exchange_counts = {name: len(self.instruments.get(name, set())) for name in self.exchanges}
+            failed = [name for name, count in exchange_counts.items() if count == 0]
+            if failed:
+                logger.error(
+                    "initialize() failed: no instruments from exchanges %s. "
+                    "Check API keys and network connectivity.",
+                    failed,
+                )
+            else:
+                logger.error(
+                    "initialize() warning: exchanges have instruments but no common pairs. "
+                    "Counts: %s",
+                    exchange_counts,
+                )
         return len(self.common_pairs)
 
     # ─── Public API ───────────────────────────────────────────────────────
@@ -969,17 +985,18 @@ class MarketDataEngine:
         try:
             if exchange == "okx":
                 inst_id = self._sym_to_okx_inst(symbol)
-                inst_family = inst_id.replace("-SWAP", "")  # BTC-USDT
-                resp = await client._public_request("GET", "/api/v5/rubik/stat/contracts-long-short-account-ratio", {"instId": inst_id, "period": "5m"})
+                # OKX V5: /api/v5/rubik/stat/contracts/long-short-account-ratio
+                # Uses ccy (e.g. "BTC") not instId
+                ccy = inst_id.split("-")[0]  # BTC-USDT-SWAP → BTC
+                resp = await client._public_request(
+                    "GET",
+                    "/api/v5/rubik/stat/contracts/long-short-account-ratio",
+                    {"ccy": ccy, "period": "5m"},
+                )
                 if resp.get("code") == "0" and resp.get("data"):
-                    return float(resp["data"][0][1])
-                # Fallback: try instFamily-based endpoint
-                resp2 = await client._public_request("GET", "/api/v5/rubik/stat/long-short-account-ratio-contract-top-trader", {"instId": inst_id, "period": "5m"})
-                if resp2.get("code") == "0" and resp2.get("data"):
-                    row = resp2["data"][0]
-                    long_r = float(row[1]) if isinstance(row, list) else float(row.get("longAccountRatio", 0.5))
-                    short_r = float(row[2]) if isinstance(row, list) else float(row.get("shortAccountRatio", 0.5))
-                    return long_r / max(short_r, 1e-9)
+                    # data: [[ts, longShortRatio], ...]
+                    row = resp["data"][0]
+                    return float(row[1]) if isinstance(row, list) else float(row.get("longShortRatio", 1.0))
             elif exchange == "htx":
                 cc = self._sym_to_htx_cc(symbol)
                 resp = await client._public_request("GET", "https://api.hbdm.com", "/linear-swap-api/v1/swap_elite_account_ratio", {"contract_code": cc, "period": "5min"})
@@ -1099,14 +1116,18 @@ class MarketDataEngine:
     # ─── Balance ──────────────────────────────────────────────────────────
 
     async def fetch_balances(self) -> Dict[str, float]:
-        """Fetch USDT balance from all exchanges. Returns {exchange: balance}."""
+        """Fetch USDT balance from all exchanges. Returns {exchange: balance}.
+
+        Returns -1.0 for exchanges where the fetch failed (timeout, auth error, etc.)
+        so callers can distinguish "zero balance" from "fetch error".
+        """
         balances: Dict[str, float] = {}
         tasks = {name: self._fetch_balance(name) for name in self.exchanges}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         for name, result in zip(tasks.keys(), results):
             if isinstance(result, Exception):
                 logger.error(f"{name.upper()} balance error: {result}")
-                balances[name] = 0.0
+                balances[name] = -1.0  # signal: fetch failed, don't override cache
             else:
                 balances[name] = result
         return balances
@@ -1125,12 +1146,34 @@ class MarketDataEngine:
 
             elif exchange == "htx":
                 result = await client.get_balance()
+                logger.debug("HTX balance response keys=%s", list(result.keys()) if isinstance(result, dict) else type(result))
+                data = None
+                # v3 unified: {"code": 200, "data": [...]}
                 if result.get("code") == 200 and result.get("data"):
                     data = result["data"]
-                    if isinstance(data, list):
-                        for item in data:
-                            if item.get("margin_asset") == "USDT":
-                                return float(item.get("withdraw_available", 0) or 0)
+                # v1 cross: {"status": "ok", "data": [...]}
+                elif result.get("status") == "ok" and result.get("data"):
+                    data = result["data"]
+                if data is not None:
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        if item.get("margin_asset") == "USDT" or not item.get("margin_asset"):
+                            # Try all known balance field names
+                            for fld in ("margin_available", "withdraw_available",
+                                         "margin_balance", "margin_static"):
+                                val = item.get(fld)
+                                if val is not None:
+                                    try:
+                                        v = float(val)
+                                        if v > 0:
+                                            return v
+                                    except (ValueError, TypeError):
+                                        continue
+                    # Parsed but all zero — log for debugging
+                    logger.warning("HTX balance: all fields zero/missing in response: %s",
+                                   [{k: v for k, v in item.items() if "margin" in k or "balance" in k or "available" in k or "withdraw" in k}
+                                    for item in items[:2]])
+                    return 0.0
 
             elif exchange == "bybit":
                 result = await client.get_balance()
@@ -1157,4 +1200,4 @@ class MarketDataEngine:
         except Exception as e:
             logger.error(f"{exchange.upper()} balance fetch error: {e}")
 
-        return 0.0
+        return -1.0  # signal: fetch failed, don't override cache

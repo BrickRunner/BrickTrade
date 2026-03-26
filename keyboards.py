@@ -50,7 +50,8 @@ def main_menu() -> ReplyKeyboardMarkup:
     """Создание главного меню"""
     kb = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="⚡ Арбитраж"), KeyboardButton(text="Stocks")],
+            [KeyboardButton(text="⚡ Арбитраж"), KeyboardButton(text="📈 Акции")],
+            [KeyboardButton(text="🔻 Шорт-бот")],
             [KeyboardButton(text="📊 Курсы валют сейчас")],
             [KeyboardButton(text="📉 Пороговые значения"), KeyboardButton(text="📈 Статистика")],
             [KeyboardButton(text="⚙ Настройки")]
@@ -159,23 +160,45 @@ def build_days_kb(selected: List[str]) -> InlineKeyboardMarkup:
 
 
 def build_timezone_kb() -> InlineKeyboardMarkup:
-    """Создание клавиатуры для выбора часового пояса (UTC)"""
+    """Создание клавиатуры для выбора часового пояса (UTC).
+
+    Shows popular cities first for quick selection, then all UTC offsets.
+    """
+    # Popular timezones with city names for quick selection
+    quick_select = [
+        ("🇷🇺 Москва", 3),
+        ("🇷🇺 Екб", 5),
+        ("🇺🇦 Киев", 2),
+        ("🇬🇧 Лондон", 0),
+        ("🇺🇸 Нью-Йорк", -5),
+        ("🇨🇳 Пекин", 8),
+        ("🇯🇵 Токио", 9),
+        ("🇮🇳 Дели", 5),
+    ]
     kb_rows = []
+    # Quick-select row (2 per row)
+    quick_row = []
+    for label, tz in quick_select:
+        quick_row.append(InlineKeyboardButton(text=label, callback_data=f"set_tz:{tz}"))
+        if len(quick_row) == 2:
+            kb_rows.append(quick_row)
+            quick_row = []
+    if quick_row:
+        kb_rows.append(quick_row)
+
+    # Separator
+    kb_rows.append([InlineKeyboardButton(text="── Все часовые пояса ──", callback_data="noop")])
+
+    # Full UTC range in compact rows
     row = []
     cnt = 0
-
-    for tz in range(-12, 13):
-        # Форматирование: UTC+3, UTC-5, UTC+0
-        if tz == 0:
-            text = "UTC+0"
-        else:
-            text = f"UTC{tz:+d}"
+    for tz in range(-12, 15):
+        text = f"UTC{tz:+d}" if tz != 0 else "UTC+0"
         row.append(InlineKeyboardButton(text=text, callback_data=f"set_tz:{tz}"))
         cnt += 1
-        if cnt % KEYBOARD_COLUMNS_TIMEZONE == 0:
+        if cnt % 5 == 0:
             kb_rows.append(row)
             row = []
-
     if row:
         kb_rows.append(row)
 

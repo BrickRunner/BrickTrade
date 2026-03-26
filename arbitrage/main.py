@@ -18,6 +18,7 @@ from arbitrage.system import (
     usdt_symbol_universe,
 )
 from arbitrage.system.lowlatency import LowLatencyExecutionVenue
+from arbitrage.system.factory import build_private_ws_manager
 from arbitrage.core.market_data import MarketDataEngine
 
 
@@ -64,6 +65,12 @@ async def run() -> None:
         venue = LowLatencyExecutionVenue()
     else:
         venue = LiveExecutionVenue(exchanges=clients, market_data=market_data)
+    # Start private WS connections for real-time balance/fill/position updates.
+    private_ws = build_private_ws_manager(config)
+    await private_ws.start()
+    await private_ws.seed_balances(market_data)
+    venue.private_ws = private_ws
+    provider.private_ws = private_ws
     execution = AtomicExecutionEngine(config=config.execution, venue=venue, slippage=SlippageModel(), state=state, monitor=monitor)
     engine = TradingSystemEngine.create(config=config, provider=provider, monitor=monitor, execution=execution, state=state)
 
@@ -76,6 +83,7 @@ async def run() -> None:
         )
         await engine.run_forever()
     finally:
+        await private_ws.stop()
         await venue.close()
 
 

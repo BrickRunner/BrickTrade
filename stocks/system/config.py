@@ -39,12 +39,15 @@ class StockRiskConfig:
     max_daily_drawdown_pct: float = 0.03
     max_portfolio_drawdown_pct: float = 0.10
     max_open_positions: int = 5
-    max_daily_trades: int = 20
+    max_daily_trades: int = 8
     max_order_slippage_pct: float = 0.5
     kill_switch_enabled: bool = True
     trailing_stop_pct: float = 1.5  # trail SL by 1.5% from peak price
-    default_sl_pct: float = 3.0     # default stop-loss if strategy doesn't set
-    default_tp_pct: float = 4.5     # default take-profit if strategy doesn't set
+    default_sl_pct: float = 4.0     # default stop-loss if strategy doesn't set
+    default_tp_pct: float = 6.0     # default take-profit if strategy doesn't set
+    min_confidence: float = 0.20    # reject signals with confidence below this
+    min_edge_pct: float = 0.15      # reject signals with expected edge below BCS commission (~0.1%)
+    signal_cooldown_sec: int = 600  # cooldown per signal (10 min)
 
     @classmethod
     def from_env(cls) -> StockRiskConfig:
@@ -54,12 +57,15 @@ class StockRiskConfig:
             max_daily_drawdown_pct=_env_float("STOCK_RISK_MAX_DAILY_DD", 0.03),
             max_portfolio_drawdown_pct=_env_float("STOCK_RISK_MAX_PORTFOLIO_DD", 0.10),
             max_open_positions=_env_int("STOCK_RISK_MAX_POSITIONS", 5),
-            max_daily_trades=_env_int("STOCK_RISK_MAX_DAILY_TRADES", 20),
+            max_daily_trades=_env_int("STOCK_RISK_MAX_DAILY_TRADES", 8),
             max_order_slippage_pct=_env_float("STOCK_RISK_MAX_SLIPPAGE", 0.5),
             kill_switch_enabled=_env_bool("STOCK_RISK_KILL_SWITCH", True),
             trailing_stop_pct=_env_float("STOCK_RISK_TRAILING_STOP", 1.5),
-            default_sl_pct=_env_float("STOCK_RISK_DEFAULT_SL", 3.0),
-            default_tp_pct=_env_float("STOCK_RISK_DEFAULT_TP", 4.5),
+            default_sl_pct=_env_float("STOCK_RISK_DEFAULT_SL", 4.0),
+            default_tp_pct=_env_float("STOCK_RISK_DEFAULT_TP", 6.0),
+            min_confidence=_env_float("STOCK_RISK_MIN_CONFIDENCE", 0.20),
+            min_edge_pct=_env_float("STOCK_RISK_MIN_EDGE", 0.15),
+            signal_cooldown_sec=_env_int("STOCK_RISK_COOLDOWN_SEC", 600),
         )
 
 
@@ -102,9 +108,9 @@ class StockStrategyConfig:
     bo_atr_multiplier: float = 1.5
     bo_lookback: int = 20
     # Volume Spike
-    vs_volume_threshold: float = 1.5
-    vs_take_profit_pct: float = 0.5
-    vs_stop_loss_pct: float = 0.3
+    vs_volume_threshold: float = 2.0
+    vs_take_profit_pct: float = 1.5
+    vs_stop_loss_pct: float = 1.0
     # Divergence
     div_rsi_period: int = 14
     div_lookback: int = 30
@@ -138,9 +144,9 @@ class StockStrategyConfig:
             bo_volume_multiplier=_env_float("STOCK_BO_VOLUME_MULT", 1.2),
             bo_atr_multiplier=_env_float("STOCK_BO_ATR_MULT", 1.5),
             bo_lookback=_env_int("STOCK_BO_LOOKBACK", 20),
-            vs_volume_threshold=_env_float("STOCK_VS_VOLUME_THRESHOLD", 1.5),
-            vs_take_profit_pct=_env_float("STOCK_VS_TP_PCT", 0.5),
-            vs_stop_loss_pct=_env_float("STOCK_VS_SL_PCT", 0.3),
+            vs_volume_threshold=_env_float("STOCK_VS_VOLUME_THRESHOLD", 2.0),
+            vs_take_profit_pct=_env_float("STOCK_VS_TP_PCT", 1.5),
+            vs_stop_loss_pct=_env_float("STOCK_VS_SL_PCT", 1.0),
             div_rsi_period=_env_int("STOCK_DIV_RSI_PERIOD", 14),
             div_lookback=_env_int("STOCK_DIV_LOOKBACK", 30),
             rsi_oversold=_env_float("STOCK_RSI_OVERSOLD", 35.0),

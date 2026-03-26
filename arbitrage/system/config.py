@@ -55,7 +55,7 @@ class RiskConfig:
     max_orderbook_age_sec: float = 10.0         # tighter for arb
     max_inventory_imbalance_pct: float = 0.80
     max_realized_slippage_bps: float = 18.0
-    max_loss_per_trade_pct: float = 0.02  # kill switch if single trade loses >2% equity
+    max_loss_per_trade_pct: float = 0.10  # emergency exit if single trade loses >10% equity
 
 
 @dataclass(frozen=True)
@@ -67,6 +67,15 @@ class ExecutionConfig:
     cycle_interval_seconds: float = 0.5
     dry_run: bool = True
     max_new_positions_per_cycle: int = 1
+    # Maker+Taker hybrid execution: place one leg as post-only maker
+    # to save ~60-80% on fees for that leg.
+    use_maker_taker: bool = False
+    maker_timeout_ms: int = 2000         # how long to wait for maker fill
+    maker_max_retries: int = 2           # how many times to re-place maker order
+    maker_price_offset_bps: float = 0.5  # how far inside the spread to place maker
+    reliability_rank: Dict[str, int] = field(
+        default_factory=lambda: {"okx": 0, "bybit": 1, "htx": 2, "binance": 3}
+    )
 
 
 @dataclass(frozen=True)
@@ -87,6 +96,12 @@ class StrategyConfig:
     funding_rate_threshold_pct: float = 0.01
     max_entry_latency_ms: float = 400.0
     min_book_depth_multiplier: float = 3.0
+    # Cash & Carry strategy parameters
+    cash_carry_min_funding_apr_pct: float = 5.0
+    cash_carry_max_basis_spread_pct: float = 0.30
+    cash_carry_min_holding_hours: float = 8.0
+    cash_carry_max_holding_hours: float = 72.0
+    cash_carry_min_book_depth_usd: float = 5000.0
     # Legacy (kept for backward compat but unused)
     grid_levels: int = 8
     indicator_rsi_window: int = 14
@@ -114,6 +129,11 @@ class StrategyConfig:
             funding_rate_threshold_pct=_as_float(os.getenv("ARB_FUNDING_THRESHOLD_PCT"), 0.01),
             max_entry_latency_ms=_as_float(os.getenv("ARB_MAX_LATENCY_MS"), 400.0),
             min_book_depth_multiplier=_as_float(os.getenv("ARB_MIN_DEPTH_MULTIPLIER"), 3.0),
+            cash_carry_min_funding_apr_pct=_as_float(os.getenv("CASH_CARRY_MIN_FUNDING_APR_PCT"), 5.0),
+            cash_carry_max_basis_spread_pct=_as_float(os.getenv("CASH_CARRY_MAX_BASIS_SPREAD_PCT"), 0.30),
+            cash_carry_min_holding_hours=_as_float(os.getenv("CASH_CARRY_MIN_HOLDING_HOURS"), 8.0),
+            cash_carry_max_holding_hours=_as_float(os.getenv("CASH_CARRY_MAX_HOLDING_HOURS"), 72.0),
+            cash_carry_min_book_depth_usd=_as_float(os.getenv("CASH_CARRY_MIN_BOOK_DEPTH_USD"), 5000.0),
         )
 
 
@@ -184,7 +204,7 @@ class TradingSystemConfig:
                 max_orderbook_age_sec=_as_float(os.getenv("RISK_MAX_ORDERBOOK_AGE_SEC"), 30.0),
                 max_inventory_imbalance_pct=_as_float(os.getenv("RISK_MAX_INVENTORY_IMBALANCE_PCT"), 0.80),
                 max_realized_slippage_bps=_as_float(os.getenv("RISK_MAX_REALIZED_SLIPPAGE_BPS"), 18.0),
-                max_loss_per_trade_pct=_as_float(os.getenv("RISK_MAX_LOSS_PER_TRADE_PCT"), 0.02),
+                max_loss_per_trade_pct=_as_float(os.getenv("RISK_MAX_LOSS_PER_TRADE_PCT"), 0.10),
             ),
             execution=ExecutionConfig(
                 order_timeout_ms=_as_int(os.getenv("EXEC_ORDER_TIMEOUT_MS"), 3000),
@@ -194,6 +214,10 @@ class TradingSystemConfig:
                 cycle_interval_seconds=_as_float(os.getenv("EXEC_CYCLE_INTERVAL"), 0.5),
                 dry_run=exec_dry_run,
                 max_new_positions_per_cycle=_as_int(os.getenv("EXEC_MAX_NEW_POSITIONS_PER_CYCLE"), 1),
+                use_maker_taker=_as_bool(os.getenv("EXEC_USE_MAKER_TAKER"), False),
+                maker_timeout_ms=_as_int(os.getenv("EXEC_MAKER_TIMEOUT_MS"), 2000),
+                maker_max_retries=_as_int(os.getenv("EXEC_MAKER_MAX_RETRIES"), 2),
+                maker_price_offset_bps=_as_float(os.getenv("EXEC_MAKER_PRICE_OFFSET_BPS"), 0.5),
             ),
             strategy=StrategyConfig.from_env(),
         )
@@ -209,3 +233,8 @@ class TradingSystemConfig:
             raise ValueError("max_total_exposure_pct must be in (0,1]")
         if not 0 < self.risk.max_strategy_allocation_pct <= 1:
             raise ValueError("max_strategy_allocation_pct must be in (0,1]")
+        if self.risk.max_strategy_allocation_pct > self.risk.max_total_exposure_pct:
+            raise ValueError(
+                f"max_strategy_allocation_pct ({self.risk.max_strategy_allocation_pct}) "
+                f"must be <= max_total_exposure_pct ({self.risk.max_total_exposure_pct})"
+            )

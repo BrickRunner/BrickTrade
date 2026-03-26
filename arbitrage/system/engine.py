@@ -18,12 +18,13 @@ from arbitrage.system.risk import RiskEngine
 from arbitrage.system.state import SystemState
 from arbitrage.system.strategy_runner import StrategyRunner
 from arbitrage.system.strategies.futures_cross_exchange import FuturesCrossExchangeStrategy
+from arbitrage.system.strategies.cash_and_carry import CashAndCarryStrategy
 
 logger = logging.getLogger("trading_system")
 
 
 def build_strategies(config: TradingSystemConfig, market_data=None) -> List:
-    """Build enabled strategies. Only futures_cross_exchange is active."""
+    """Build enabled strategies."""
     mapping = {
         StrategyId.FUTURES_CROSS_EXCHANGE.value: FuturesCrossExchangeStrategy(
             min_spread_pct=config.strategy.min_spread_pct,
@@ -33,6 +34,13 @@ def build_strategies(config: TradingSystemConfig, market_data=None) -> List:
             funding_threshold_pct=config.strategy.funding_rate_threshold_pct,
             max_latency_ms=config.strategy.max_entry_latency_ms,
             min_book_depth_multiplier=config.strategy.min_book_depth_multiplier,
+        ),
+        StrategyId.CASH_AND_CARRY.value: CashAndCarryStrategy(
+            min_funding_apr_pct=config.strategy.cash_carry_min_funding_apr_pct,
+            max_basis_spread_pct=config.strategy.cash_carry_max_basis_spread_pct,
+            min_holding_hours=config.strategy.cash_carry_min_holding_hours,
+            max_holding_hours=config.strategy.cash_carry_max_holding_hours,
+            min_book_depth_usd=config.strategy.cash_carry_min_book_depth_usd,
         ),
     }
     return [mapping[name] for name in config.strategy.enabled if name in mapping]
@@ -111,7 +119,11 @@ class TradingSystemEngine:
             await self._sync_balance_on_startup()
             self._balance_synced = True
         state_snapshot = await self.risk.state.snapshot()
-        api_health = await self.provider.health()
+        try:
+            api_health = await asyncio.wait_for(self.provider.health(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("provider.health() timed out after 10s, using default latency")
+            api_health = {}
         latency_ms = max(api_health.values(), default=0.0)
         await self._process_open_positions()
         opened_in_cycle = 0
@@ -294,13 +306,13 @@ class TradingSystemEngine:
                     # likely has a margin or API issue.  Block the EXCHANGE entirely
                     # for 30 minutes to prevent repeated costly hedge cycles.
                     # Determine which exchange was the second leg:
-                    reliability_rank = {"okx": 0, "bybit": 1, "htx": 2, "binance": 3}
+                    reliability_rank = self.config.execution.reliability_rank
                     first_leg = min(
                         [intent.long_exchange, intent.short_exchange],
                         key=lambda ex: reliability_rank.get(ex, 99),
                     )
                     second_leg_ex = intent.short_exchange if first_leg == intent.long_exchange else intent.long_exchange
-                    cooldown_seconds = 1800  # 30 minutes
+                    cooldown_seconds = max(60, int(float(os.getenv("MARGIN_REJECT_COOLDOWN_SECONDS", "1800"))))
                     self._margin_rejected_exchanges[second_leg_ex] = time.time() + cooldown_seconds
                     logger.warning(
                         "[MARGIN_REJECT_COOLDOWN] %s blocked for %d min after second_leg_failed on %s",
@@ -331,7 +343,7 @@ class TradingSystemEngine:
                                 "realized_slippage_limit",
                                 {"symbol": symbol, "strategy": intent.strategy_id.value, "slippage_bps": realized_slip},
                             )
-                            await self.risk.state.trigger_kill_switch(permanent=True)
+                            await self.risk.state.trigger_kill_switch(permanent=False)
                             return
                     execution_success += 1
                     opened_in_cycle += 1
@@ -350,10 +362,9 @@ class TradingSystemEngine:
             )
 
     async def _process_open_positions(self) -> None:
-        take_profit_usd = max(0.01, float(os.getenv("EXIT_TAKE_PROFIT_USD", "0.08")))
-        stop_loss_usd = max(0.01, float(os.getenv("EXIT_STOP_LOSS_USD", "0.15")))
-        max_holding_seconds = max(30, int(float(os.getenv("EXIT_MAX_HOLD_SECONDS", "1800"))))
-        close_edge_bps = max(0.0, float(os.getenv("EXIT_CLOSE_EDGE_BPS", "1.0")))
+        take_profit_usd = max(0.01, float(os.getenv("EXIT_TAKE_PROFIT_USD", "0.50")))
+        max_holding_seconds = max(30, int(float(os.getenv("EXIT_MAX_HOLD_SECONDS", "3600"))))
+        close_edge_bps = max(0.0, float(os.getenv("EXIT_CLOSE_EDGE_BPS", "0.5")))
         monitor_log_interval_sec = max(5, int(float(os.getenv("POSITION_MONITOR_LOG_INTERVAL_SEC", "20"))))
         loss_streak_limit = max(1, int(float(os.getenv("LOSS_STREAK_LIMIT", "3"))))
         loss_streak_cooldown_seconds = max(
@@ -382,16 +393,47 @@ class TradingSystemEngine:
                 # Approx mark-to-market PnL in quote currency on each leg.
                 long_pnl = ((long_exit_px - entry_long) / max(entry_long, 1e-9)) * pos.notional_usd
                 short_pnl = ((entry_short - short_exit_px) / max(entry_short, 1e-9)) * pos.notional_usd
-                # Subtract estimated exit fees (entry fees already paid).
-                # total_fees_pct = full round-trip (entry+exit). Exit = half of that.
-                # Default 0.20 (typical taker both legs ×2) if missing from metadata.
-                exit_fee_pct = float(pos.metadata.get("total_fees_pct", 0.20) or 0.20) / 2
-                estimated_exit_fees = pos.notional_usd * exit_fee_pct / 100.0
-                pnl_usd = long_pnl + short_pnl - estimated_exit_fees
-                # Use realistic exit prices: sell long at bid, buy back short at ask.
-                # Mid prices are optimistic — bid/ask reflects actual executable edge.
+
+                # Exit fee estimation — only the EXIT portion (entry fees are already
+                # baked into our fill prices).  We use actual per-leg taker rates from
+                # the snapshot when available, falling back to 0.05% per leg.
+                long_fee_pct = 0.05
+                short_fee_pct = 0.05
+                fee_data_long = snapshot.fee_bps.get(pos.long_exchange, {})
+                fee_data_short = snapshot.fee_bps.get(pos.short_exchange, {})
+                if "perp" in fee_data_long:
+                    val = abs(float(fee_data_long["perp"]))
+                    if val > 0:
+                        long_fee_pct = val / 100  # bps → pct
+                if "perp" in fee_data_short:
+                    val = abs(float(fee_data_short["perp"]))
+                    if val > 0:
+                        short_fee_pct = val / 100  # bps → pct
+                estimated_exit_fees = pos.notional_usd * (long_fee_pct + short_fee_pct) / 100.0
+
+                # --- Funding cost/income estimation ---
+                # For perpetual futures, funding payments occur every 8h.
+                # Long pays funding if rate > 0, short receives it (and vice versa).
+                # Estimate accrued funding based on current rates and holding time.
+                funding_pnl = 0.0
+                fr_long = snapshot.funding_rates.get(pos.long_exchange)
+                fr_short = snapshot.funding_rates.get(pos.short_exchange)
+                if fr_long is not None and fr_short is not None:
+                    funding_interval_sec = 28800.0  # 8 hours
+                    periods_held = age_sec / funding_interval_sec
+                    # Long position pays funding_rate * notional per period
+                    # Short position receives funding_rate * notional per period
+                    funding_cost_long = fr_long * pos.notional_usd * periods_held
+                    funding_income_short = fr_short * pos.notional_usd * periods_held
+                    # Net: short receives, long pays (when rates are positive)
+                    funding_pnl = funding_income_short - funding_cost_long
+
+                pnl_usd = long_pnl + short_pnl - estimated_exit_fees + funding_pnl
+                # Remaining edge: how profitable is closing NOW?
+                # We exit by selling long @ bid, buying back short @ ask.
+                # Positive edge = we'd still profit, negative = underwater.
                 mid_ref = max((long_ob.bid + short_ob.ask) / 2, 1e-9)
-                edge_bps = ((short_ob.ask - long_ob.bid) / mid_ref) * 10_000
+                edge_bps = ((long_ob.bid - short_ob.ask) / mid_ref) * 10_000
                 age_sec = now - pos.opened_at
 
                 last_log = self._last_position_monitor_log_ts.get(pos.position_id, 0.0)
@@ -405,26 +447,27 @@ class TradingSystemEngine:
                             "strategy": pos.strategy_id.value,
                             "age_sec": int(age_sec),
                             "pnl_usd": round(pnl_usd, 6),
+                            "funding_pnl": round(funding_pnl, 6),
                             "edge_bps": round(edge_bps, 3),
                         },
                     )
 
                 # Strategy-specific overrides from intent metadata.
-                # Prefer percentage-based TP/SL (computed from notional) over fixed USD.
+                # Arbitrage is market-neutral: we do NOT use PnL-based stop-loss
+                # because PnL swings are spread noise, not directional risk.
+                # Exits: spread convergence (TP), timeout, funding reversal, or
+                # emergency per-trade max loss (anomaly protection only).
                 tp_pct = float(pos.metadata.get("take_profit_pct", 0) or 0)
-                sl_pct = float(pos.metadata.get("stop_loss_pct", 0) or 0)
                 if tp_pct > 0:
                     tp_local = tp_pct * pos.notional_usd
                 else:
                     tp_local = float(pos.metadata.get("take_profit_usd", take_profit_usd) or take_profit_usd)
-                if sl_pct > 0:
-                    sl_local = sl_pct * pos.notional_usd
-                else:
-                    sl_local = float(pos.metadata.get("stop_loss_usd", stop_loss_usd) or stop_loss_usd)
                 max_hold_local = int(pos.metadata.get("max_holding_seconds", max_holding_seconds) or max_holding_seconds)
                 close_edge_local = float(pos.metadata.get("close_edge_bps", close_edge_bps) or close_edge_bps)
 
-                # Fix #2: Per-trade max loss — kill switch if single trade loses too much
+                # Emergency safety: per-trade max loss — only for anomalies
+                # (exchange failure, delisting, extreme divergence).
+                # Deliberately set high to avoid cutting normal spread noise.
                 equity = (await self.risk.state.snapshot())["equity"]
                 max_trade_loss = equity * self.config.risk.max_loss_per_trade_pct
                 close_reason = None
@@ -434,17 +477,17 @@ class TradingSystemEngine:
                         "per_trade_max_loss",
                         {"position_id": pos.position_id, "pnl_usd": round(pnl_usd, 6), "limit_usd": round(max_trade_loss, 6)},
                     )
-                    await self.risk.state.trigger_kill_switch(permanent=True)
+                    # Temporary pause (cooldown), not permanent — single trade loss
+                    # is expected noise in arb, permanent kill is for critical failures only.
+                    await self.risk.state.trigger_kill_switch(permanent=False)
                 elif pnl_usd >= tp_local:
                     close_reason = "take_profit"
-                elif pnl_usd <= -sl_local:
-                    close_reason = "stop_loss"
                 elif age_sec >= max_hold_local:
                     close_reason = "max_holding_time"
                 elif edge_bps <= close_edge_local:
                     close_reason = "edge_converged"
 
-                # Funding arb: exit if funding rate advantage has reversed or halved
+                # Funding arb: exit if funding rate advantage has reversed
                 if not close_reason and pos.metadata.get("arb_type") == "funding_rate":
                     fr_long = snapshot.funding_rates.get(pos.long_exchange)
                     fr_short = snapshot.funding_rates.get(pos.short_exchange)
@@ -597,6 +640,11 @@ class TradingSystemEngine:
         try:
             balances = await self.execution.venue.get_balances()
             if balances:
+                # Only sync if we have data for ALL configured exchanges.
+                missing = [ex for ex in self.config.exchanges if ex not in balances or balances[ex] < 0]
+                if missing:
+                    logger.warning("balance_sync: missing data for %s, keeping configured equity", missing)
+                    return
                 total = sum(balances.values())
                 if total > 0:
                     old_equity = (await self.risk.state.snapshot())["equity"]

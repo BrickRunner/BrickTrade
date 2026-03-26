@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 # Константы
 SCHEDULER_POLL_INTERVAL = 60  # Интервал проверки в секундах (увеличен до 60 для избежания дубликатов)
+CALIBRATION_HOUR = 23
+CALIBRATION_MINUTE = 55
 
 
 async def scheduler_loop(bot: Bot):
@@ -24,6 +26,7 @@ async def scheduler_loop(bot: Bot):
     market_hourly_sent: Set[Tuple[int, int]] = set()  # (user_id, hour)
     last_checked_minute = None
     last_checked_hour = None
+    calibration_done_today: str = ""  # ISO date of last calibration run
 
     logger.info("Scheduler started")
 
@@ -163,11 +166,38 @@ async def scheduler_loop(bot: Bot):
                         # Отметка, что уведомление отправлено в эту минуту
                         sent_this_minute.add(notification_key)
 
+            # ── Evening auto-calibration ──────────────────────────────
+            utc_now = datetime.utcnow()
+            if (
+                utc_now.hour == CALIBRATION_HOUR
+                and utc_now.minute == CALIBRATION_MINUTE
+                and calibration_done_today != utc_now.date().isoformat()
+            ):
+                try:
+                    from arbitrage.system.calibrator import DailyCalibrator
+                    calibrator = DailyCalibrator()
+                    report = await calibrator.run()
+                    calibration_done_today = utc_now.date().isoformat()
+                    if report.recommendations:
+                        rec_text = "\n".join(
+                            f"  {k}: {v.get('reason', '')}"
+                            for k, v in report.recommendations.items()
+                        )
+                        logger.info("calibrator: recommendations:\n%s", rec_text)
+                except Exception as e:
+                    logger.error("calibrator: failed to run: %s", e, exc_info=True)
+
             await asyncio.sleep(SCHEDULER_POLL_INTERVAL)
 
         except asyncio.CancelledError:
             logger.info("Scheduler cancelled, shutting down")
             raise
+        except (OSError, ConnectionError) as e:
+            logger.error(f"Network/IO error in scheduler: {e}", exc_info=True)
+            await asyncio.sleep(10)
+        except TelegramAPIError as e:
+            logger.error(f"Telegram API error in scheduler: {e}", exc_info=True)
+            await asyncio.sleep(5)
         except Exception as e:
             logger.error(f"Unexpected error in scheduler: {e}", exc_info=True)
             await asyncio.sleep(5)

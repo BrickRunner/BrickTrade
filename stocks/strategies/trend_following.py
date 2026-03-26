@@ -79,7 +79,7 @@ class TrendFollowingStrategy(StockBaseStrategy):
                 side=side,
                 quantity_lots=self._quantity_lots,
                 confidence=confidence,
-                expected_edge_pct=abs(ema_fast - ema_slow) / ema_slow * 100,
+                expected_edge_pct=tp_pct * 0.5,
                 stop_loss_pct=round(sl_pct, 2),
                 take_profit_pct=round(tp_pct, 2),
                 mode=self.default_mode,

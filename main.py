@@ -12,16 +12,22 @@ from api import close_session
 from config import BOT_TOKEN
 from database import init_db
 from handlers import arbitrage_handlers_simple as arbitrage_handlers
-from handlers import basic, settings, stats_handlers, stock_handlers, thresholds
+from handlers import basic, settings, short_handlers, stats_handlers, stock_handlers, thresholds
 from market_intelligence.integration import shutdown_market_intelligence
+from healthcheck import start_healthcheck_server, stop_healthcheck_server
 from scheduler import scheduler_loop
 from states import DateForm, InlineThresholdForm
 
 
+from arbitrage.utils.logger import HourlyRotatingFileHandler
+
+_bot_file_handler = HourlyRotatingFileHandler("logs", "bot.log", level=logging.INFO)
+_bot_file_handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    handlers=[_bot_file_handler, logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
 
@@ -81,11 +87,42 @@ def register_handlers() -> None:
     dp.callback_query.register(arbitrage_handlers.cb_arb_stat_arb, lambda c: c.data == "arb_stat_arb")
     dp.callback_query.register(arbitrage_handlers.cb_arb_emergency_close, lambda c: c.data == "arb_emergency_close")
     dp.callback_query.register(arbitrage_handlers.cb_arb_emergency_confirm, lambda c: c.data == "arb_emergency_confirm")
+    dp.callback_query.register(arbitrage_handlers.cb_arb_reset_kill_switch, lambda c: c.data == "arb_reset_ks")
     dp.callback_query.register(arbitrage_handlers.cb_arb_settings, lambda c: c.data == "arb_settings")
     dp.callback_query.register(arbitrage_handlers.cb_arb_menu, lambda c: c.data == "arb_menu")
 
+    # Short-bot (Overheat Detector)
+    dp.message.register(short_handlers.handle_short_menu, lambda m: m.text == "🔻 Шорт-бот")
+    dp.callback_query.register(short_handlers.cb_short_menu, lambda c: c.data == "short_menu")
+    dp.callback_query.register(short_handlers.cb_short_scan_now, lambda c: c.data == "short_scan_now")
+    dp.callback_query.register(short_handlers.cb_short_auto_on, lambda c: c.data == "short_auto_on")
+    dp.callback_query.register(short_handlers.cb_short_auto_off, lambda c: c.data == "short_auto_off")
+    dp.callback_query.register(short_handlers.cb_short_tf, lambda c: c.data and c.data.startswith("short_tf:"))
+    dp.callback_query.register(short_handlers.cb_short_last, lambda c: c.data == "short_last")
+    dp.callback_query.register(short_handlers.cb_short_settings, lambda c: c.data == "short_settings")
+    dp.callback_query.register(short_handlers.cb_short_exec_on, lambda c: c.data == "short_exec_on")
+    dp.callback_query.register(short_handlers.cb_short_exec_off, lambda c: c.data == "short_exec_off")
+    dp.callback_query.register(short_handlers.cb_short_exec_symbol, lambda c: c.data and c.data.startswith("short_exec:"))
+    dp.callback_query.register(short_handlers.cb_short_positions, lambda c: c.data == "short_positions")
+    dp.callback_query.register(short_handlers.cb_short_close, lambda c: c.data and c.data.startswith("short_close:"))
+    dp.callback_query.register(short_handlers.cb_short_close_all, lambda c: c.data == "short_close_all")
+    dp.callback_query.register(short_handlers.cb_short_clear_history, lambda c: c.data == "short_clear_history")
+    # Short-bot settings pickers
+    dp.callback_query.register(short_handlers.cb_short_set_size, lambda c: c.data == "short_set_size")
+    dp.callback_query.register(short_handlers.cb_short_size_val, lambda c: c.data and c.data.startswith("short_size_val:"))
+    dp.callback_query.register(short_handlers.cb_short_set_lev, lambda c: c.data == "short_set_lev")
+    dp.callback_query.register(short_handlers.cb_short_lev_val, lambda c: c.data and c.data.startswith("short_lev_val:"))
+    dp.callback_query.register(short_handlers.cb_short_set_sl, lambda c: c.data == "short_set_sl")
+    dp.callback_query.register(short_handlers.cb_short_sl_val, lambda c: c.data and c.data.startswith("short_sl_val:"))
+    dp.callback_query.register(short_handlers.cb_short_set_tp, lambda c: c.data == "short_set_tp")
+    dp.callback_query.register(short_handlers.cb_short_tp_val, lambda c: c.data and c.data.startswith("short_tp_val:"))
+    dp.callback_query.register(short_handlers.cb_short_set_maxpos, lambda c: c.data == "short_set_maxpos")
+    dp.callback_query.register(short_handlers.cb_short_maxpos_val, lambda c: c.data and c.data.startswith("short_maxpos_val:"))
+    dp.callback_query.register(short_handlers.cb_short_set_minscore, lambda c: c.data == "short_set_minscore")
+    dp.callback_query.register(short_handlers.cb_short_minscore_val, lambda c: c.data and c.data.startswith("short_minscore_val:"))
+
     # Stock trading handlers (MOEX via BCS)
-    dp.message.register(stock_handlers.handle_stocks_menu, lambda m: m.text == "Stocks")
+    dp.message.register(stock_handlers.handle_stocks_menu, lambda m: m.text in ("Stocks", "📈 Акции"))
     dp.callback_query.register(stock_handlers.cb_stock_start, lambda c: c.data == "stock_start")
     dp.callback_query.register(stock_handlers.cb_stock_stop, lambda c: c.data == "stock_stop")
     dp.callback_query.register(stock_handlers.cb_stock_stats, lambda c: c.data == "stock_stats")
@@ -114,6 +151,13 @@ def register_handlers() -> None:
     dp.callback_query.register(stock_handlers.cb_stock_sl_val, lambda c: c.data and c.data.startswith("stock_sl_val:"))
     dp.callback_query.register(stock_handlers.cb_stock_tp_val, lambda c: c.data and c.data.startswith("stock_tp_val:"))
     dp.callback_query.register(stock_handlers.cb_stock_trail_val, lambda c: c.data and c.data.startswith("stock_trail_val:"))
+    # Quality filter settings
+    dp.callback_query.register(stock_handlers.cb_stock_set_min_conf, lambda c: c.data == "stock_set_min_conf")
+    dp.callback_query.register(stock_handlers.cb_stock_set_min_edge, lambda c: c.data == "stock_set_min_edge")
+    dp.callback_query.register(stock_handlers.cb_stock_set_cooldown, lambda c: c.data == "stock_set_cooldown")
+    dp.callback_query.register(stock_handlers.cb_stock_minconf_val, lambda c: c.data and c.data.startswith("stock_minconf_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_minedge_val, lambda c: c.data and c.data.startswith("stock_minedge_val:"))
+    dp.callback_query.register(stock_handlers.cb_stock_cooldown_val, lambda c: c.data and c.data.startswith("stock_cooldown_val:"))
 
 
 async def shutdown(signal_name: str | None = None) -> None:
@@ -141,9 +185,18 @@ async def shutdown(signal_name: str | None = None) -> None:
     except Exception:
         pass
 
+    try:
+        await short_handlers.shutdown_short()
+    except Exception:
+        pass
+
     await close_session()
     try:
         await shutdown_market_intelligence()
+    except Exception:
+        pass
+    try:
+        await stop_healthcheck_server()
     except Exception:
         pass
     await bot.session.close()
@@ -153,6 +206,7 @@ async def run_telegram() -> None:
     global scheduler_task
     await init_db()
     register_handlers()
+    await start_healthcheck_server()
     scheduler_task = asyncio.create_task(scheduler_loop(bot))
     await dp.start_polling(bot)
 

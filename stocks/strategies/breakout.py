@@ -65,7 +65,7 @@ class BreakoutStrategy(StockBaseStrategy):
         else:
             return []
 
-        confidence = min(1.0, vol_spike / (self._vol_mult * 2))
+        confidence = min(1.0, 0.3 + (vol_spike - self._vol_mult) / self._vol_mult)
 
         return [
             StockTradeIntent(
@@ -74,7 +74,7 @@ class BreakoutStrategy(StockBaseStrategy):
                 side=side,
                 quantity_lots=self._quantity_lots,
                 confidence=confidence,
-                expected_edge_pct=abs(price - (swing_high if side == "buy" else swing_low)) / price * 100,
+                expected_edge_pct=tp_pct * 0.5,
                 stop_loss_pct=round(sl_pct, 2),
                 take_profit_pct=round(tp_pct, 2),
                 mode=self.default_mode,

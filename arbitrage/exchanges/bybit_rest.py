@@ -12,9 +12,10 @@ import json
 import time
 from typing import Dict, Any, Optional
 
-from arbitrage.utils import get_arbitrage_logger, ExchangeConfig
+from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, get_rate_limiter
 
 logger = get_arbitrage_logger("bybit_rest")
+_EXCHANGE = "bybit"
 
 BASE_URL = "https://api.bybit.com"
 RECV_WINDOW = "5000"
@@ -83,15 +84,23 @@ class BybitRestClient:
         endpoint: str,
         params: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Публичный HTTP запрос с retry"""
+        """Публичный HTTP запрос с retry и rate limiting"""
+        limiter = get_rate_limiter()
         url = f"{self.base_url}{endpoint}"
         for attempt in range(3):
             try:
+                await limiter.acquire(_EXCHANGE)
                 session = await self._get_session()
                 async with session.request(
                     method=method, url=url, params=params or {},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
+                    if resp.status == 429:
+                        backoff = limiter.record_429(_EXCHANGE)
+                        logger.warning("Bybit 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                        await asyncio.sleep(backoff)
+                        continue
+                    limiter.record_success(_EXCHANGE)
                     return await resp.json(content_type=None)
             except Exception as e:
                 if attempt < 2:
@@ -109,15 +118,17 @@ class BybitRestClient:
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Приватный HTTP запрос с подписью и retry"""
+        """Приватный HTTP запрос с подписью, retry и rate limiting"""
         if self.public_only:
             logger.warning(f"Cannot make private request without API keys: {endpoint}")
             return {"retCode": -1, "retMsg": "No API keys configured", "result": {}}
 
+        limiter = get_rate_limiter()
         url = f"{self.base_url}{endpoint}"
 
         for attempt in range(3):
             try:
+                await limiter.acquire(_EXCHANGE)
                 session = await self._get_session()
 
                 if method.upper() == "GET":
@@ -128,6 +139,12 @@ class BybitRestClient:
                         url, params=params or {}, headers=headers,
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
+                        if resp.status == 429:
+                            backoff = limiter.record_429(_EXCHANGE)
+                            logger.warning("Bybit 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        limiter.record_success(_EXCHANGE)
                         return await resp.json(content_type=None)
                 else:
                     # POST: подпись на JSON body
@@ -137,6 +154,12 @@ class BybitRestClient:
                         url, data=body, headers=headers,
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
+                        if resp.status == 429:
+                            backoff = limiter.record_429(_EXCHANGE)
+                            logger.warning("Bybit 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        limiter.record_success(_EXCHANGE)
                         return await resp.json(content_type=None)
 
             except Exception as e:
@@ -188,6 +211,42 @@ class BybitRestClient:
         return await self._public_request(
             "GET", "/v5/market/orderbook",
             params={"category": category, "symbol": symbol, "limit": limit},
+        )
+
+    async def get_kline(
+        self, symbol: str, interval: str = "5", limit: int = 300,
+        category: str = "linear",
+    ) -> Dict[str, Any]:
+        """Получить свечи (kline).  interval: 1,3,5,15,30,60,120,240,360,720,D,W,M"""
+        return await self._public_request(
+            "GET", "/v5/market/kline",
+            params={
+                "category": category,
+                "symbol": symbol,
+                "interval": interval,
+                "limit": str(limit),
+            },
+        )
+
+    async def get_ticker(self, symbol: str, category: str = "linear") -> Dict[str, Any]:
+        """Получить тикер для конкретного символа (включает fundingRate)"""
+        return await self._public_request(
+            "GET", "/v5/market/tickers",
+            params={"category": category, "symbol": symbol},
+        )
+
+    async def get_open_interest(
+        self, symbol: str, interval_time: str = "5min", limit: int = 10,
+    ) -> Dict[str, Any]:
+        """Получить историю открытого интереса.  intervalTime: 5min,15min,30min,1h,4h,1d"""
+        return await self._public_request(
+            "GET", "/v5/market/open-interest",
+            params={
+                "category": "linear",
+                "symbol": symbol,
+                "intervalTime": interval_time,
+                "limit": str(limit),
+            },
         )
 
     # ─── Account / Trading (Private) ──────────────────────────────────────────
@@ -364,6 +423,32 @@ class BybitRestClient:
             order_type="market",
             offset="close",
         )
+
+    async def get_instrument_info(self, symbol: str, category: str = "linear") -> Dict[str, Any]:
+        """Получить информацию об инструменте (lotSize, priceFilter, leverage)"""
+        return await self._public_request(
+            "GET", "/v5/market/instruments-info",
+            params={"category": category, "symbol": symbol},
+        )
+
+    async def set_trading_stop(
+        self,
+        symbol: str,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        position_idx: int = 0,
+    ) -> Dict[str, Any]:
+        """Установить SL/TP на открытую позицию"""
+        body: Dict[str, Any] = {
+            "category": "linear",
+            "symbol": symbol,
+            "positionIdx": position_idx,
+        }
+        if stop_loss is not None:
+            body["stopLoss"] = str(stop_loss)
+        if take_profit is not None:
+            body["takeProfit"] = str(take_profit)
+        return await self._request("POST", "/v5/position/trading-stop", data=body)
 
     # ── RFQ (Block Trading) ────────────────────────────────────────────────
 

@@ -23,8 +23,8 @@ class VolumeSpikeStrategy(StockBaseStrategy):
     def __init__(
         self,
         volume_threshold: float = 2.0,
-        take_profit_pct: float = 0.5,
-        stop_loss_pct: float = 0.3,
+        take_profit_pct: float = 1.5,
+        stop_loss_pct: float = 1.0,
         quantity_lots: int = 1,
     ) -> None:
         super().__init__(StockStrategyId.VOLUME_SPIKE)
@@ -43,10 +43,10 @@ class VolumeSpikeStrategy(StockBaseStrategy):
         if price <= 0 or vol_spike < self._vol_threshold:
             return []
 
-        # Direction from CVD (relaxed for MOEX blue-chips).
-        if cvd > 0.03:
+        # Direction from CVD — require meaningful directional volume.
+        if cvd > 0.10:
             side = "buy"
-        elif cvd < -0.03:
+        elif cvd < -0.10:
             side = "sell"
         else:
             return []
@@ -58,7 +58,7 @@ class VolumeSpikeStrategy(StockBaseStrategy):
             if side == "sell" and price < vwap_val:
                 return []
 
-        confidence = min(1.0, vol_spike / (self._vol_threshold * 3))
+        confidence = min(1.0, 0.3 + (vol_spike - self._vol_threshold) / (self._vol_threshold * 1.5))
 
         return [
             StockTradeIntent(

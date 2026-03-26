@@ -20,6 +20,7 @@ import time
 from typing import Dict, List, Optional
 
 from arbitrage.system.models import MarketSnapshot, OrderBookSnapshot, StrategyId, TradeIntent
+from arbitrage.system.slippage import SlippageModel
 from arbitrage.system.strategies.base import BaseStrategy
 
 logger = logging.getLogger("trading_system")
@@ -131,8 +132,33 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
         if long_ob.ask <= 0 or short_ob.bid <= 0:
             return None
 
-        # Calculate spread: we buy at long_ask, sell at short_bid
-        spread_pct = (short_ob.bid - long_ob.ask) / long_ob.ask * 100
+        # Walk-the-book: use depth data for realistic fill prices
+        # when available (from WebSocket or REST depth).
+        # Estimate notional per leg (~$500 default for price impact calc).
+        est_notional = float(snapshot.balances.get(long_ex, 0.0) or 0.0) * 0.05
+        est_notional = max(est_notional, 500.0)
+
+        buy_price = long_ob.ask   # fallback: top-of-book
+        sell_price = short_ob.bid  # fallback: top-of-book
+
+        long_depth = snapshot.orderbook_depth.get(long_ex)
+        if long_depth:
+            asks = long_depth.get("asks") or []
+            if asks:
+                walked = SlippageModel.walk_book(asks, est_notional)
+                if walked > 0:
+                    buy_price = walked
+
+        short_depth = snapshot.orderbook_depth.get(short_ex)
+        if short_depth:
+            bids = short_depth.get("bids") or []
+            if bids:
+                walked = SlippageModel.walk_book(bids, est_notional)
+                if walked > 0:
+                    sell_price = walked
+
+        # Calculate spread using realistic fill prices
+        spread_pct = (sell_price - buy_price) / buy_price * 100
 
         # Taker fees on both legs
         fee_long = self._get_fee_pct(long_ex, snapshot)
@@ -156,8 +182,8 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
                 )
             return None
 
-        # Cooldown check
-        pair_key = f"{long_ex}_{short_ex}_{snapshot.symbol}"
+        # Cooldown check — per direction (long_ex→short_ex is separate from short_ex→long_ex)
+        pair_key = f"spread_{long_ex}_long_{short_ex}_short_{snapshot.symbol}"
         now = time.time()
         if now - self._last_signal_ts.get(pair_key, 0) < self._signal_cooldown_sec:
             return None
@@ -189,23 +215,27 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
                 "spread_pct": round(spread_pct, 4),
                 "net_spread_pct": round(net_spread_pct, 4),
                 "total_fees_pct": round(total_fees_pct, 4),
-                "long_price": long_ob.ask,
-                "short_price": short_ob.bid,
-                "entry_long_price": long_ob.ask,
-                "entry_short_price": short_ob.bid,
-                "entry_mid": (long_ob.ask + short_ob.bid) / 2,
+                "long_price": buy_price,
+                "short_price": sell_price,
+                "entry_long_price": buy_price,
+                "entry_short_price": sell_price,
+                "top_of_book_long": long_ob.ask,
+                "top_of_book_short": short_ob.bid,
+                "entry_mid": (buy_price + sell_price) / 2,
                 "target_profit_pct": self.target_profit_pct,
                 "exit_spread_pct": self.exit_spread_pct,
                 "max_spread_risk_pct": self.max_spread_risk_pct,
                 "entry_spread_pct": spread_pct,
                 "arb_type": "price_spread",
-                # TP/SL as percentage of notional — engine computes USD
-                "take_profit_pct": round(net_spread_pct * 0.7 / 100, 6),
-                "stop_loss_pct": round(self.max_spread_risk_pct / 100, 6),
+                # Arbitrage is market-neutral: PnL depends on spread convergence,
+                # not price direction.  Normal PnL swings are noise — SL on PnL
+                # would cut profitable trades prematurely.
+                # Exit only when spread converges (TP) or on timeout.
+                "take_profit_pct": round(net_spread_pct / 100, 6),
                 "max_holding_seconds": 3600,
                 "close_edge_bps": self.exit_spread_pct * 100,
-                # Limit prices for IOC slippage buffer
-                "limit_prices": {"buy": long_ob.ask, "sell": short_ob.bid},
+                # Limit prices for IOC slippage buffer — use walked prices
+                "limit_prices": {"buy": buy_price, "sell": sell_price},
             },
         )
 
@@ -259,8 +289,8 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
         if fr_diff_pct < total_round_trip_cost:
             return None
 
-        # Cooldown
-        pair_key = f"funding_{long_ex}_{short_ex}_{snapshot.symbol}"
+        # Cooldown — per direction
+        pair_key = f"funding_{long_ex}_long_{short_ex}_short_{snapshot.symbol}"
         now = time.time()
         if now - self._last_signal_ts.get(pair_key, 0) < 60.0:  # longer cooldown for funding
             return None
@@ -289,9 +319,9 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
                 "entry_short_price": short_ob.bid,
                 "entry_mid": (long_ob.ask + short_ob.bid) / 2,
                 "arb_type": "funding_rate",
-                # Funding arb holds longer — TP/SL as pct of notional
-                "take_profit_pct": round(fr_diff_pct * 0.6 / 100, 6),
-                "stop_loss_pct": round(self.max_spread_risk_pct / 100, 6),
+                # Funding arb: exit on TP or timeout only — no SL on PnL.
+                # Funding arb is inherently hedged; PnL noise is spread noise.
+                "take_profit_pct": round(fr_diff_pct / 100, 6),
                 "max_holding_seconds": 28800,  # 8 hours (one funding period)
                 "close_edge_bps": 0.5,
                 "limit_prices": {"buy": long_ob.ask, "sell": short_ob.bid},
@@ -329,12 +359,25 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
         return True
 
     def _get_fee_pct(self, exchange: str, snapshot: MarketSnapshot) -> float:
-        """Get taker fee percentage for an exchange."""
+        """Get taker fee percentage for an exchange.
+
+        Priority:
+          1. Live fee from snapshot (fetched from exchange API or env vars)
+          2. Per-symbol fee if available (``perp:BTCUSDT``)
+          3. Hardcoded default per exchange
+        """
         fee_data = snapshot.fee_bps.get(exchange, {})
+        # Try symbol-specific key first (e.g. ``perp:BTCUSDT``)
+        if snapshot.symbol:
+            sym_key = f"perp:{snapshot.symbol}"
+            sym_val = fee_data.get(sym_key)
+            if sym_val is not None:
+                val = abs(float(sym_val))
+                if val > 0:
+                    return val / 100  # bps → percent
+        # Then generic perp fee
         if "perp" in fee_data:
-            # Use abs() because some exchanges report taker fees as negative.
-            # A fee of 0 bps is suspicious for taker — fall back to defaults.
-            fee_val = abs(fee_data["perp"])
+            fee_val = abs(float(fee_data["perp"]))
             if fee_val > 0:
-                return fee_val / 100  # bps to percent
+                return fee_val / 100  # bps → percent
         return _DEFAULT_FEE_PCT.get(exchange, 0.05)

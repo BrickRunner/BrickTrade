@@ -71,7 +71,11 @@ async def cb_delete_thresholds(cb: types.CallbackQuery):
 
 async def cb_delete_specific_threshold(cb: types.CallbackQuery):
     """Обработка удаления конкретного порога"""
-    tid = int(cb.data.split(":", 1)[1])
+    try:
+        tid = int(cb.data.split(":", 1)[1])
+    except (IndexError, ValueError, AttributeError):
+        await cb.answer("Ошибка данных")
+        return
     result = await delete_threshold(tid, cb.from_user.id)
     
     if not result:
@@ -91,7 +95,11 @@ async def cb_delete_specific_threshold(cb: types.CallbackQuery):
 
 async def cb_threshold_currency(cb: types.CallbackQuery, state: FSMContext):
     """Обработка выбора валюты для порога"""
-    cur = cb.data.split(":", 1)[1]
+    try:
+        cur = cb.data.split(":", 1)[1]
+    except (IndexError, AttributeError):
+        await cb.answer("Ошибка данных")
+        return
     await state.update_data(currency=cur)
     try:
         await cb.message.edit_text(f"Введите пороговое значение для {cur} (например 100.50):")

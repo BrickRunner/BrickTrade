@@ -34,6 +34,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 class LiveMarketDataProvider(MarketDataProvider):
     market_data: MarketDataEngine
     exchanges: Iterable[str]
+    private_ws: Any = None  # Optional[PrivateWsManager] — set after construction
     _initialized: bool = False
     _mid_history: Dict[str, deque] = field(default_factory=dict)
     _last_refresh_ts: float = 0.0
@@ -132,34 +133,69 @@ class LiveMarketDataProvider(MarketDataProvider):
                     timestamp=time.time(),
                 )
 
+        # Try to get depth from WebSocket first (sub-50ms latency),
+        # fall back to REST polling if WS unavailable.
+        ws_depth_available = False
+        if self._ws_cache:
+            for exchange in self.exchanges:
+                ws_depth = self._ws_cache.get_depth(exchange, symbol)
+                if ws_depth:
+                    orderbook_depth[exchange] = ws_depth
+                    ws_depth_available = True
+
         symbol_depth_ts = self._per_symbol_depth_ts.get(symbol, 0.0)
+        # Only REST-poll for exchanges missing WS depth data
         if now - symbol_depth_ts >= self._depth_refresh_seconds:
+            exchanges_needing_depth = [
+                ex for ex in self.exchanges if ex not in orderbook_depth
+            ]
             enable_spot = os.getenv("ENABLE_SPOT_EXECUTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 
-            async def _fetch_depth(ex: str):
-                d = await self.market_data.fetch_orderbook_depth(ex, symbol, levels=10)
-                sd = None
-                if enable_spot:
-                    sd = await self.market_data.fetch_spot_orderbook_depth(ex, symbol, levels=10)
-                return ex, d, sd
+            if exchanges_needing_depth:
+                async def _fetch_depth(ex: str):
+                    d = await self.market_data.fetch_orderbook_depth(ex, symbol, levels=10)
+                    sd = None
+                    if enable_spot:
+                        sd = await self.market_data.fetch_spot_orderbook_depth(ex, symbol, levels=10)
+                    return ex, d, sd
 
-            results = await asyncio.gather(*[_fetch_depth(ex) for ex in self.exchanges], return_exceptions=True)
-            for r in results:
-                if isinstance(r, Exception):
-                    continue
-                ex, depth, spot_depth = r
-                if depth:
-                    orderbook_depth[ex] = depth
-                if spot_depth:
-                    spot_orderbook_depth[ex] = spot_depth
+                results = await asyncio.gather(*[_fetch_depth(ex) for ex in exchanges_needing_depth], return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        continue
+                    ex, depth, spot_depth = r
+                    if depth:
+                        orderbook_depth[ex] = depth
+                    if spot_depth:
+                        spot_orderbook_depth[ex] = spot_depth
+
             self._per_symbol_depth_ts[symbol] = now
 
-        if now - self._last_balance_ts >= self._balance_refresh_seconds:
-            try:
-                self._cached_balances = await self.market_data.fetch_balances()
-            except Exception:
-                pass
-            self._last_balance_ts = now
+        # Prefer private WS push for balances (instant, no REST calls).
+        if self.private_ws is not None:
+            ws_balances = self.private_ws.get_all_balances()
+            if ws_balances:
+                self._cached_balances.update(ws_balances)
+            # REST fallback only for exchanges not covered by WS, at reduced rate.
+            if now - self._last_balance_ts >= self._balance_refresh_seconds * 6:
+                try:
+                    rest_balances = await self.market_data.fetch_balances()
+                    for ex, bal in rest_balances.items():
+                        if ex not in ws_balances and bal >= 0:
+                            self._cached_balances[ex] = bal
+                except Exception:
+                    pass
+                self._last_balance_ts = now
+        else:
+            if now - self._last_balance_ts >= self._balance_refresh_seconds:
+                try:
+                    rest_balances = await self.market_data.fetch_balances()
+                    for ex, bal in rest_balances.items():
+                        if bal >= 0:
+                            self._cached_balances[ex] = bal
+                except Exception:
+                    pass
+                self._last_balance_ts = now
         balances = dict(self._cached_balances)
 
         fee_bps = self.market_data.get_fee_bps()
@@ -264,6 +300,7 @@ class LiveMarketDataProvider(MarketDataProvider):
 class LiveExecutionVenue(ExecutionVenue):
     exchanges: Dict[str, Any]
     market_data: MarketDataEngine
+    private_ws: Any = None  # Optional[PrivateWsManager] — set after construction
     _balance_cache: Dict[str, float] = field(default_factory=dict)
     _last_balance_ts: float = 0.0
     _balance_refresh_seconds: float = 5.0
@@ -676,6 +713,17 @@ class LiveExecutionVenue(ExecutionVenue):
                 await client.close()
 
     async def open_contracts(self, exchange: str, symbol: str) -> float:
+        # Try WS cache first (instant, no REST call).
+        if self.private_ws is not None and self.private_ws.is_connected(exchange):
+            ws_pos = self.private_ws.get_open_contracts(exchange, symbol)
+            if ws_pos > 0:
+                return ws_pos
+            # WS says 0 — could be genuinely zero or WS hasn't received data yet.
+            # If WS has been connected and has any position data, trust it.
+            if self.private_ws.get_positions(exchange):
+                return 0.0
+
+        # Fallback: REST query.
         try:
             client = self.exchanges[exchange]
             result = await client.get_cross_position(symbol)
@@ -719,6 +767,29 @@ class LiveExecutionVenue(ExecutionVenue):
     ) -> bool:
         if not order_id:
             return False
+
+        # Strategy: Use WS push event as primary, REST poll as fallback.
+        # WS gives sub-millisecond detection; REST poll catches edge cases
+        # where WS message is missed.
+        if self.private_ws is not None and not spot and self.private_ws.is_connected(exchange):
+            # Try WS-based fill detection first (much faster).
+            ws_filled = await self.private_ws.wait_for_fill(
+                exchange, order_id, timeout_ms=min(timeout_ms, timeout_ms),
+            )
+            if ws_filled:
+                logger.debug("wait_for_fill: %s %s detected via WS", exchange, order_id)
+                return True
+            # WS didn't fire — do one final REST check before giving up.
+            try:
+                result = await self.get_order(exchange, symbol, order_id)
+                if self._order_filled(exchange, result, expected_size):
+                    logger.debug("wait_for_fill: %s %s detected via REST fallback", exchange, order_id)
+                    return True
+            except Exception:
+                pass
+            return False
+
+        # Fallback: REST polling (original behavior for spot or no WS).
         deadline = time.time() + (timeout_ms / 1000)
         poll_interval = 0.25
         while time.time() < deadline:
@@ -742,12 +813,39 @@ class LiveExecutionVenue(ExecutionVenue):
         self._last_balance_ts = 0.0
 
     async def _get_balances(self) -> Dict[str, float]:
+        # Prefer private WS push data when available (instant, no REST call).
+        if self.private_ws is not None:
+            ws_balances = self.private_ws.get_all_balances()
+            if ws_balances:
+                # Merge WS data into cache; fall back to REST for exchanges
+                # not yet connected via private WS.
+                merged = dict(self._balance_cache)
+                merged.update(ws_balances)
+                self._balance_cache = merged
+                # Still do a REST refresh periodically for exchanges without WS
+                now = time.time()
+                if now - self._last_balance_ts >= self._balance_refresh_seconds * 6:
+                    try:
+                        rest_balances = await self.market_data.fetch_balances()
+                        # Only use REST for exchanges NOT in WS; skip -1.0 (fetch error)
+                        for ex, bal in rest_balances.items():
+                            if ex not in ws_balances and bal >= 0:
+                                self._balance_cache[ex] = bal
+                    except Exception:
+                        pass
+                    self._last_balance_ts = now
+                return self._balance_cache
+
+        # Fallback: REST polling (original behavior).
         now = time.time()
         if now - self._last_balance_ts >= self._balance_refresh_seconds or not self._balance_cache:
             try:
-                self._balance_cache = await self.market_data.fetch_balances()
+                rest_balances = await self.market_data.fetch_balances()
+                # Skip -1.0 values (fetch error) — keep cached balance instead
+                for ex, bal in rest_balances.items():
+                    if bal >= 0:
+                        self._balance_cache[ex] = bal
             except Exception:
-                # Keep previous cache on transient failure.
                 pass
             self._last_balance_ts = now
         return self._balance_cache
@@ -772,25 +870,33 @@ class LiveExecutionVenue(ExecutionVenue):
     @staticmethod
     def _map_order_params(exchange: str, order_type: str, limit_price: float) -> tuple[str, str, float]:
         kind = (order_type or "").lower()
-        wants_limit = kind in {"limit", "ioc", "fok"} and limit_price > 0
+        is_post_only = kind == "post_only"
+        wants_limit = kind in {"limit", "ioc", "fok", "post_only"} and limit_price > 0
         if exchange == "htx":
-            # HTX rejects limit orders without price. Use market-like order when price is absent.
             if wants_limit:
+                if is_post_only:
+                    return "limit", "maker", limit_price
                 tif = "ioc" if kind in {"ioc", "fok"} else ""
                 return "limit", tif, limit_price
             return "market", "", 0.0
         if exchange == "okx":
             if wants_limit:
+                if is_post_only:
+                    return "post_only", "", limit_price
                 tif = "ioc" if kind in {"ioc", "fok"} else "gtc"
                 return "limit", tif, limit_price
             return "market", "", 0.0
         if exchange == "binance":
             if wants_limit:
+                if is_post_only:
+                    return "limit", "GTX", limit_price
                 tif = "IOC" if kind in {"ioc", "fok"} else "GTC"
                 return "limit", tif, limit_price
             return "market", "", 0.0
         # bybit and others
         if wants_limit:
+            if is_post_only:
+                return "limit", "PostOnly", limit_price
             tif = "ioc" if kind in {"ioc", "fok"} else ""
             return "limit", tif, limit_price
         return "market", "", 0.0

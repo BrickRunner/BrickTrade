@@ -354,6 +354,10 @@ async def cb_stock_settings(query: types.CallbackQuery) -> None:
         f"  Stop-loss: {cfg.risk.default_sl_pct:.1f}%\n"
         f"  Take-profit: {cfg.risk.default_tp_pct:.1f}%\n"
         f"  Trailing stop: {cfg.risk.trailing_stop_pct:.1f}%\n"
+        f"\n<b>Фильтры качества:</b>\n"
+        f"  Мин. уверенность: {cfg.risk.min_confidence:.0%}\n"
+        f"  Мин. доходность: {cfg.risk.min_edge_pct:.2f}%\n"
+        f"  Кулдаун сигнала: {cfg.risk.signal_cooldown_sec // 60} мин\n"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -368,6 +372,11 @@ async def cb_stock_settings(query: types.CallbackQuery) -> None:
             InlineKeyboardButton(text=f"SL: {cfg.risk.default_sl_pct:.1f}%", callback_data="stock_set_sl"),
             InlineKeyboardButton(text=f"TP: {cfg.risk.default_tp_pct:.1f}%", callback_data="stock_set_tp"),
             InlineKeyboardButton(text=f"Trail: {cfg.risk.trailing_stop_pct:.1f}%", callback_data="stock_set_trail"),
+        ],
+        [
+            InlineKeyboardButton(text=f"Мин.увер: {cfg.risk.min_confidence:.0%}", callback_data="stock_set_min_conf"),
+            InlineKeyboardButton(text=f"Мин.доход: {cfg.risk.min_edge_pct:.2f}%", callback_data="stock_set_min_edge"),
+            InlineKeyboardButton(text=f"Кулдаун: {cfg.risk.signal_cooldown_sec // 60}м", callback_data="stock_set_cooldown"),
         ],
         [InlineKeyboardButton(text="\u2b05 Назад", callback_data="stock_menu")],
     ])
@@ -396,10 +405,13 @@ def _rebuild_config_with_risk(new_risk: StockRiskConfig) -> None:
 _EXPOSURE_OPTIONS = [0.25, 0.50, 0.75, 1.0]
 _PER_POS_OPTIONS = [0.10, 0.25, 0.50, 1.0]
 _MAX_POS_OPTIONS = [1, 3, 5, 10, 20]
-_MAX_TRADES_OPTIONS = [5, 10, 20, 50]
-_SL_OPTIONS = [1.0, 2.0, 3.0, 5.0, 7.0]
-_TP_OPTIONS = [1.5, 3.0, 4.5, 7.0, 10.0]
+_MAX_TRADES_OPTIONS = [3, 5, 8, 15, 30]
+_SL_OPTIONS = [2.0, 3.0, 4.0, 5.0, 7.0]
+_TP_OPTIONS = [3.0, 4.5, 6.0, 8.0, 10.0]
 _TRAIL_OPTIONS = [0.0, 1.0, 1.5, 2.0, 3.0]
+_MIN_CONF_OPTIONS = [0.10, 0.15, 0.20, 0.30, 0.40]
+_MIN_EDGE_OPTIONS = [0.05, 0.10, 0.15, 0.25, 0.40]
+_COOLDOWN_OPTIONS = [120, 300, 600, 900, 1800]  # seconds
 
 
 def _clone_risk(**overrides) -> StockRiskConfig:
@@ -513,6 +525,51 @@ async def cb_stock_trail_val(query: types.CallbackQuery) -> None:
     val = float(query.data.split(":")[1])
     _rebuild_config_with_risk(_clone_risk(trailing_stop_pct=val))
     await query.answer(f"Trailing Stop: {'выкл' if val == 0 else f'{val}%'}")
+    await cb_stock_settings(query)
+
+
+async def cb_stock_set_min_conf(query: types.CallbackQuery) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{int(v*100)}%", callback_data=f"stock_minconf_val:{v}") for v in _MIN_CONF_OPTIONS],
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="stock_settings")],
+    ])
+    await _safe_edit(query.message, "<b>Мин. уверенность</b>\nСигналы с уверенностью ниже этого порога отклоняются:", kb)
+
+
+async def cb_stock_set_min_edge(query: types.CallbackQuery) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{v}%", callback_data=f"stock_minedge_val:{v}") for v in _MIN_EDGE_OPTIONS],
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="stock_settings")],
+    ])
+    await _safe_edit(query.message, "<b>Мин. ожидаемая доходность</b>\nДолжна превышать комиссию БКС (~0.1% за сделку):", kb)
+
+
+async def cb_stock_set_cooldown(query: types.CallbackQuery) -> None:
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{v // 60} мин", callback_data=f"stock_cooldown_val:{v}") for v in _COOLDOWN_OPTIONS],
+        [InlineKeyboardButton(text="\u2b05 Назад", callback_data="stock_settings")],
+    ])
+    await _safe_edit(query.message, "<b>Кулдаун сигнала</b>\nПауза между повторными сигналами одной стратегии:", kb)
+
+
+async def cb_stock_minconf_val(query: types.CallbackQuery) -> None:
+    val = float(query.data.split(":")[1])
+    _rebuild_config_with_risk(_clone_risk(min_confidence=val))
+    await query.answer(f"Мин. уверенность: {int(val*100)}%")
+    await cb_stock_settings(query)
+
+
+async def cb_stock_minedge_val(query: types.CallbackQuery) -> None:
+    val = float(query.data.split(":")[1])
+    _rebuild_config_with_risk(_clone_risk(min_edge_pct=val))
+    await query.answer(f"Мин. доходность: {val}%")
+    await cb_stock_settings(query)
+
+
+async def cb_stock_cooldown_val(query: types.CallbackQuery) -> None:
+    val = int(query.data.split(":")[1])
+    _rebuild_config_with_risk(_clone_risk(signal_cooldown_sec=val))
+    await query.answer(f"Кулдаун: {val // 60} мин")
     await cb_stock_settings(query)
 
 

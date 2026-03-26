@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Dict, List
 
+import aiofiles
+
 from arbitrage.system.models import OpenPosition, StrategyId
 
 logger = logging.getLogger("trading_system")
@@ -80,6 +82,10 @@ class SystemState:
         if today != self._daily_reset_date:
             self._daily_start_equity = self._equity
             self._daily_reset_date = today
+            # Auto-reset kill switch on new day (daily drawdown resets)
+            self._kill_switch = False
+            self._kill_switch_permanent = False
+            self._kill_switch_ts = 0.0
 
     async def set_equity(self, equity: float) -> None:
         async with self._lock:
@@ -170,6 +176,7 @@ class SystemState:
             return {"portfolio_dd": max(0.0, dd_total), "daily_dd": max(0.0, dd_daily)}
 
     def _load_positions(self) -> None:
+        """Synchronous load at startup (before event loop is running)."""
         try:
             if os.path.exists(self._positions_file):
                 with open(self._positions_file, "r") as f:
@@ -179,18 +186,41 @@ class SystemState:
                     self._positions[pos.position_id] = pos
                 if self._positions:
                     logger.info("Recovered %d open positions from %s", len(self._positions), self._positions_file)
-        except Exception as exc:
-            logger.warning("Failed to load positions from %s: %s", self._positions_file, exc)
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to load positions from %s (corrupted data): %s", self._positions_file, exc)
+        except OSError as exc:
+            logger.warning("Failed to load positions from %s (I/O error): %s", self._positions_file, exc)
 
-    def _persist_positions(self) -> None:
+    async def _persist_positions_async(self) -> None:
+        """Non-blocking async file persistence — called from async context."""
         if self._positions_file == ":memory:":
             return
         try:
             os.makedirs(os.path.dirname(self._positions_file) or ".", exist_ok=True)
             data = [_serialize_position(p) for p in self._positions.values()]
+            payload = json.dumps(data, indent=2)
             tmp = self._positions_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f, indent=2)
+            async with aiofiles.open(tmp, "w") as f:
+                await f.write(payload)
             os.replace(tmp, self._positions_file)
         except Exception as exc:
             logger.warning("Failed to persist positions: %s", exc)
+
+    def _persist_positions(self) -> None:
+        """Schedule async persistence without blocking the caller."""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._persist_positions_async())
+        except RuntimeError:
+            # No running loop (e.g. during tests) — fall back to sync
+            if self._positions_file == ":memory:":
+                return
+            try:
+                os.makedirs(os.path.dirname(self._positions_file) or ".", exist_ok=True)
+                data = [_serialize_position(p) for p in self._positions.values()]
+                tmp = self._positions_file + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, self._positions_file)
+            except Exception as exc:
+                logger.warning("Failed to persist positions (sync fallback): %s", exc)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from dataclasses import replace
 from typing import Optional
@@ -23,6 +24,7 @@ from arbitrage.system import (
     build_exchange_clients,
     usdt_symbol_universe,
 )
+from arbitrage.system.factory import build_private_ws_manager
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,12 @@ class _EngineState:
             except (asyncio.CancelledError, Exception):
                 pass
         if self.venue:
+            # Stop private WS connections first.
+            if hasattr(self.venue, "private_ws") and self.venue.private_ws:
+                try:
+                    await self.venue.private_ws.stop()
+                except Exception:
+                    pass
             try:
                 await self.venue.close()
             except Exception:
@@ -401,11 +409,25 @@ async def _start_engine(bot, user_id: int) -> str:
             selected = usdt_symbol_universe(market_data, config.max_symbols, config.symbol_blacklist)
             config = replace(config, symbols=selected)
 
+        state = SystemState(starting_equity=config.starting_equity)
+        monitor = TelegramMonitoringSink(tg_logger=logging.getLogger("trading_system"), bot=bot, user_id=user_id)
+        venue = LiveExecutionVenue(exchanges=clients, market_data=market_data)
+        # Start private WebSocket connections for real-time balance/fill/position updates.
+        private_ws = build_private_ws_manager(config)
+        await private_ws.start()
+        await private_ws.seed_balances(market_data)
+        venue.private_ws = private_ws
+        provider.private_ws = private_ws
+
         # Align working equity with real available balances to avoid oversizing.
-        balances = await market_data.fetch_balances()
+        # Use WS-seeded balances (more reliable than raw REST for HTX).
+        balances = private_ws.get_all_balances()
+        if not balances:
+            balances = await market_data.fetch_balances()
         live_equity = sum(max(0.0, v) for v in balances.values())
         if live_equity > 0:
             config = replace(config, starting_equity=live_equity)
+            await state.set_equity(live_equity)
 
         # Prioritize affordable symbols (put them first), but keep ALL symbols
         # so the engine can monitor spreads and trade when margin allows.
@@ -421,19 +443,12 @@ async def _start_engine(bot, user_id: int) -> str:
                 len(affordable), len(config.symbols),
             )
         else:
-            # No symbols are affordable right now, but keep all symbols anyway.
-            # The engine's margin guard will reject orders it can't afford,
-            # and the bot will enter positions when spreads appear on cheap pairs.
             logger.warning(
                 "No symbols currently affordable (balances: %s), "
                 "keeping all %d symbols — engine will filter by margin at execution time.",
                 {ex: f"${max(0.0, balances.get(ex, 0.0)):.2f}" for ex in config.exchanges},
                 len(config.symbols),
             )
-
-        state = SystemState(starting_equity=config.starting_equity)
-        monitor = TelegramMonitoringSink(tg_logger=logging.getLogger("trading_system"), bot=bot, user_id=user_id)
-        venue = LiveExecutionVenue(exchanges=clients, market_data=market_data)
         execution = AtomicExecutionEngine(
             config=config.execution,
             venue=venue,
@@ -622,7 +637,7 @@ async def cb_arb_stats(call: types.CallbackQuery):
     if positions:
         lines.append(f"\n📂 <b>Открытые позиции ({len(positions)}):</b>")
         for pos in positions:
-            age_min = (asyncio.get_event_loop().time() - pos.opened_at) / 60 if pos.opened_at > 0 else 0
+            age_min = (time.time() - pos.opened_at) / 60 if pos.opened_at > 0 else 0
             lines.append(
                 f"  • {pos.symbol} | {pos.long_exchange}↔{pos.short_exchange} | "
                 f"<code>${pos.notional_usd:.2f}</code> | {age_min:.0f}м"
@@ -633,16 +648,27 @@ async def cb_arb_stats(call: types.CallbackQuery):
     if _es.last_error:
         lines.append(f"\n⚠️ Ошибка:\n<code>{_es.last_error[:200]}</code>")
 
+    buttons = [
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_stats")],
+    ]
+    if snap['kill_switch']:
+        buttons.append([InlineKeyboardButton(text="🔓 Сбросить Kill Switch", callback_data="arb_reset_ks")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")])
+
     await _safe_edit(
         call.message,
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Обновить", callback_data="arb_stats")],
-                [InlineKeyboardButton(text="⬅️ Меню", callback_data="arb_menu")],
-            ]
-        ),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
+
+
+async def cb_arb_reset_kill_switch(call: types.CallbackQuery):
+    if not _es.state:
+        await call.answer("Бот не запущен")
+        return
+    await _es.state.reset_kill_switch()
+    await call.answer("Kill switch сброшен!")
+    await cb_arb_stats(call)
 
 
 async def cb_arb_history(call: types.CallbackQuery):

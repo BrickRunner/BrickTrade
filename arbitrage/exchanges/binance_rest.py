@@ -12,9 +12,10 @@ import time
 from typing import Dict, Any, Optional
 from urllib.parse import urlencode
 
-from arbitrage.utils import get_arbitrage_logger, ExchangeConfig
+from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, get_rate_limiter
 
 logger = get_arbitrage_logger("binance_rest")
+_EXCHANGE = "binance"
 
 BASE_URL = "https://fapi.binance.com"
 SPOT_BASE_URL = "https://api.binance.com"
@@ -75,14 +76,22 @@ class BinanceRestClient:
         params: Optional[Dict] = None,
         base_url: Optional[str] = None,
     ) -> Any:
+        limiter = get_rate_limiter()
         url = f"{base_url or self.base_url}{endpoint}"
         for attempt in range(3):
             try:
+                await limiter.acquire(_EXCHANGE)
                 session = await self._get_session()
                 async with session.request(
                     method=method, url=url, params=params or {},
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
+                    if resp.status == 429:
+                        backoff = limiter.record_429(_EXCHANGE)
+                        logger.warning("Binance 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                        await asyncio.sleep(backoff)
+                        continue
+                    limiter.record_success(_EXCHANGE)
                     return await resp.json(content_type=None)
             except Exception as e:
                 if attempt < 2:
@@ -105,10 +114,12 @@ class BinanceRestClient:
             logger.warning(f"Cannot make private request without API keys: {endpoint}")
             return {"code": -1, "msg": "No API keys configured"}
 
+        limiter = get_rate_limiter()
         url = f"{base_url or self.base_url}{endpoint}"
 
         for attempt in range(3):
             try:
+                await limiter.acquire(_EXCHANGE)
                 session = await self._get_session()
                 req_params = dict(params or data or {})
                 req_params["timestamp"] = int(time.time() * 1000)
@@ -121,12 +132,24 @@ class BinanceRestClient:
                         url, params=req_params, headers=headers,
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
+                        if resp.status == 429:
+                            backoff = limiter.record_429(_EXCHANGE)
+                            logger.warning("Binance 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        limiter.record_success(_EXCHANGE)
                         return await resp.json(content_type=None)
                 else:
                     async with session.post(
                         url, params=req_params, headers=headers,
                         timeout=aiohttp.ClientTimeout(total=15),
                     ) as resp:
+                        if resp.status == 429:
+                            backoff = limiter.record_429(_EXCHANGE)
+                            logger.warning("Binance 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        limiter.record_success(_EXCHANGE)
                         return await resp.json(content_type=None)
 
             except Exception as e:

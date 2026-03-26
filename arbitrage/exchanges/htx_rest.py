@@ -17,9 +17,10 @@ import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
-from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, usdt_to_htx as _usdt_to_htx
+from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, usdt_to_htx as _usdt_to_htx, get_rate_limiter
 
 logger = get_arbitrage_logger("htx_rest")
+_EXCHANGE = "htx"
 
 # Base URLs
 FUTURES_BASE_URL = "https://api.hbdm.com"    # Linear swap (USDT-margined)
@@ -102,15 +103,23 @@ class HTXRestClient:
         endpoint: str,
         params: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Публичный HTTP запрос с retry"""
+        """Публичный HTTP запрос с retry и rate limiting"""
+        limiter = get_rate_limiter()
         url = f"{base_url}{endpoint}"
         for attempt in range(3):
             try:
+                await limiter.acquire(_EXCHANGE)
                 session = await self._get_session()
                 async with session.request(
                     method=method, url=url, params=params or {},
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
+                    if resp.status == 429:
+                        backoff = limiter.record_429(_EXCHANGE)
+                        logger.warning("HTX 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                        await asyncio.sleep(backoff)
+                        continue
+                    limiter.record_success(_EXCHANGE)
                     return await resp.json(content_type=None)
             except Exception as e:
                 if attempt < 2:
@@ -129,24 +138,32 @@ class HTXRestClient:
         params: Optional[Dict] = None,
         data: Optional[Dict] = None,
     ) -> Dict[str, Any]:
-        """Приватный HTTP запрос с подписью и retry"""
+        """Приватный HTTP запрос с подписью, retry и rate limiting"""
         if self.public_only:
             logger.warning(f"Cannot make private request without API keys: {endpoint}")
             return {"status": "error", "err-msg": "No API keys configured"}
 
+        limiter = get_rate_limiter()
         url = f"{base_url}{endpoint}"
         host = urllib.parse.urlparse(base_url).hostname or ""
 
-        max_attempts = 2
+        max_attempts = 3
         for attempt in range(max_attempts):
             try:
+                await limiter.acquire(_EXCHANGE)
                 # Пересоздаём подпись на каждой попытке (timestamp меняется)
                 get_params = dict(params or {})
                 signed = self._sign_request(method.upper(), host, endpoint, get_params)
                 session = await self._get_session()
 
                 if method.upper() == "GET":
-                    async with session.get(url, params=signed, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                    async with session.get(url, params=signed, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                        if resp.status == 429:
+                            backoff = limiter.record_429(_EXCHANGE)
+                            logger.warning("HTX 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        limiter.record_success(_EXCHANGE)
                         return await resp.json(content_type=None)
                 else:
                     # POST: подпись в query string, тело — JSON
@@ -155,16 +172,24 @@ class HTXRestClient:
                         f"{url}?{qs}",
                         json=data or {},
                         headers={"Content-Type": "application/json"},
-                        timeout=aiohttp.ClientTimeout(total=8),
+                        timeout=aiohttp.ClientTimeout(total=12),
                     ) as resp:
+                        if resp.status == 429:
+                            backoff = limiter.record_429(_EXCHANGE)
+                            logger.warning("HTX 429 on %s (attempt %d), backoff %.1fs", endpoint, attempt + 1, backoff)
+                            await asyncio.sleep(backoff)
+                            continue
+                        limiter.record_success(_EXCHANGE)
                         return await resp.json(content_type=None)
             except Exception as e:
+                err_type = type(e).__name__
+                err_msg = str(e) or "(no message)"
                 if attempt < max_attempts - 1:
-                    logger.warning(f"Private request attempt {attempt+1} failed {endpoint}: {e}")
-                    await asyncio.sleep(0.3)
+                    logger.warning(f"Private request attempt {attempt+1} failed {endpoint}: {err_type}: {err_msg}")
+                    await asyncio.sleep(0.5 * (attempt + 1))
                 else:
-                    logger.error(f"Private request error {endpoint} after {max_attempts} attempts: {e}")
-                    return {"status": "error", "err-msg": str(e)}
+                    logger.error(f"Private request error {endpoint} after {max_attempts} attempts: {err_type}: {err_msg}")
+                    return {"status": "error", "err-msg": f"{err_type}: {err_msg}"}
 
     # ─── Market Data (Public) ────────────────────────────────────────────────
 
@@ -230,9 +255,23 @@ class HTXRestClient:
     # ─── Account / Trading (Private) ────────────────────────────────────────
 
     async def get_balance(self) -> Dict[str, Any]:
-        """Получить баланс аккаунта (unified account — merged cross/isolated)"""
+        """Получить баланс аккаунта (unified account — merged cross/isolated).
+
+        Tries v3 unified first; falls back to v1 cross_account_info if v3 times out.
+        """
+        try:
+            result = await self._request(
+                "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/unified_account_info",
+                data={"margin_account": "USDT"}
+            )
+            if result.get("code") == 200 and result.get("data"):
+                return result
+        except Exception:
+            pass
+        # Fallback: v1 cross account info
+        logger.info("HTX: v3 unified balance failed, trying v1 cross_account_info")
         return await self._request(
-            "POST", FUTURES_BASE_URL, "/linear-swap-api/v3/unified_account_info",
+            "POST", FUTURES_BASE_URL, "/linear-swap-api/v1/swap_cross_account_info",
             data={"margin_account": "USDT"}
         )
 

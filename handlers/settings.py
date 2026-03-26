@@ -28,7 +28,11 @@ async def cb_set_currencies(cb: types.CallbackQuery):
 
 async def cb_toggle_curr(cb: types.CallbackQuery):
     """Обработка переключения валюты"""
-    cur = cb.data.split(":", 1)[1]
+    try:
+        cur = cb.data.split(":", 1)[1]
+    except (IndexError, AttributeError):
+        await cb.answer("Ошибка данных")
+        return
     row = await get_settings(cb.from_user.id)
     selected = [c.strip().upper() for c in (row[1] or "USD,EUR").split(",") if c.strip()]
     
@@ -117,7 +121,11 @@ async def cb_set_days(cb: types.CallbackQuery):
 
 async def cb_toggle_day(cb: types.CallbackQuery):
     """Обработка переключения дня уведомлений"""
-    day = cb.data.split(":", 1)[1]
+    try:
+        day = cb.data.split(":", 1)[1]
+    except (IndexError, AttributeError):
+        await cb.answer("Ошибка данных")
+        return
     row = await get_settings(cb.from_user.id)
     selected = [d for d in (row[3] or "1,2,3,4,5").split(",") if d.strip()]
     
@@ -155,7 +163,15 @@ async def cb_set_timezone(cb: types.CallbackQuery):
 
 async def cb_set_tz(cb: types.CallbackQuery):
     """Установка часового пояса"""
-    tz = int(cb.data.split(":", 1)[1])
+    try:
+        raw = cb.data.split(":", 1)[1]
+        if raw == "noop":
+            await cb.answer()
+            return
+        tz = int(raw)
+    except (IndexError, ValueError, AttributeError):
+        await cb.answer("Ошибка данных")
+        return
     await update_settings(cb.from_user.id, "timezone", str(tz))
     try:
         tz_display = f"UTC{tz:+d}" if tz != 0 else "UTC+0"

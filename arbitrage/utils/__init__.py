@@ -3,6 +3,7 @@
 """
 from .logger import init_arbitrage_logger, get_arbitrage_logger, ArbitrageLogger
 from .config import ArbitrageConfig, ExchangeConfig
+from .rate_limiter import get_rate_limiter, init_rate_limiter, ExchangeRateLimiter
 from .helpers import (
     get_timestamp_ms,
     get_timestamp_sec,
@@ -34,4 +35,7 @@ __all__ = [
     'calculate_position_value',
     'calculate_pnl',
     'usdt_to_htx',
+    'get_rate_limiter',
+    'init_rate_limiter',
+    'ExchangeRateLimiter',
 ]

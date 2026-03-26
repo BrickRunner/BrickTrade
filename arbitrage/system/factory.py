@@ -9,6 +9,7 @@ logger = logging.getLogger("trading_system")
 
 from arbitrage.core.market_data import MarketDataEngine
 from arbitrage.exchanges import BinanceRestClient, BybitRestClient, HTXRestClient, OKXRestClient
+from arbitrage.exchanges.private_ws import PrivateWsManager
 from arbitrage.system.config import TradingSystemConfig
 from arbitrage.utils import ExchangeConfig
 
@@ -66,6 +67,29 @@ def build_exchange_clients(
     if len(clients) < 2:
         raise ValueError("At least two exchange clients are required")
     return clients
+
+
+def build_private_ws_manager(config: TradingSystemConfig) -> PrivateWsManager:
+    """Build PrivateWsManager with configs for all exchanges that have API keys.
+
+    Provides real-time WS push for balances, order fills, and positions
+    instead of REST polling.
+    """
+    configs: Dict[str, ExchangeConfig] = {}
+    for exchange in config.exchanges:
+        creds = config.credentials.get(exchange)
+        if not creds or not creds.api_key or not creds.api_secret:
+            continue
+        # Private WS supported for okx, htx, bybit (not binance yet)
+        if exchange not in {"okx", "htx", "bybit"}:
+            continue
+        configs[exchange] = ExchangeConfig(
+            api_key=creds.api_key,
+            api_secret=creds.api_secret,
+            passphrase=creds.passphrase,
+            testnet=os.getenv(f"{exchange.upper()}_TESTNET", "false").lower() == "true",
+        )
+    return PrivateWsManager(configs=configs)
 
 
 def usdt_symbol_universe(
