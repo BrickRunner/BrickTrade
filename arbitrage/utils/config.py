@@ -75,15 +75,18 @@ class ArbitrageConfig:
     # 1. monitoring_only = true: Только мониторинг через публичные API (БЕЗ торговли, БЕЗ личных ключей)
     # 2. monitoring_only = false + mock_mode = true: Mock режим для разработки
     # 3. monitoring_only = false + dry_run_mode = true: Реальные данные, но без ордеров
-    monitoring_only: bool = False  # Полный режим с реальными API
+    #
+    # FIX C6: Safe fail-safe defaults — if .env is missing, monitoring_only=True
+    # and dry_run_mode=True prevent accidental live trading.
+    monitoring_only: bool = True  # SAFE DEFAULT: monitoring only by default
 
     # Mock режим
-    mock_mode: bool = False  # Реальные API
+    mock_mode: bool = False  # Real API by default (when not monitoring_only)
 
     # DRY RUN режим
     # true = реальные данные, но НЕ размещает ордера
     # false = РЕАЛЬНАЯ ТОРГОВЛЯ
-    dry_run_mode: bool = False  # Реальная торговля
+    dry_run_mode: bool = True  # SAFE DEFAULT: dry run by default
 
     # Multi-Pair настройки
     min_opportunity_lifetime: int = 3  # Минимальное время жизни возможности (сек)

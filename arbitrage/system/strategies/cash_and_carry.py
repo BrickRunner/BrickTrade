@@ -34,7 +34,11 @@ logger = logging.getLogger("trading_system")
 # Typical perpetual funding: 0.01% per 8h = ~0.03% daily = ~10.95% APR
 _MIN_FUNDING_APR_PCT = 5.0  # 5% APR minimum
 
-# Default taker fees per exchange (for spot + perp combined)
+# FIX #2: Correct taker fee rates per exchange (VIP-0, as of Mar-2026):
+#   Binance spot: 0.10% taker  |  Binance futures: 0.04% taker
+#   Bybit spot:  0.10% taker  |  Bybit linear:    0.055% taker
+#   OKX spot:    0.08% taker  |  OKX swap:        0.05% taker
+#   HTX spot:    0.20% taker  |  HTX linear swap: 0.05% taker (unified margin)
 _DEFAULT_SPOT_FEE_PCT: Dict[str, float] = {
     "binance": 0.10,
     "bybit": 0.10,
@@ -140,10 +144,26 @@ class CashAndCarryStrategy(BaseStrategy):
         perp_fee = self._get_perp_fee_pct(exchange, snapshot)
         round_trip_fees_pct = (spot_fee + perp_fee) * 2
 
-        # Net APR after fees (amortized over expected holding period)
-        # For one funding period (8h), the net gain is:
-        one_period_gain_pct = funding_rate_pct - (round_trip_fees_pct / 3)  # amortize over ~3 periods min
-        net_apr = one_period_gain_pct * 3 * 365
+        # FIX #3: Correct cash & carry APR math.
+        # The previous formula was mathematically broken:
+        #   one_period_gain = funding - (round_trip_fees / 3)
+        #   net_apr = one_period_gain × 3 × 365 = funding×1095 - fees×365
+        # This multiplied the fee drag by 365 instead of the correct subtraction.
+        #
+        # Correct approach:
+        #   Funding income per 8h period = funding_rate_pct (per leg)
+        #   Total funding income over holding period = funding_rate_pct × num_periods
+        #   Net profit = funding_income - round_trip_fees (one-time cost)
+        #   APR = (net_profit / holding_days) × 365
+        #
+        # With ~3 funding periods per day and minimum holding of
+        # self.min_holding_hours, the minimum number of periods is:
+        min_periods = max(1, int(self.min_holding_hours / 8))
+        total_funding_income_pct = funding_rate_pct * min_periods * 3  # 3 periods/day
+        net_profit_pct = total_funding_income_pct - round_trip_fees_pct
+        # Project to APR: net profit over min_holding_hours → annualized
+        holding_days = max(self.min_holding_hours / 24.0, 1.0 / 365.0)
+        net_apr = (net_profit_pct / holding_days) * 365 if holding_days > 0 else 0.0
 
         if net_apr < self.min_funding_apr_pct:
             logger.debug(
@@ -169,7 +189,10 @@ class CashAndCarryStrategy(BaseStrategy):
         # Confidence based on how much APR exceeds threshold
         confidence = min(1.0, net_apr / max(self.min_funding_apr_pct * 3, 1.0))
 
-        edge_bps = one_period_gain_pct * 100  # per-period edge in bps
+        # FIX #3 (continued): edge_bps = net profit in percent × 100 = bps.
+        # The old code used `one_period_gain_pct` which no longer exists
+        # after the APR math rewrite.  Use net_profit_pct directly.
+        edge_bps = net_profit_pct * 100  # pct → bps
 
         logger.info(
             "[CASH_CARRY_SIGNAL] %s on %s: funding=%.4f%% apr=%.1f%% net_apr=%.1f%% "
@@ -205,7 +228,7 @@ class CashAndCarryStrategy(BaseStrategy):
                 # Execution config
                 "leg_kinds": {exchange: "spot"},  # long leg = spot
                 "max_holding_seconds": int(self.max_holding_hours * 3600),
-                "take_profit_pct": round(one_period_gain_pct * 3 / 100, 6),  # 3 periods
+                "take_profit_pct": round(net_apr / 100.0 / 365 * self.min_holding_hours / 24.0, 6),
                 "close_edge_bps": 0.0,  # don't exit on edge — exit on funding/time
                 # Limit prices with buffer
                 "limit_prices": {

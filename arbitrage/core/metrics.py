@@ -14,7 +14,7 @@ class MetricsTracker:
     def __init__(self):
         # Per-strategy trade records
         self._trades: Dict[str, List[Dict[str, Any]]] = {}
-        # PnL history for Sharpe/drawdown
+        # PnL history for Sharpe/drawdown (each element: (timestamp, pnl))
         self._pnl_history: deque = deque(maxlen=1000)
         self._cumulative_pnl: float = 0.0
         self._peak_pnl: float = 0.0
@@ -30,7 +30,7 @@ class MetricsTracker:
 
     def record_exit(self, strategy: str, symbol: str, pnl: float, reason: str) -> None:
         self._exits += 1
-        self._pnl_history.append(pnl)
+        self._pnl_history.append((time.time(), pnl))
         self._cumulative_pnl += pnl
 
         # Track peak and drawdown
@@ -54,20 +54,33 @@ class MetricsTracker:
         self._cycle_times.append(elapsed)
 
     def sharpe_ratio(self) -> float:
-        """Annualized Sharpe ratio from trade PnLs."""
+        """Annualized Sharpe ratio from trade PnLs.
+
+        FIX H1: Previously assumed a hardcoded "~3 trades per day" regardless of
+        actual data. Now computes the real observation window from timestamps
+        and annualizes correctly: annual_factor = sqrt(365 / days_observed).
+        """
         if len(self._pnl_history) < 5:
             return 0.0
-        pnls = list(self._pnl_history)
+
+        records = list(self._pnl_history)  # (timestamp, pnl)
+        pnls = [r[1] for r in records]
         mean = sum(pnls) / len(pnls)
+
         if len(pnls) < 2:
             return 0.0
         variance = sum((p - mean) ** 2 for p in pnls) / (len(pnls) - 1)
         std = math.sqrt(variance) if variance > 0 else 0.0
         if std < 1e-10:
             return 0.0
-        # Assume ~3 trades per day, 365 days
-        trades_per_year = 3 * 365
-        return (mean / std) * math.sqrt(trades_per_year)
+
+        # Compute actual observation window from timestamps
+        first_ts = records[0][0]
+        last_ts = records[-1][0]
+        days_observed = max((last_ts - first_ts) / 86400.0, 1.0)  # at least 1 day
+        annual_factor = math.sqrt(365.0 / days_observed)
+
+        return (mean / std) * annual_factor
 
     def summary(self) -> Dict[str, Any]:
         avg_cycle = (

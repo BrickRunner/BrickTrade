@@ -1,12 +1,15 @@
 """
 Модуль логирования для арбитражного бота.
 Логи сохраняются в структуре: logs/YYYY-MM-DD/HH/filename.log
+
+FIX M4: Now uses datetime.utcnow() instead of datetime.now() to avoid
+DST transition issues during log rotation.
 """
 import logging
 import os
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 class HourlyRotatingFileHandler(logging.FileHandler):
@@ -27,7 +30,7 @@ class HourlyRotatingFileHandler(logging.FileHandler):
         self.setLevel(level)
 
     def _resolve_path(self) -> str:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         hour_key = now.strftime("%Y-%m-%d/%H")
 
         target_dir = self._base_dir / now.strftime("%Y-%m-%d") / now.strftime("%H")
@@ -37,7 +40,7 @@ class HourlyRotatingFileHandler(logging.FileHandler):
         return str(target_dir / self._filename)
 
     def emit(self, record):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         hour_key = now.strftime("%Y-%m-%d/%H")
 
         if hour_key != self._current_hour_key:

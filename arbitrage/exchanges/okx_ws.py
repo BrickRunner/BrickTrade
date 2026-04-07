@@ -3,6 +3,7 @@ OKX WebSocket клиент для получения стаканов
 """
 import asyncio
 import json
+import time
 from typing import Callable, Optional, Dict, Any
 import websockets
 from websockets.client import WebSocketClientProtocol
@@ -21,6 +22,9 @@ class OKXWebSocket:
         self.ws: Optional[WebSocketClientProtocol] = None
         self.running = False
         self.callback: Optional[Callable] = None
+        # FIX C2/H3: heartbeat tracking and subscription state
+        self._last_msg_ts: float = 0.0
+        self._subscribed: bool = False
 
         # URLs
         if testnet:
@@ -54,6 +58,7 @@ class OKXWebSocket:
                     ping_timeout=10
                 ) as ws:
                     self.ws = ws
+                    self._last_msg_ts = time.monotonic()  # FIX C2: heartbeat tracking
                     logger.info("Connected to OKX WebSocket")
 
                     # Подписка на orderbook
@@ -68,20 +73,60 @@ class OKXWebSocket:
                     }
 
                     await ws.send(json.dumps(subscribe_msg))
-                    logger.info(f"Subscribed to OKX orderbook: {self.okx_symbol}")
+                    # FIX H3: Wait for subscription confirmation before entering recv loop
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=15)
+                        resp = json.loads(raw)
+                        if "event" in resp:
+                            if resp["event"] == "error":
+                                logger.error(f"OKX subscription error: {resp}")
+                                await asyncio.sleep(2)
+                                continue  # reconnect
+                            elif resp["event"] == "subscribe":
+                                logger.info(f"OKX subscription confirmed: {self.okx_symbol}")
+                                self._subscribed = True
+                            # Snapshot snapshot message may also be the first data
+                            pass
+                        else:
+                            # Data message — process it as first snapshot
+                            self._subscribed = True
+                            try:
+                                await self._handle_message(resp)
+                            except Exception as e:
+                                logger.error(f"OKX initial snapshot error: {e}")
+                    except asyncio.TimeoutError:
+                        logger.warning("OKX subscription confirmation timeout, reconnecting")
+                        continue
 
-                    # Обработка сообщений
-                    async for message in ws:
-                        if not self.running:
+                    # FIX C2: Explicit recv loop with heartbeat + timeout
+                    while self.running:
+                        try:
+                            # Heartbeat check: if >60s since last mesg, reconnect
+                            if time.monotonic() - self._last_msg_ts > 60:
+                                logger.warning(
+                                    "OKX WebSocket: heartbeat timeout (%.0fs), reconnecting",
+                                    time.monotonic() - self._last_msg_ts,
+                                )
+                                break
+                            message = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "OKX WebSocket: no message in 30s, reconnecting",
+                            )
                             break
-
+                        except websockets.exceptions.ConnectionClosed:
+                            break
                         try:
                             data = json.loads(message)
-                            await self._handle_message(data)
                         except json.JSONDecodeError as e:
                             logger.error(f"Failed to decode OKX message: {e}")
+                            continue
+
+                        # Callback isolation: exceptions in handler do NOT break recv loop
+                        try:
+                            await self._handle_message(data)
                         except Exception as e:
-                            logger.error(f"Error handling OKX message: {e}", exc_info=True)
+                            logger.error(f"OKX _handle_message error: {e}", exc_info=True)
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("OKX WebSocket connection closed")
@@ -93,9 +138,11 @@ class OKXWebSocket:
                     await asyncio.sleep(2)
             finally:
                 self.ws = None
+                self._subscribed = False
 
     async def _handle_message(self, data: Dict[str, Any]) -> None:
         """Обработка входящих сообщений"""
+        self._last_msg_ts = time.monotonic()  # FIX C2: update heartbeat on every message
         # Пропускаем служебные сообщения
         if "event" in data:
             if data["event"] == "subscribe":

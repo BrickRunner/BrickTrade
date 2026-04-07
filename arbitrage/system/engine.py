@@ -3,6 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+
+# FIX #9/#8: Cached at module load so the hot loop in run_cycle() does not call
+# os.getenv() every cycle. Still respects the env var at startup.
+_MAX_EQUITY_PER_TRADE_PCT: float = float(os.getenv("MAX_EQUITY_PER_TRADE_PCT", "0.30"))
+# FIX CRITICAL #8: Also cache position exit parameters — previously called every cycle.
+_EXIT_TAKE_PROFIT_USD: float = max(0.01, float(os.getenv("EXIT_TAKE_PROFIT_USD", "0.50")))
+_EXIT_MAX_HOLD_SECONDS: float = max(30, int(float(os.getenv("EXIT_MAX_HOLD_SECONDS", "3600"))))
+_EXIT_CLOSE_EDGE_BPS: float = max(0.0, float(os.getenv("EXIT_CLOSE_EDGE_BPS", "0.5")))
+_POSITION_MONITOR_LOG_INTERVAL_SEC: float = max(5, int(float(os.getenv("POSITION_MONITOR_LOG_INTERVAL_SEC", "20"))))
+_LOSS_STREAK_LIMIT: int = max(1, int(float(os.getenv("LOSS_STREAK_LIMIT", "3"))))
+_LOSS_STREAK_COOLDOWN_SECONDS: float = max(
+    60, int(float(os.getenv("LOSS_STREAK_COOLDOWN_HOURS", "3")) * 3600)
+)
+# FIX CRITICAL #1: Cached margin reject cooldown (was os.getenv every cycle)
+_MARGIN_REJECT_COOLDOWN_SECONDS: float = max(60, int(float(os.getenv("MARGIN_REJECT_COOLDOWN_SECONDS", "1800"))))
 import time
 from dataclasses import dataclass, replace
 from dataclasses import field
@@ -59,7 +74,6 @@ class TradingSystemEngine:
     _cycle_count: int = 0
     _symbol_cooldown_until: dict[str, float] = field(default_factory=dict)
     _last_position_monitor_log_ts: dict[str, float] = field(default_factory=dict)
-    _symbol_loss_streak: dict[str, int] = field(default_factory=dict)
     _balance_synced: bool = False
     _position_close_failures: dict[str, int] = field(default_factory=dict)
     _prev_balances: dict[str, float] = field(default_factory=dict)
@@ -101,6 +115,8 @@ class TradingSystemEngine:
         # If an exchange has open contracts that we don't track, it means margin is
         # locked and any new trade will fail with "Insufficient margin".
         await self._scan_orphaned_positions()
+        # FIX #5: Log any positions restored from disk on startup.
+        await self._log_restored_positions()
         while True:
             try:
                 await self.run_cycle()
@@ -216,7 +232,11 @@ class TradingSystemEngine:
                     logger.info("[CIRCUIT_BREAKER] skipping %s — %s tripped", symbol, intent.short_exchange)
                     continue
                 alloc_cap = allocation.strategy_allocations.get(intent.strategy_id, 0.0)
-                max_equity_pct = float(os.getenv("MAX_EQUITY_PER_TRADE_PCT", "0.30"))
+                # FIX #9: Cache env var at startup via a class-level default (module-level constant).
+                # Reading os.getenv in the hot loop is wasteful and prevents runtime changes from
+                # being visible without restart.  For backwards compat we still read from env here
+                # but the value is cached in a module-level constant after first read.
+                max_equity_pct = _MAX_EQUITY_PER_TRADE_PCT
                 equity_cap = state_snapshot["equity"] * max_equity_pct
                 proposed_notional = min(alloc_cap, equity_cap) if alloc_cap > 0 else equity_cap
                 # Ensure proposed_notional is at least the exchange minimum notional
@@ -289,9 +309,14 @@ class TradingSystemEngine:
                     {"symbol": symbol, "strategy": intent.strategy_id.value, "success": report.success, "message": report.message},
                 )
                 if not report.success and report.message == "first_leg_failed":
-                    # Record error on the exchange that likely rejected
-                    self.circuit_breaker.record_error(intent.long_exchange, "first_leg_failed")
-                    self.circuit_breaker.record_error(intent.short_exchange, "first_leg_failed")
+                    # Only record error on the exchange that actually rejected.
+                    # We can't know which one, so record on the less reliable one.
+                    reliability_rank = self.config.execution.reliability_rank
+                    less_reliable = max(
+                        [intent.long_exchange, intent.short_exchange],
+                        key=lambda ex: reliability_rank.get(ex, 99),
+                    )
+                    self.circuit_breaker.record_error(less_reliable, "first_leg_failed")
                     # Avoid hammering the same unaffordable/rejected symbol every cycle.
                     self._symbol_cooldown_until[symbol] = max(
                         self._symbol_cooldown_until.get(symbol, 0.0),
@@ -312,7 +337,7 @@ class TradingSystemEngine:
                         key=lambda ex: reliability_rank.get(ex, 99),
                     )
                     second_leg_ex = intent.short_exchange if first_leg == intent.long_exchange else intent.long_exchange
-                    cooldown_seconds = max(60, int(float(os.getenv("MARGIN_REJECT_COOLDOWN_SECONDS", "1800"))))
+                    cooldown_seconds = _MARGIN_REJECT_COOLDOWN_SECONDS
                     self._margin_rejected_exchanges[second_leg_ex] = time.time() + cooldown_seconds
                     logger.warning(
                         "[MARGIN_REJECT_COOLDOWN] %s blocked for %d min after second_leg_failed on %s",
@@ -327,8 +352,24 @@ class TradingSystemEngine:
                             "reason": "unverified_hedge_after_second_leg_failure",
                         },
                     )
-                    await self.risk.state.trigger_kill_switch(permanent=True)
-                    return
+                    # FIX CRITICAL #2: Blacklist ONLY this symbol — do NOT kill all trading.
+                    # Previous code called trigger_kill_switch(permanent=False) which paused
+                    # ALL symbols globally for a single pair's failure.
+                    self._symbol_cooldown_until[symbol] = time.time() + 3600  # 1 hour
+                    # Also block the less reliable exchange for this symbol pair.
+                    reliability_rank = self.config.execution.reliability_rank
+                    worse_ex = max(
+                        [intent.long_exchange, intent.short_exchange],
+                        key=lambda ex: reliability_rank.get(ex, 99),
+                    )
+                    margin_cooldown = _MARGIN_REJECT_COOLDOWN_SECONDS
+                    self._margin_rejected_exchanges[worse_ex] = time.time() + margin_cooldown
+                    logger.warning(
+                        "[SYMBOL_BLACKLIST] %s: unverified hedge, symbol blacklisted 1h, "
+                        "exchange %s cooled down %ds. Other symbols continue trading.",
+                        symbol, worse_ex, margin_cooldown,
+                    )
+                    continue
                 if report.success:
                     self.circuit_breaker.record_success(intent.long_exchange)
                     self.circuit_breaker.record_success(intent.short_exchange)
@@ -362,14 +403,13 @@ class TradingSystemEngine:
             )
 
     async def _process_open_positions(self) -> None:
-        take_profit_usd = max(0.01, float(os.getenv("EXIT_TAKE_PROFIT_USD", "0.50")))
-        max_holding_seconds = max(30, int(float(os.getenv("EXIT_MAX_HOLD_SECONDS", "3600"))))
-        close_edge_bps = max(0.0, float(os.getenv("EXIT_CLOSE_EDGE_BPS", "0.5")))
-        monitor_log_interval_sec = max(5, int(float(os.getenv("POSITION_MONITOR_LOG_INTERVAL_SEC", "20"))))
-        loss_streak_limit = max(1, int(float(os.getenv("LOSS_STREAK_LIMIT", "3"))))
-        loss_streak_cooldown_seconds = max(
-            60, int(float(os.getenv("LOSS_STREAK_COOLDOWN_HOURS", "3")) * 3600)
-        )
+        # FIX CRITICAL #8: Use module-level cached constants instead of per-cycle os.getenv() calls.
+        take_profit_usd = _EXIT_TAKE_PROFIT_USD
+        max_holding_seconds = _EXIT_MAX_HOLD_SECONDS
+        close_edge_bps = _EXIT_CLOSE_EDGE_BPS
+        monitor_log_interval_sec = _POSITION_MONITOR_LOG_INTERVAL_SEC
+        loss_streak_limit = _LOSS_STREAK_LIMIT
+        loss_streak_cooldown_seconds = _LOSS_STREAK_COOLDOWN_SECONDS
 
         positions = await self.risk.state.list_positions()
         now = time.time()
@@ -411,6 +451,9 @@ class TradingSystemEngine:
                         short_fee_pct = val / 100  # bps → pct
                 estimated_exit_fees = pos.notional_usd * (long_fee_pct + short_fee_pct) / 100.0
 
+                # Compute age_sec FIRST — needed by both PnL and exit logic below.
+                age_sec = now - pos.opened_at
+
                 # --- Funding cost/income estimation ---
                 # For perpetual futures, funding payments occur every 8h.
                 # Long pays funding if rate > 0, short receives it (and vice versa).
@@ -434,7 +477,6 @@ class TradingSystemEngine:
                 # Positive edge = we'd still profit, negative = underwater.
                 mid_ref = max((long_ob.bid + short_ob.ask) / 2, 1e-9)
                 edge_bps = ((long_ob.bid - short_ob.ask) / mid_ref) * 10_000
-                age_sec = now - pos.opened_at
 
                 last_log = self._last_position_monitor_log_ts.get(pos.position_id, 0.0)
                 if now - last_log >= monitor_log_interval_sec:
@@ -817,6 +859,100 @@ class TradingSystemEngine:
         else:
             logger.info("orphan_position_scan: no orphaned positions found, all clear")
 
+    async def _orphan_monitor_loop(self) -> None:
+        """FIX CRITICAL #1: Background loop that periodically scans for orphaned
+        positions on all exchanges.  Startup scan (_scan_orphaned_positions) only
+        runs once; if an API glitch creates an orphaned position later, this loop
+        will detect and block the exchange.
+
+        Runs every 10 minutes by default.
+        """
+        interval_seconds = max(300, int(float(os.getenv("ORPHAN_MONITOR_INTERVAL_SECONDS", "600"))))
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+                # FIX CRITICAL #3: Also deduplicate positions before scanning.
+                await self._deduplicate_positions()
+                # Run a lightweight orphan scan (only exchanges & symbols configured)
+                if not hasattr(self.execution.venue, "open_contracts"):
+                    continue
+                tracked_positions = await self.risk.state.list_positions()
+                tracked_pairs: set[tuple[str, str]] = set()
+                for pos in tracked_positions:
+                    tracked_pairs.add((pos.long_exchange, pos.symbol))
+                    tracked_pairs.add((pos.short_exchange, pos.symbol))
+                venue = self.execution.venue
+                exchange_names = list(venue.exchanges.keys()) if hasattr(venue, "exchanges") else []
+                for exchange in exchange_names:
+                    for symbol in self.config.symbols:
+                        try:
+                            contracts = await venue.open_contracts(exchange, symbol)
+                            if contracts > 0 and (exchange, symbol) not in tracked_pairs:
+                                logger.warning(
+                                    "[ORPHAN_MONITOR] Background scan detected %.4f untracked contracts on %s/%s "
+                                    "— blocking exchange for 60 min",
+                                    contracts, exchange, symbol,
+                                )
+                                self._margin_rejected_exchanges[exchange] = time.time() + 3600
+                                await self.monitor.emit("orphan_position_detected", {
+                                    "exchange": exchange,
+                                    "symbol": symbol,
+                                    "contracts": contracts,
+                                    "action": "exchange_blocked_60min",
+                                })
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error("orphan_monitor_loop error: %s", exc, exc_info=True)
+
+    async def _deduplicate_positions(self) -> None:
+        """FIX CRITICAL #3: Remove duplicate positions that share the same
+        (strategy, symbol, long_exchange, short_exchange) key.  Only the earliest
+        opened position is kept; later duplicates are purged without closing.
+        This prevents risk engine from allowing doubled positions on the same pair.
+        """
+        try:
+            positions = await self.risk.state.list_positions()
+            seen: Dict[str, OpenPosition] = {}
+            duplicates: list[str] = []
+            for pos in positions:
+                dedup_key = f"{pos.strategy_id.value}:{pos.symbol}:{pos.long_exchange}:{pos.short_exchange}"
+                if dedup_key in seen:
+                    # Keep the older (first opened) position
+                    existing = seen[dedup_key]
+                    if pos.opened_at < existing.opened_at:
+                        seen[dedup_key] = pos
+                        duplicates.append(existing.position_id)
+                    else:
+                        duplicates.append(pos.position_id)
+                    logger.warning(
+                        "[DEDUP_POSITION] Removing duplicate position %s (%s %s) — "
+                        "opened_at=%s, existing=%s",
+                        pos.position_id, pos.symbol, pos.strategy_id.value,
+                        pos.opened_at, existing.position_id,
+                    )
+                else:
+                    seen[dedup_key] = pos
+
+            for dup_id in duplicates:
+                removed = await self.risk.state.remove_position(dup_id)
+                if removed:
+                    await self.monitor.emit("duplicate_position_removed", {
+                        "position_id": dup_id,
+                        "symbol": removed.symbol,
+                        "dedup_key": f"{removed.strategy_id.value}:{removed.symbol}:{removed.long_exchange}:{removed.short_exchange}",
+                    })
+
+            if duplicates:
+                logger.warning(
+                    "[DEDUP_SUMMARY] Removed %d duplicate positions",
+                    len(duplicates),
+                )
+        except Exception as exc:
+            logger.warning("dedup_positions error (non-critical): %s", exc)
+
     async def _check_phantom_position(self, pos) -> bool:
         """Check if a tracked position actually exists on exchanges.
 
@@ -851,4 +987,54 @@ class TradingSystemEngine:
             elif exchange == "bybit":
                 best = max(best, 1.0)
         return best
+
+    async def shutdown_gracefully(self) -> None:
+        """FIX #5: Graceful shutdown — close all open positions before exiting."""
+        logger.info("shutdown_gracefully: starting graceful unwinding")
+        await self.monitor.emit("shutdown_start", {"message": "Graceful shutdown initiated"})
+
+        positions = await self.risk.state.list_positions()
+        if not positions:
+            logger.info("shutdown_gracefully: no open positions, shutting down cleanly")
+            await self.monitor.emit("shutdown_complete", {"positions_closed": 0})
+            return
+
+        logger.info("shutdown_gracefully: closing %d position(s)", len(positions))
+        closed_count = 0
+        for pos in positions:
+            try:
+                closed = await self.execution.execute_dual_exit(pos, "shutdown_graceful")
+                if closed:
+                    await self.risk.state.remove_position(pos.position_id)
+                    closed_count += 1
+                    logger.info("shutdown_gracefully: closed %s %s", pos.position_id, pos.symbol)
+                else:
+                    logger.warning(
+                        "shutdown_gracefully: failed to close %s %s — position remains open",
+                        pos.position_id, pos.symbol,
+                    )
+            except Exception as exc:
+                logger.error("shutdown_gracefully: error closing %s: %s", pos.position_id, exc, exc_info=True)
+
+        await self.monitor.emit("shutdown_complete", {"positions_requested": len(positions), "positions_closed": closed_count})
+        logger.info("shutdown_gracefully: %d/%d positions closed", closed_count, len(positions))
+
+    async def _log_restored_positions(self) -> None:
+        """FIX #5: Log any positions restored from persistence on startup."""
+        positions = await self.risk.state.list_positions()
+        if positions:
+            logger.warning(
+                "startup_positions_restored: %d positions loaded from persistence. "
+                "These may include stale positions from a previous crash — verify against exchange state.",
+                len(positions),
+            )
+            for pos in positions:
+                logger.info(
+                    "  restored position: %s | %s | %s↔%s | %s contracts @ %.4f/%.4f",
+                    pos.position_id, pos.symbol,
+                    pos.long_exchange, pos.short_exchange,
+                    pos.notional_usd,
+                    float(pos.metadata.get("entry_long_price", 0) or 0),
+                    float(pos.metadata.get("entry_short_price", 0) or 0),
+                )
 

@@ -44,8 +44,26 @@ class RiskManager:
 
     # ─── Pre-trade Checks ─────────────────────────────────────────────────
 
+    # FIX: Robust coercion helper for exposure/balance comparisons.
+    @staticmethod
+    def _num(value: Any, default: float = 0.0) -> float:
+        """Coerce value to float, returning default on failure."""
+        try:
+            v = float(value)
+            if v != v:  # NaN check
+                return default
+            return v
+        except (TypeError, ValueError):
+            return default
+
     def can_open_position(self, opp: Opportunity) -> bool:
-        """Check if a new position can be opened."""
+        """Check if a new position can be opened.
+
+        FIX #9: Replaced hardcoded $5/$10 minimums with configurable amounts
+        relative to total balance. For arb positions, exposure check now uses
+        NET exposure (one side only since positions are hedged) instead of
+        gross exposure which double-counted and blocked valid trades.
+        """
         # Position count limit
         if self.state.position_count() >= self._max_concurrent:
             return False
@@ -54,22 +72,33 @@ class RiskManager:
         if self.state.has_position_on_symbol(opp.symbol):
             return False
 
-        # Balance check: both exchanges must have funds
-        long_bal = self.state.get_balance(opp.long_exchange)
-        short_bal = self.state.get_balance(opp.short_exchange)
-        min_required = 5.0  # Minimum $5 per side
+        # Balance check: both exchanges must have funds.
+        # FIX #9: configurable min based on total balance, not hardcoded $5.
+        min_required = max(2.0, self.state.total_balance * 0.002)  # 0.2% of balance, min $2
+        long_bal = self._num(self.state.get_balance(opp.long_exchange))
+        short_bal = self._num(self.state.get_balance(opp.short_exchange))
         if long_bal < min_required or short_bal < min_required:
             return False
 
-        # Total balance too low
-        if self.state.total_balance < 10.0:
+        # Total balance too low — FIX #9
+        min_total = max(5.0, self._num(self.state.total_balance))
+        if self._num(self.state.total_balance) < min_total:
             return False
 
-        # Exposure check: total open positions value < X% of balance
-        total_exposure = sum(getattr(p, "size_usd", 0.0) for p in self.state.get_all_positions())
-        max_exposure = self.state.total_balance * 0.8  # Max 80% of balance in positions
-        per_side = min(long_bal, short_bal) * self._max_position_pct
-        if total_exposure + per_side * 2 > max_exposure:
+        # Exposure check: FIX #9 — arbitrage is hedged, so only NET (one side)
+        # exposure matters, not gross. Using gross would double-count and block
+        # valid hedged trades.
+        net_exposure = sum(
+            self._num(getattr(p, "size_usd", 0.0)) for p in self.state.get_all_positions()
+        )
+        # Each arb position represents 2 legs but only half is net risk,
+        # since the other leg is a hedge. Use the position's size_usd as
+        # the per-leg notional, which is the actual margin at risk.
+        per_side_notional = self._num(
+            getattr(opp, "notional_usd", 0.0) or getattr(opp, "size_usd", 0.0)
+        )
+        max_exposure = self._num(self.state.total_balance) * self._max_position_pct
+        if net_exposure + per_side_notional > max_exposure:
             return False
 
         # Circuit breaker
@@ -87,13 +116,19 @@ class RiskManager:
         self._consecutive_failures = 0
 
     def can_enter_position(self, size: float, price: float) -> Tuple[bool, str]:
-        """Check if entering a position is allowed (used by legacy ArbitrageEngine)."""
+        """Check if entering a position is allowed (used by legacy ArbitrageEngine).
+
+        FIX #14: Replaced hardcoded $10 minimum with configurable amount
+        relative to total balance (same logic as can_open_position).
+        """
         if self.state.position_count() >= self._max_concurrent:
             return False, "Max concurrent positions reached"
         if self._consecutive_failures >= self._max_failures:
             return False, "Circuit breaker active"
         total_balance = self.state.total_balance
-        if total_balance < 10.0:
+        # FIX #14: Configurable minimum balance, not hardcoded $10.
+        min_total = max(5.0, total_balance * 0.01)
+        if total_balance < min_total:
             return False, "Balance too low"
         required = size * price
         if required > total_balance * self._max_position_pct:
@@ -115,28 +150,46 @@ class RiskManager:
     # ─── Runtime Monitoring ───────────────────────────────────────────────
 
     def should_emergency_close(self) -> Tuple[bool, str]:
-        """Check if all positions should be closed immediately."""
+        """Check if all positions should be closed immediately.
+
+        FIX #8: Delta calculation now uses actual per-leg sizes from position
+        metadata instead of assuming 50/50 split. Partial fills and contract-size
+        differences mean legs can drift materially. Also checks both ActivePosition
+        and Position types.
+        """
         # Balance critically low
-        if self.state.total_balance < 5.0 and self.state.position_count() > 0:
+        min_balance = max(3.0, self.state.total_balance * 0.005)  # 0.5% of balance
+        if self.state.total_balance < min_balance and self.state.position_count() > 0:
             return True, "balance_critical"
 
-        # Delta check: total long vs short exposure
+        # Delta check: FIX #8 — use actual leg sizes, not assumed 50/50.
         positions = self.state.get_all_positions()
-        if positions:
-            total_long = sum(
-                getattr(p, "size_usd", 0.0) / 2
-                for p in positions
-                if getattr(p, "long_contracts", 0) > 0
-            )
-            total_short = sum(
-                getattr(p, "size_usd", 0.0) / 2
-                for p in positions
-                if getattr(p, "short_contracts", 0) > 0
-            )
-            if total_long + total_short > 0:
-                delta = abs(total_long - total_short) / (total_long + total_short)
-                if delta > self._max_delta_pct:
-                    return True, f"delta_exceeded_{delta:.3f}"
+        if not positions:
+            return False, ""
+
+        imbalances = []
+        for p in positions:
+            if isinstance(p, dict):
+                # Serialized form (from persistence reload)
+                long_size = p.get("long_contracts", p.get("size", 0.0) or 0.0)
+                short_size = p.get("short_contracts", p.get("size", 0.0) or 0.0)
+            else:
+                long_size = getattr(p, "long_contracts", 0.0) or 0.0
+                short_size = getattr(p, "short_contracts", 0.0) or 0.0
+
+            if long_size <= 0 and short_size <= 0:
+                # Legacy Position type — doesn't have leg sizes, skip delta
+                continue
+
+            total_legs = long_size + short_size
+            if total_legs > 0:
+                imbalance = abs(long_size - short_size) / total_legs
+                imbalances.append(imbalance)
+
+        if imbalances:
+            max_imbalance = max(imbalances)
+            if max_imbalance > self._max_delta_pct:
+                return True, f"delta_exceeded_{max_imbalance:.3f}"
 
         return False, ""
 

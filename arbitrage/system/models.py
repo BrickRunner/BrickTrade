@@ -10,6 +10,9 @@ class StrategyId(str, Enum):
     FUTURES_CROSS_EXCHANGE = "futures_cross_exchange"
     FUNDING_ARBITRAGE = "funding_arbitrage"
     CASH_AND_CARRY = "cash_and_carry"
+    # FIX AUDIT: Missing strategy IDs referenced in strategy classes but not in enum.
+    PAIRS_TRADING = "pairs_trading"
+    TRIANGULAR = "triangular_arbitrage"
 
 
 @dataclass(frozen=True)

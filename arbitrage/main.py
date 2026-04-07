@@ -39,6 +39,16 @@ async def run() -> None:
     config.validate()
 
     clients = build_exchange_clients(config)
+
+    # FIX P2: Verify API keys actually work before starting any trading.
+    if not config.execution.dry_run:
+        try:
+            await config.validate_api_credentials(clients)
+        except RuntimeError as exc:
+            logger.error("API key validation FAILED: %s", exc)
+            logger.error("Fix your .env credentials or set EXEC_DRY_RUN=true to skip validation")
+            raise
+
     state = SystemState(starting_equity=config.starting_equity)
     monitor = InMemoryMonitoring(logger=logger)
     if os.getenv("METRICS_ADDR"):
@@ -82,9 +92,23 @@ async def run() -> None:
             config.symbols,
         )
         await engine.run_forever()
+    except asyncio.CancelledError:
+        logger.info("Trading engine cancelled, shutting down gracefully...")
+        await engine.shutdown_gracefully()
+    except Exception as exc:
+        logger.error("Trading engine crashed: %s", exc, exc_info=True)
+        # FIX #5: Even on crash, try to close open positions.
+        # State is persisted to disk, so on restart positions are loaded.
+        logger.warning("Exiting without graceful shutdown — positions saved to disk")
     finally:
-        await private_ws.stop()
-        await venue.close()
+        try:
+            await private_ws.stop()
+        except Exception:
+            pass
+        try:
+            await venue.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

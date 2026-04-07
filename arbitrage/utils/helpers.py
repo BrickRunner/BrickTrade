@@ -44,18 +44,40 @@ def sign_okx(timestamp: str, method: str, request_path: str, body: str, secret: 
 
 def calculate_spread(bid_price: float, ask_price: float) -> float:
     """
-    Рассчитать спред в процентах
+    Рассчитать спред в процентах.
+
+    For cross-exchange arbitrage: spread = (best_bid_elsewhere - best_ask_here) / best_ask_here * 100
+    Positive = profitable (bid > ask = arbitrage opportunity exists).
+    Negative = not profitable (bid < ask = normal market condition).
+
+    FIX AUDIT #9: The naming was confusing — this is NOT the bid-ask spread
+    within one exchange, but the cross-exchange spread. When bid comes from
+    exchange B and ask from exchange A, positive means B.bid > A.ask.
 
     Args:
-        bid_price: Цена покупки
-        ask_price: Цена продажи
+        bid_price: Best bid price on exchange B (where you can SELL)
+        ask_price: Best ask price on exchange A (where you can BUY)
 
     Returns:
-        Спред в процентах
+        Спред в процентах (positive = cross-exchange arbitrage opportunity)
     """
     if ask_price == 0:
         return 0.0
     return ((bid_price - ask_price) / ask_price) * 100
+
+
+def calculate_bid_ask_spread_pct(bid: float, ask: float) -> float:
+    """
+    Calculate the bid-ask spread as % of mid-price for a single exchange.
+    Always >= 0. Lower = more liquid.
+
+    FIX AUDIT: New function — replaces misuse of calculate_spread for
+    intra-exchange spread measurement.
+    """
+    mid = (bid + ask) / 2.0
+    if mid == 0:
+        return 0.0
+    return (ask - bid) / mid * 100
 
 
 def round_down(value: float, decimals: int) -> float:
@@ -157,23 +179,81 @@ def calculate_position_value(size: float, price: float) -> float:
     return size * price
 
 
-def calculate_pnl(entry_price: float, exit_price: float, size: float, side: str) -> float:
+def calculate_pnl(
+    entry_price: float,
+    exit_price: float,
+    size: float,
+    side: str,
+    fee_rate: float = 0.0,
+) -> float:
     """
-    Рассчитать PnL позиции
+    Рассчитать PnL позиции net of fees.
+
+    FIX AUDIT #8: Previously ignored fees — a "profitable" trade could lose
+    money after fees. Now accepts fee_rate (decimal, e.g. 0.0005 = 0.05%)
+    and deducts it from gross PnL.
 
     Args:
         entry_price: Цена входа
         exit_price: Цена выхода
         size: Размер позиции
         side: Сторона ("LONG" или "SHORT")
+        fee_rate: Trading fee rate per leg (e.g. 0.0005 = 0.05% = 5 bps).
+            Total fee = size × (entry_price + exit_price) × fee_rate
 
     Returns:
-        PnL в USDT
+        PnL в USDT (net of fees)
     """
     if side == "LONG":
-        return (exit_price - entry_price) * size
+        gross_pnl = (exit_price - entry_price) * size
     else:  # SHORT
-        return (entry_price - exit_price) * size
+        gross_pnl = (entry_price - exit_price) * size
+
+    # Deduct fees on both entry and exit legs
+    fee_total = size * (entry_price + exit_price) * fee_rate
+    return gross_pnl - fee_total
+
+
+def calculate_pnl_with_fees(
+    entry_price_long: float,
+    exit_price_long: float,
+    entry_price_short: float,
+    exit_price_short: float,
+    size_usd: float,
+    fee_rate_long: float = 0.0005,
+    fee_rate_short: float = 0.0005,
+    funding_pnl: float = 0.0,
+) -> float:
+    """
+    Calculate total PnL for a cross-exchange arbitrage position, net of fees
+    and including funding income/cost.
+
+    FIX AUDIT #8: New comprehensive PnL function.
+
+    Args:
+        entry_price_long: Entry price on long exchange
+        exit_price_long: Exit price (bid) on long exchange
+        entry_price_short: Entry price (ask) on short exchange
+        exit_price_short: Exit price (bid) on short exchange
+        size_usd: Position notional in USD
+        fee_rate_long: Fee rate on long exchange (e.g. 0.0005 = 5 bps)
+        fee_rate_short: Fee rate on short exchange
+        funding_pnl: Net funding income (+) or cost (-)
+
+    Returns:
+        Total PnL in USD net of all costs
+    """
+    # Long leg PnL
+    long_pnl = ((exit_price_long - entry_price_long) / max(entry_price_long, 1e-9)) * size_usd
+
+    # Short leg PnL
+    short_pnl = ((entry_price_short - exit_price_short) / max(entry_price_short, 1e-9)) * size_usd
+
+    # Fees: entry (2 legs) + exit (2 legs) = 4 fee events
+    entry_fees = size_usd * (fee_rate_long + fee_rate_short)
+    exit_fees = size_usd * (fee_rate_long + fee_rate_short)
+
+    return long_pnl + short_pnl - entry_fees - exit_fees + funding_pnl
 
 
 def usdt_to_htx(symbol: str) -> str:

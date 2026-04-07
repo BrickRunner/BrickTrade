@@ -83,8 +83,11 @@ class OKXPrivateWs:
                 logger.info("OKX private WS: connecting %s", self.ws_url)
                 async with websockets.connect(
                     self.ws_url, ping_interval=20, ping_timeout=10,
+                    max_size=10 * 1024 * 1024,  # 10 MB max message
                 ) as ws:
                     self.ws = ws
+                    self._last_msg_ts = time.monotonic()
+
                     # Authenticate
                     ts = str(int(time.time()))
                     sign = self._sign(ts)
@@ -100,12 +103,23 @@ class OKXPrivateWs:
                     await ws.send(json.dumps(login_msg))
 
                     # Wait for login response
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15)
                     resp = json.loads(raw)
                     if resp.get("event") == "login" and resp.get("code") == "0":
                         logger.info("OKX private WS: authenticated")
+                        self._auth_failures = 0  # reset on success
                     else:
-                        logger.error("OKX private WS: login failed: %s", resp)
+                        # FIX CRITICAL H: Stop re-authenticating after 3 failures
+                        # to prevent log spam + API rate-limit exhaustion.
+                        self._auth_failures = getattr(self, "_auth_failures", 0) + 1
+                        if self._auth_failures >= 3:
+                            logger.critical(
+                                "OKX private WS: %d auth failures, stopping "
+                                "— check API key/passphrase", self._auth_failures,
+                            )
+                            self.running = False
+                            break
+                        logger.error("OKX private WS: login failed (%d/3): %s", self._auth_failures, resp)
                         await asyncio.sleep(5)
                         continue
 
@@ -121,19 +135,44 @@ class OKXPrivateWs:
                     await ws.send(json.dumps(sub))
                     logger.info("OKX private WS: subscribed to account/orders/positions")
 
-                    async for message in ws:
-                        if not self.running:
-                            break
+                    # FIX #2: Robust message loop with zombie-connection detection.
+                    # The `async for ws` pattern can silently exit on some
+                    # websockets library versions when the connection dies
+                    # without raising ConnectionClosed.
+                    # We use an explicit recv loop + heartbeat timestamp
+                    # so we can detect a dead connection by age.
+                    reconnect_reason = "loop_exited"
+                    while self.running:
                         try:
+                            message = await asyncio.wait_for(ws.recv(), timeout=30)
+                            self._last_msg_ts = time.monotonic()
                             data = json.loads(message)
                             await self._handle(data)
+                        except asyncio.TimeoutError:
+                            # No message in 30s — likely zombie connection
+                            logger.warning(
+                                "OKX private WS: no message in 30s, reconnecting"
+                            )
+                            reconnect_reason = "heartbeat_timeout"
+                            break
                         except Exception as e:
-                            logger.error("OKX private WS handle error: %s", e)
+                            logger.error("OKX private WS recv/handle error: %s", e)
+                            reconnect_reason = "recv_error"
+                            break
+
+                    if self.running and reconnect_reason != "stop_requested":
+                        logger.info(
+                            "OKX private WS: reconnecting (reason=%s)",
+                            reconnect_reason,
+                        )
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("OKX private WS: connection closed")
                 if self.running:
                     await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                logger.info("OKX private WS: cancelled")
+                break
             except Exception as e:
                 logger.error("OKX private WS error: %s: %s", type(e).__name__, e)
                 if self.running:
@@ -267,8 +306,10 @@ class HTXPrivateWs:
                     ping_interval=None,  # HTX custom heartbeat
                     ping_timeout=None,
                     close_timeout=5,
+                    max_size=10 * 1024 * 1024,  # 10 MB max message
                 ) as ws:
                     self.ws = ws
+                    self._last_msg_ts = time.monotonic()
 
                     # Authenticate
                     auth_params = self._build_auth_params()
@@ -279,13 +320,24 @@ class HTXPrivateWs:
                     }
                     await ws.send(json.dumps(auth_msg))
 
-                    # Wait for auth response
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    # FIX #8: Increase auth timeout from 10s → 30s
+                    # HTX under load can take 15-20s for auth response.
+                    raw = await asyncio.wait_for(ws.recv(), timeout=30)
                     resp = self._decompress(raw)
                     if resp.get("op") == "auth" and resp.get("err-code") == 0:
                         logger.info("HTX private WS: authenticated")
+                        self._auth_failures = 0  # FIX CRITICAL H: reset on success
                     else:
-                        logger.error("HTX private WS: auth failed: %s", resp)
+                        # FIX CRITICAL H: Stop re-authenticating after 3 failures
+                        self._auth_failures = getattr(self, "_auth_failures", 0) + 1
+                        if self._auth_failures >= 3:
+                            logger.critical(
+                                "HTX private WS: %d auth failures, stopping "
+                                "— check API key/secret", self._auth_failures,
+                            )
+                            self.running = False
+                            break
+                        logger.error("HTX private WS: auth failed (%d/3): %s", self._auth_failures, resp)
                         await asyncio.sleep(5)
                         continue
 
@@ -301,19 +353,38 @@ class HTXPrivateWs:
                         await ws.send(json.dumps(sub))
                     logger.info("HTX private WS: subscribed to accounts/orders/positions")
 
-                    async for raw_msg in ws:
-                        if not self.running:
-                            break
+                    # FIX #2: Robust message loop with heartbeat detection
+                    reconnect_reason = "loop_exited"
+                    while self.running:
                         try:
+                            raw_msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                            self._last_msg_ts = time.monotonic()
                             data = self._decompress(raw_msg)
                             await self._handle(ws, data)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "HTX private WS: no message in 30s, reconnecting"
+                            )
+                            reconnect_reason = "heartbeat_timeout"
+                            break
                         except Exception as e:
-                            logger.error("HTX private WS handle error: %s", e)
+                            logger.error("HTX private WS recv/handle error: %s", e)
+                            reconnect_reason = "recv_error"
+                            break
+
+                    if self.running and reconnect_reason != "stop_requested":
+                        logger.info(
+                            "HTX private WS: reconnecting (reason=%s)",
+                            reconnect_reason,
+                        )
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("HTX private WS: connection closed")
                 if self.running:
                     await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                logger.info("HTX private WS: cancelled")
+                break
             except Exception as e:
                 logger.error("HTX private WS error: %s: %s", type(e).__name__, e)
                 if self.running:
@@ -323,9 +394,20 @@ class HTXPrivateWs:
 
     @staticmethod
     def _decompress(raw) -> Dict:
+        # FIX #10: HTX sends gzip-compressed messages for data,
+        # but error/auth responses may be plain text (not gzip).
         if isinstance(raw, bytes):
-            raw = gzip.decompress(raw)
-        return json.loads(raw)
+            # Check for gzip magic header (0x1f 0x8b)
+            if raw[:2] == b'\x1f\x8b':
+                try:
+                    raw = gzip.decompress(raw)
+                except Exception:
+                    # Fallback: try decoding as plain text if gzip fails
+                    pass
+            else:
+                # Not gzip — likely an error response, skip decompression
+                pass
+        return json.loads(raw) if not isinstance(raw, dict) else raw
 
     async def _handle(self, ws, data: Dict) -> None:
         # Heartbeat
@@ -467,8 +549,10 @@ class BybitPrivateWs:
                 logger.info("Bybit private WS: connecting %s", self.ws_url)
                 async with websockets.connect(
                     self.ws_url, ping_interval=20, ping_timeout=10,
+                    max_size=10 * 1024 * 1024,  # 10 MB max message
                 ) as ws:
                     self.ws = ws
+                    self._last_msg_ts = time.monotonic()
 
                     # Authenticate
                     expires = str(int((time.time() + 10) * 1000))
@@ -480,12 +564,22 @@ class BybitPrivateWs:
                     await ws.send(json.dumps(auth_msg))
 
                     # Wait for auth response
-                    raw = await asyncio.wait_for(ws.recv(), timeout=10)
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15)
                     resp = json.loads(raw)
                     if resp.get("op") == "auth" and resp.get("success"):
                         logger.info("Bybit private WS: authenticated")
+                        self._auth_failures = 0  # FIX CRITICAL H: reset on success
                     else:
-                        logger.error("Bybit private WS: auth failed: %s", resp)
+                        # FIX CRITICAL H: Stop re-authenticating after 3 failures
+                        self._auth_failures = getattr(self, "_auth_failures", 0) + 1
+                        if self._auth_failures >= 3:
+                            logger.critical(
+                                "Bybit private WS: %d auth failures, stopping "
+                                "— check API key/secret", self._auth_failures,
+                            )
+                            self.running = False
+                            break
+                        logger.error("Bybit private WS: auth failed (%d/3): %s", self._auth_failures, resp)
                         await asyncio.sleep(5)
                         continue
 
@@ -497,19 +591,38 @@ class BybitPrivateWs:
                     await ws.send(json.dumps(sub))
                     logger.info("Bybit private WS: subscribed to wallet/execution/order/position")
 
-                    async for message in ws:
-                        if not self.running:
-                            break
+                    # FIX #2: Robust message loop with heartbeat detection
+                    reconnect_reason = "loop_exited"
+                    while self.running:
                         try:
+                            message = await asyncio.wait_for(ws.recv(), timeout=30)
+                            self._last_msg_ts = time.monotonic()
                             data = json.loads(message)
                             await self._handle(data)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Bybit private WS: no message in 30s, reconnecting"
+                            )
+                            reconnect_reason = "heartbeat_timeout"
+                            break
                         except Exception as e:
-                            logger.error("Bybit private WS handle error: %s", e)
+                            logger.error("Bybit private WS recv/handle error: %s", e)
+                            reconnect_reason = "recv_error"
+                            break
+
+                    if self.running and reconnect_reason != "stop_requested":
+                        logger.info(
+                            "Bybit private WS: reconnecting (reason=%s)",
+                            reconnect_reason,
+                        )
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("Bybit private WS: connection closed")
                 if self.running:
                     await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                logger.info("Bybit private WS: cancelled")
+                break
             except Exception as e:
                 logger.error("Bybit private WS error: %s: %s", type(e).__name__, e)
                 if self.running:
@@ -675,21 +788,45 @@ class PrivateWsManager:
     async def _on_order(self, exchange: str, order: Dict) -> None:
         oid = order.get("order_id", "")
         state = order.get("state", "")
-        self._order_data[oid] = order
-
-        # Notify anyone waiting for this order
+        
+        # FIX #10: Cancelled orders (HTX state="7") are NOT fills.
+        # Previously `"7"` (cancelled) was in is_filled set, causing
+        # false "order filled" signals for cancelled orders.
         is_filled = state in {
             "filled", "partially_filled",          # OKX
-            "6", "partial-filled",                  # HTX (6=filled, 7=cancelled)
+            "6", "partial-filled",                  # HTX (6=filled)
             "filled", "partiallyfilled",            # Bybit
         }
+        
         fill_sz = order.get("fill_sz", 0)
-        if is_filled or fill_sz > 0:
+        # FIX #10: Only signal fill event for actual fills (not just fill_sz > 0
+        # which could be stale data from a previous order).
+        if is_filled and fill_sz > 0:
             evt = self._fill_events.get(oid)
             if evt:
                 evt.set()
             logger.debug("private_ws: order fill %s on %s state=%s sz=%.6f",
                          oid, exchange, state, fill_sz)
+        elif fill_sz > 0 and not is_filled:
+            # FIX #11: Log stale events as warnings for diagnostics
+            logger.debug(
+                "private_ws: non-fill with fill_sz>0 %s on %s state=%s sz=%.6f "
+                "(likely stale event, not signalling)",
+                oid, exchange, state, fill_sz,
+            )
+
+        # FIX #11: Store order data for cross-check (with bounded cleanup).
+        self._order_data[oid] = order
+        
+        # Bounded cleanup: remove old order entries to prevent memory leak.
+        # Keep only the most recent 1000 entries.
+        if len(self._order_data) > 1000:
+            # Remove oldest entries (dicts maintain insertion order in Python 3.7+)
+            keys_to_remove = list(self._order_data.keys())[:500]
+            for k in keys_to_remove:
+                self._order_data.pop(k, None)
+                self._order_events.pop(k, None)
+                self._fill_events.pop(k, None)
 
         # Also signal general order event
         evt = self._order_events.get(oid)
@@ -755,6 +892,7 @@ class PrivateWsManager:
         existing = self._order_data.get(order_id)
         if existing:
             state = existing.get("state", "")
+            # FIX #10: HTX state "7" = cancelled, NOT filled
             if state in {"filled", "partially_filled", "6", "partial-filled", "partiallyfilled"}:
                 return True
             if existing.get("fill_sz", 0) > 0:

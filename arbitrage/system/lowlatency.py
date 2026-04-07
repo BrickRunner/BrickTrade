@@ -110,8 +110,9 @@ class LowLatencyExecutionVenue(ExecutionVenue):
     ) -> bool:
         if not order_id:
             return False
-        deadline = asyncio.get_event_loop().time() + (timeout_ms / 1000)
-        while asyncio.get_event_loop().time() < deadline:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (timeout_ms / 1000)
+        while loop.time() < deadline:
             try:
                 if spot:
                     result = await self.get_spot_order(exchange, symbol, order_id)

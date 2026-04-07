@@ -39,10 +39,25 @@ class FeeStats:
 class FeeOptimizer:
     """Dynamically optimize maker/taker execution parameters."""
 
+    # FIX #5: Real taker/maker fees by exchange (VIP-0, bps).
+    # Maker fees are often 0.01-0.02%; some exchanges offer rebates.
+    _TAKER_FEE_BPS: Dict[str, float] = {
+        "binance": 4.0,    # futures: 0.04%
+        "bybit": 5.5,      # linear: 0.055%
+        "okx": 5.0,        # swap: 0.05%
+        "htx": 5.0,        # linear swap: 0.05%
+    }
+    _MAKER_FEE_BPS: Dict[str, float] = {
+        "binance": 2.0,    # futures maker: 0.02%
+        "bybit": 1.0,      # linear maker: 0.01%
+        "okx": 1.0,        # swap maker: 0.01%
+        "htx": 2.0,        # linear swap maker: 0.02%
+    }
+
     def __init__(self):
         self.stats_by_exchange: Dict[str, FeeStats] = {}
-        self._maker_fee_bps = 0.0    # maker fee (negative = rebate)
-        self._taker_fee_bps = 5.0    # typical taker fee
+        self._maker_fee_bps = 1.0    # FIX #5: realistic default
+        self._taker_fee_bps = 5.0    # typical taker
 
     def get_stats(self, exchange: str) -> FeeStats:
         """Get or create stats for an exchange."""
@@ -90,11 +105,18 @@ class FeeOptimizer:
             # Poor fill rate — widen significantly
             return 1.0
 
-        # Additional adjustment for high volatility
+        # FIX #5: Additional adjustment for high volatility.
+        # This code was previously unreachable due to early return.
         if volatility > 0.02:  # >2% volatility
-            return min(fill_rate * 0.015, 1.5)  # cap at 1.5 bps
+            offset = offset * 1.5  # widen by 50% in high vol
+            return min(offset, 1.5)  # cap at 1.5 bps
 
-        return 0.5
+        return float(offset)
+
+    # FIX #5: Reduced minimum attempts before rejecting.
+    # Waiting 20 attempts wastes API calls and money.  5 attempts provides
+    # a reasonable sample while limiting losses.
+    MIN_ATTEMPTS_BEFORE_REJECT = 5
 
     def should_use_maker(
         self,
@@ -105,8 +127,9 @@ class FeeOptimizer:
         """Decide whether to use maker order based on conditions."""
         stats = self.get_stats(exchange)
 
-        # Always try maker for the first N attempts to gather data
-        if stats.maker_attempts < 20:
+        # FIX #5: Only try maker for the first N attempts to gather data.
+        # 5 attempts is sufficient — 20 was excessive and costly.
+        if stats.maker_attempts < self.MIN_ATTEMPTS_BEFORE_REJECT:
             return True
 
         # Check fill rate
@@ -171,6 +194,14 @@ class FeeOptimizer:
         stats = self.get_stats(exchange)
         stats.taker_only += 1
 
+    def get_taker_fee_bps(self, exchange: str) -> float:
+        """Get taker fee for exchange in bps."""
+        return self._TAKER_FEE_BPS.get(exchange, self._taker_fee_bps)
+
+    def get_maker_fee_bps(self, exchange: str) -> float:
+        """Get maker fee for exchange in bps."""
+        return self._MAKER_FEE_BPS.get(exchange, self._maker_fee_bps)
+
     def estimate_fee_saved(
         self,
         exchange: str,
@@ -181,12 +212,10 @@ class FeeOptimizer:
         if not maker_filled:
             return 0.0
 
-        # Typical fee structure:
-        # Maker: -0.02% to +0.01% (often negative = rebate)
-        # Taker: +0.04% to +0.06%
-        # Savings: ~0.05-0.08% (50-80 bps)
-
-        fee_diff_bps = self._taker_fee_bps - self._maker_fee_bps
+        # FIX #5: Use real per-exchange fee rates instead of hardcoded defaults.
+        taker_bps = self.get_taker_fee_bps(exchange)
+        maker_bps = self.get_maker_fee_bps(exchange)
+        fee_diff_bps = taker_bps - maker_bps
         fee_saved_usd = notional_usd * (fee_diff_bps / 10_000)
 
         stats = self.get_stats(exchange)

@@ -26,7 +26,17 @@ from arbitrage.system.strategies.base import BaseStrategy
 logger = logging.getLogger("trading_system")
 
 
-# Default fee rates per exchange (taker, in percent)
+# Default taker fee rates per exchange (in percent).
+# These are conservative *upper-bound* defaults based on each exchange's
+# published VIP-0 taker rates for USDT-margined perpetuals.
+# Actual fees are fetched live via ``snapshot.fee_bps`` when available;
+# these fallbacks are only used when the exchange API does not return fees.
+#
+# Sources (as of Mar-2026, VIP-0):
+#   Binance futures: 0.04% taker
+#   Bybit linear:    0.055% taker
+#   OKX swap:        0.05% taker
+#   HTX linear swap: 0.05% taker (unified margin account, 0.25% is for SPOT)
 _DEFAULT_FEE_PCT: Dict[str, float] = {
     "binance": 0.04,
     "bybit": 0.055,
@@ -160,11 +170,14 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
         # Calculate spread using realistic fill prices
         spread_pct = (sell_price - buy_price) / buy_price * 100
 
-        # Taker fees on both legs
+        # FIX #2: Correct round-trip fee accounting.
+        # Entry: pay taker on long (buy) + taker on short (sell)
+        # Exit:  pay taker on long (sell back) + taker on short (buy back)
+        # All four legs incur exchange taker fees, so total = 2 × (long + short).
         fee_long = self._get_fee_pct(long_ex, snapshot)
         fee_short = self._get_fee_pct(short_ex, snapshot)
         entry_fees_pct = fee_long + fee_short  # one-way entry cost
-        # Full round-trip fees (entry + exit, taker both legs both ways)
+        # Full round-trip fees (entry + exit, both legs)
         total_fees_pct = entry_fees_pct * 2
 
         # Net spread after FULL round-trip fees (entry + exit)
@@ -253,6 +266,11 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
         If funding_rate on one exchange > threshold:
           SHORT on exchange with positive/higher funding (receive payment)
           LONG on exchange with lower funding (pay less)
+
+        FIX CRITICAL #7: Use walk-the-book for realistic fill prices
+        instead of top-of-book, which underestimates spread cost.
+        FIX: Also account for funding payment timing — entering early
+        in the funding period yields more income.
         """
         fr_a = snapshot.funding_rates.get(ex_a)
         fr_b = snapshot.funding_rates.get(ex_b)
@@ -277,16 +295,59 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
             short_ex, long_ex = ex_b, ex_a
             short_ob, long_ob = ob_b, ob_a
 
-        # Check that we're not paying more in spread + fees than we earn in funding
-        # Spread cost is positive when we lose money crossing (buy@ask, sell@bid)
-        spread_cost_pct = (long_ob.ask - short_ob.bid) / long_ob.ask * 100
+        # FIX CRITICAL #7: Use walk-the-book for realistic fill prices
+        # Funding arb often gets rejected because top-of-book underestimates
+        # the real spread cost for positions >$500 notional.
+        est_notional = float(snapshot.balances.get(long_ex, 0.0) or 0.0) * 0.05
+        est_notional = max(est_notional, 500.0)
+
+        buy_price = long_ob.ask   # fallback
+        sell_price = short_ob.bid  # fallback
+
+        long_depth = snapshot.orderbook_depth.get(long_ex)
+        if long_depth:
+            asks = long_depth.get("asks") or []
+            if asks:
+                walked = SlippageModel.walk_book(asks, est_notional)
+                if walked > 0:
+                    buy_price = walked
+
+        short_depth = snapshot.orderbook_depth.get(short_ex)
+        if short_depth:
+            bids = short_depth.get("bids") or []
+            if bids:
+                walked = SlippageModel.walk_book(bids, est_notional)
+                if walked > 0:
+                    sell_price = walked
+
+        # FIX: Adjusted spread cost using walked prices
+        spread_cost_pct = (buy_price - sell_price) / buy_price * 100
         fee_long = self._get_fee_pct(long_ex, snapshot)
         fee_short = self._get_fee_pct(short_ex, snapshot)
         # Full round-trip: entry fees + exit fees + spread crossing cost
         total_round_trip_cost = max(0.0, spread_cost_pct) + (fee_long + fee_short) * 2
 
+        # FIX P2 #10: Correct funding timing using UTC hour alignment.
+        # All supported exchanges (OKX, Bybit, Binance, HTX) settle funding
+        # at fixed UTC hours: 00:00, 04:00, 08:00, 12:00, 16:00, 20:00.
+        # We compute the exact minutes remaining until next settlement.
+        # If we enter 7h into the cycle, only ~1h of funding income is collected.
+        # If we enter at cycle start, full 8h of income is collected.
+        from datetime import datetime, timezone
+        now_utc = datetime.now(timezone.utc)
+        current_hour = now_utc.hour
+        funding_interval_hours = 8
+        # Next funding hour (always on 8h boundary)
+        next_funding_hour = ((current_hour // funding_interval_hours) + 1) % 24
+        minutes_until_funding = (next_funding_hour - current_hour) % 24 * 60 - now_utc.minute
+        if minutes_until_funding < 0:
+            minutes_until_funding += 24 * 60
+        # Fraction of a full funding period remaining
+        remaining_fraction = max(0.1, minutes_until_funding / (funding_interval_hours * 60))
+        adjusted_income = fr_diff_pct * remaining_fraction
+
         # At minimum, one funding period's income should cover round-trip costs
-        if fr_diff_pct < total_round_trip_cost:
+        if adjusted_income < total_round_trip_cost:
             return None
 
         # Cooldown — per direction
@@ -313,18 +374,19 @@ class FuturesCrossExchangeStrategy(BaseStrategy):
                 "funding_rate_diff_pct": round(fr_diff_pct, 4),
                 "funding_long": round(snapshot.funding_rates[long_ex] * 100, 4),
                 "funding_short": round(snapshot.funding_rates[short_ex] * 100, 4),
-                "long_price": long_ob.ask,
-                "short_price": short_ob.bid,
-                "entry_long_price": long_ob.ask,
-                "entry_short_price": short_ob.bid,
-                "entry_mid": (long_ob.ask + short_ob.bid) / 2,
+                "long_price": buy_price,  # FIX #7: Use walked prices
+                "short_price": sell_price,  # FIX #7: Use walked prices
+                "entry_long_price": buy_price,  # FIX #7: Use walked prices
+                "entry_short_price": sell_price,  # FIX #7: Use walked prices
+                "entry_mid": (buy_price + sell_price) / 2,
                 "arb_type": "funding_rate",
                 # Funding arb: exit on TP or timeout only — no SL on PnL.
                 # Funding arb is inherently hedged; PnL noise is spread noise.
                 "take_profit_pct": round(fr_diff_pct / 100, 6),
                 "max_holding_seconds": 28800,  # 8 hours (one funding period)
                 "close_edge_bps": 0.5,
-                "limit_prices": {"buy": long_ob.ask, "sell": short_ob.bid},
+                # FIX #7: Use walked prices for IOC limit orders instead of top-of-book
+                "limit_prices": {"buy": buy_price, "sell": sell_price},
             },
         )
 

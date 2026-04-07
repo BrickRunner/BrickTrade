@@ -72,6 +72,12 @@ class _EngineState:
             return "done"
 
     async def shutdown(self) -> None:
+        # FIX #5: Graceful shutdown — close open positions before stopping
+        if self.engine:
+            try:
+                await self.engine.shutdown_gracefully()
+            except Exception:
+                logger.error("graceful_shutdown_failed: %s", self.engine, exc_info=True)
         task = self.task
         self.task = None
         if task and not task.done():
@@ -401,6 +407,15 @@ async def _start_engine(bot, user_id: int) -> str:
         config = TradingSystemConfig.from_env()
         config.validate()
         clients = build_exchange_clients(config)
+
+        # FIX P2: Verify API keys actually work before starting engine.
+        if not config.execution.dry_run:
+            try:
+                await config.validate_api_credentials(clients)
+            except RuntimeError as exc:
+                logger.error("telegram_api_key_validation_failed: %s", exc)
+                raise
+
         market_data = MarketDataEngine(clients)
         provider = LiveMarketDataProvider(market_data=market_data, exchanges=config.exchanges)
         await provider.initialize()

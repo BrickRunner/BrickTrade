@@ -74,8 +74,11 @@ class SystemState:
         self._kill_switch_permanent = False
         self._history: List[EquityPoint] = [EquityPoint(ts=time.time(), equity=starting_equity)]
         self._positions_file = positions_file or _POSITIONS_FILE
+        # FIX CRITICAL A: Persistent kill switch state across restarts
+        self._kill_switch_file = self._positions_file.replace(".json", "_killswitch.json") if self._positions_file else None
         if self._positions_file != ":memory:":
             self._load_positions()
+            self._load_kill_switch_state()
 
     def _maybe_reset_daily(self) -> None:
         today = date.today()
@@ -83,9 +86,11 @@ class SystemState:
             self._daily_start_equity = self._equity
             self._daily_reset_date = today
             # Auto-reset kill switch on new day (daily drawdown resets)
-            self._kill_switch = False
-            self._kill_switch_permanent = False
-            self._kill_switch_ts = 0.0
+            # FIX CRITICAL A: Do NOT auto-reset permanent kill switch —
+            # permanent kill switch requires explicit manual reset.
+            if not self._kill_switch_permanent:
+                self._kill_switch = False
+                self._kill_switch_ts = 0.0
 
     async def set_equity(self, equity: float) -> None:
         async with self._lock:
@@ -146,6 +151,8 @@ class SystemState:
             self._kill_switch_ts = time.time()
             if permanent:
                 self._kill_switch_permanent = True
+        # FIX CRITICAL A: Persist kill switch state to disk
+        self._persist_kill_switch()
 
     async def kill_switch_triggered(self) -> bool:
         async with self._lock:
@@ -164,6 +171,8 @@ class SystemState:
             self._kill_switch = False
             self._kill_switch_permanent = False
             self._kill_switch_ts = 0.0
+        # FIX CRITICAL A: Persist cleared kill switch state to disk
+        self._persist_kill_switch()
 
     async def drawdowns(self) -> Dict[str, float]:
         async with self._lock:
@@ -224,3 +233,45 @@ class SystemState:
                 os.replace(tmp, self._positions_file)
             except Exception as exc:
                 logger.warning("Failed to persist positions (sync fallback): %s", exc)
+
+    # ─── FIX CRITICAL A: Kill switch persistence ────────────────────────
+
+    def _load_kill_switch_state(self) -> None:
+        """Load kill switch state from disk on startup. Ensures kill switch
+        survives process restarts and isn't silently cleared."""
+        if not self._kill_switch_file:
+            return
+        try:
+            if os.path.exists(self._kill_switch_file):
+                with open(self._kill_switch_file, "r") as f:
+                    data = json.load(f)
+                self._kill_switch = data.get("kill_switch", False)
+                self._kill_switch_ts = float(data.get("kill_switch_ts", 0.0))
+                self._kill_switch_permanent = data.get("kill_switch_permanent", False)
+                if self._kill_switch:
+                    logger.warning(
+                        "Kill switch LOADED from disk: active=%s permanent=%s ts=%.0f",
+                        self._kill_switch, self._kill_switch_permanent, self._kill_switch_ts,
+                    )
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            logger.warning("Failed to load kill switch state (corrupted data): %s", exc)
+        except OSError as exc:
+            logger.warning("Failed to load kill switch state (I/O error): %s", exc)
+
+    def _persist_kill_switch(self) -> None:
+        """Atomically persist kill switch state to disk."""
+        if not self._kill_switch_file:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._kill_switch_file) or ".", exist_ok=True)
+            data = {
+                "kill_switch": self._kill_switch,
+                "kill_switch_ts": self._kill_switch_ts,
+                "kill_switch_permanent": self._kill_switch_permanent,
+            }
+            tmp = self._kill_switch_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, self._kill_switch_file)
+        except Exception as exc:
+            logger.warning("Failed to persist kill switch: %s", exc)

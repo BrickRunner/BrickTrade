@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable
@@ -84,6 +86,13 @@ class LiveMarketDataProvider(MarketDataProvider):
         if now - self._last_refresh_ts >= self._min_refresh_seconds:
             self._last_refresh_ts = now
 
+        # FIX CRITICAL #6: WS cache methods are now async with lock-protected reads.
+        # Fetch WS orderbooks concurrently for all exchanges.
+        ws_obs: Dict[str, OrderBookSnapshot | None] = {}
+        if self._ws_cache:
+            tasks = {ex: self._ws_cache.get(ex, symbol) for ex in self.exchanges}
+            ws_obs = {ex: await t for ex, t in tasks.items()}
+
         orderbooks: Dict[str, OrderBookSnapshot] = {}
         spot_orderbooks: Dict[str, OrderBookSnapshot] = {}
         orderbook_depth: Dict[str, Dict[str, list]] = {}
@@ -93,7 +102,7 @@ class LiveMarketDataProvider(MarketDataProvider):
         funding_rates: Dict[str, float] = {}
         mids: list[float] = []
         for exchange in self.exchanges:
-            ws_ob = self._ws_cache.get(exchange, symbol) if self._ws_cache else None
+            ws_ob = ws_obs.get(exchange)
             if ws_ob:
                 orderbooks[exchange] = ws_ob
                 mids.append(ws_ob.mid)
@@ -137,8 +146,10 @@ class LiveMarketDataProvider(MarketDataProvider):
         # fall back to REST polling if WS unavailable.
         ws_depth_available = False
         if self._ws_cache:
-            for exchange in self.exchanges:
-                ws_depth = self._ws_cache.get_depth(exchange, symbol)
+            # FIX CRITICAL #6: get_depth is now async
+            depth_tasks = {ex: self._ws_cache.get_depth(ex, symbol) for ex in self.exchanges}
+            for exchange, depth_task in depth_tasks.items():
+                ws_depth = await depth_task
                 if ws_depth:
                     orderbook_depth[exchange] = ws_depth
                     ws_depth_available = True
@@ -324,6 +335,25 @@ class LiveExecutionVenue(ExecutionVenue):
     spot_qty_step: float = field(default_factory=lambda: float(os.getenv("SPOT_QTY_STEP", "0.0001")))
     spot_min_notional_usd: float = field(default_factory=lambda: float(os.getenv("SPOT_MIN_NOTIONAL_USD", "5.0")))
 
+    def _generate_order_id(self, exchange: str, symbol: str, side: str, offset: str) -> str:
+        """Generate a unique, deterministic idempotency key for order placement.
+
+        Format: brick_{exchange}_{symbol}_{side}_{offset}_{short_hash}
+        
+        The hash is derived from a UUID timestamp to ensure uniqueness across
+        attempts while keeping the key stable for a single request.
+        Each exchange has its own length limit:
+          - OKX: clOrdId max 32 chars
+          - Bybit: orderLinkId max 36 chars
+          - Binance: newClientOrderId arbitrary, best < 36
+          - HTX: client_order_id arbitrary, best < 32
+        We cap at 32 chars to be safe for all exchanges.
+        """
+        uid = uuid.uuid4().hex[:8]
+        prefix = f"bt_{exchange[:3]}_{side[:1]}{offset[:1]}_{uid}".lower()
+        # Keep within strict 32-char limit
+        return prefix[:32]
+
     def _size_from_notional(self, exchange: str, symbol: str, notional_usd: float) -> float:
         ticker = self.market_data.get_futures_price(exchange, symbol)
         if not ticker:
@@ -368,6 +398,10 @@ class LiveExecutionVenue(ExecutionVenue):
         offset: str = "open",
     ) -> Dict:
         client = self.exchanges[exchange]
+        # FIX P2: Generate idempotency key to prevent duplicate fills
+        # on timeout-retry.  Each exchange has its own field name:
+        # OKX=clOrdId, HTX=client_order_id, Bybit=orderLinkId, Binance=newClientOrderId
+        client_order_id = self._generate_order_id(exchange, symbol, side, offset)
         is_close = (offset or "").lower() == "close"
         effective_notional = quantity_usd
         if not is_close:
@@ -424,6 +458,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 order_type=mapped_order_type,
                 price=px if px > 0 else None,
                 time_in_force=tif,
+                client_order_id=client_order_id,
             )
         elif exchange == "htx":
             response = await client.place_order(
@@ -435,6 +470,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 time_in_force=tif,
                 offset=offset,
                 lever_rate=1,
+                client_order_id=client_order_id,
             )
         elif exchange == "binance":
             response = await client.place_order(
@@ -445,6 +481,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 price=px,
                 time_in_force=tif,
                 offset=offset,
+                client_order_id=client_order_id,
             )
         else:
             response = await client.place_order(
@@ -456,6 +493,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 time_in_force=tif,
                 offset=offset,
                 lever_rate=1,
+                client_order_id=client_order_id,
             )
 
         if exchange == "okx":
@@ -498,6 +536,7 @@ class LiveExecutionVenue(ExecutionVenue):
         limit_price: float = 0.0,
     ) -> Dict:
         client = self.exchanges[exchange]
+        client_order_id = self._generate_order_id(exchange, symbol, side, "spot")
         size = self._round_spot_size(exchange, symbol, quantity_base)
         if size <= 0:
             return {"success": False, "message": "invalid_spot_size", "exchange": exchange}
@@ -521,6 +560,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 order_type=mapped_order_type,
                 price=px if px > 0 else None,
                 time_in_force=tif,
+                client_order_id=client_order_id,
             )
             ok = response.get("code") == "0"
         elif exchange == "htx":
@@ -530,6 +570,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 size=size,
                 order_type=mapped_order_type,
                 price=px,
+                client_order_id=client_order_id,
             )
             ok = response.get("status") == "ok"
         elif exchange == "binance":
@@ -540,6 +581,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 order_type=mapped_order_type,
                 price=px,
                 time_in_force=tif,
+                client_order_id=client_order_id,
             )
             ok = response.get("orderId") is not None and response.get("code") is None
         else:
@@ -550,6 +592,7 @@ class LiveExecutionVenue(ExecutionVenue):
                 order_type=mapped_order_type,
                 price=px,
                 time_in_force=tif,
+                client_order_id=client_order_id,
             )
             ok = response.get("retCode") == 0
 

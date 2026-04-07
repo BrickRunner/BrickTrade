@@ -1,0 +1,28 @@
+{
+  "positions": {
+    "legacy:bybit:BTCUSDT:LONG": {
+      "type": "Position",
+      "exchange": "bybit",
+      "symbol": "BTCUSDT",
+      "side": "LONG",
+      "size": 1.0,
+      "entry_price": 50000.0,
+      "order_id": null
+    },
+    "legacy:bybit:BTCUSDT:SHORT": {
+      "type": "Position",
+      "exchange": "bybit",
+      "symbol": "BTCUSDT",
+      "side": "SHORT",
+      "size": 1.0,
+      "entry_price": 50000.0,
+      "order_id": null
+    }
+  },
+  "total_trades": 0,
+  "total_pnl": 0.0,
+  "balances": {
+    "okx": 500.0,
+    "htx": 500.0
+  }
+}

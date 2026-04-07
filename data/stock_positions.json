@@ -1,0 +1,22 @@
+[
+  {
+    "position_id": "b7c00f8e-3c37-46f7-8a94-00df8a5118b4",
+    "strategy_id": "volume_spike",
+    "ticker": "IRAO",
+    "side": "buy",
+    "quantity_lots": 2,
+    "entry_price": 3.2185,
+    "stop_loss_price": 3.2088,
+    "take_profit_price": 3.2346,
+    "lot_size": 100,
+    "opened_at": 1775559659.9661326,
+    "realized_pnl": 0.0,
+    "peak_price": 3.2185,
+    "trailing_stop_pct": 2.0,
+    "metadata": {
+      "vol_spike": 4.11,
+      "cvd": 0.415,
+      "vwap": 3.2202
+    }
+  }
+]

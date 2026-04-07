@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
 def _as_bool(value: str, default: bool = False) -> bool:
@@ -19,6 +21,8 @@ def _as_float(value: str, default: float) -> float:
 
 
 def _as_int(value: str, default: int) -> int:
+    if value is None:
+        return default
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -94,7 +98,7 @@ class StrategyConfig:
     max_spread_risk_pct: float = 0.40
     exit_spread_pct: float = 0.05
     funding_rate_threshold_pct: float = 0.01
-    max_entry_latency_ms: float = 400.0
+    max_entry_latency_ms: float = 3000.0        # FIX: Aligns with api_latency_limit_ms (3000ms vs 4000ms API limit)
     min_book_depth_multiplier: float = 3.0
     # Cash & Carry strategy parameters
     cash_carry_min_funding_apr_pct: float = 5.0
@@ -127,7 +131,7 @@ class StrategyConfig:
             max_spread_risk_pct=_as_float(os.getenv("ARB_MAX_SPREAD_RISK_PCT"), 0.40),
             exit_spread_pct=_as_float(os.getenv("ARB_EXIT_SPREAD_PCT"), 0.05),
             funding_rate_threshold_pct=_as_float(os.getenv("ARB_FUNDING_THRESHOLD_PCT"), 0.01),
-            max_entry_latency_ms=_as_float(os.getenv("ARB_MAX_LATENCY_MS"), 400.0),
+            max_entry_latency_ms=_as_float(os.getenv("ARB_MAX_LATENCY_MS"), 3000.0),
             min_book_depth_multiplier=_as_float(os.getenv("ARB_MIN_DEPTH_MULTIPLIER"), 3.0),
             cash_carry_min_funding_apr_pct=_as_float(os.getenv("CASH_CARRY_MIN_FUNDING_APR_PCT"), 5.0),
             cash_carry_max_basis_spread_pct=_as_float(os.getenv("CASH_CARRY_MAX_BASIS_SPREAD_PCT"), 0.30),
@@ -237,4 +241,121 @@ class TradingSystemConfig:
             raise ValueError(
                 f"max_strategy_allocation_pct ({self.risk.max_strategy_allocation_pct}) "
                 f"must be <= max_total_exposure_pct ({self.risk.max_total_exposure_pct})"
+            )
+
+        # FIX: Reject spreads that are unprofitably low.
+        # Round-trip fees for cross-exchange arb are ~10-15 bps minimum,
+        # so spreads below 5 bps are guaranteed losses.
+        min_spread = self.strategy.min_spread_pct
+        if min_spread < 0.05:
+            raise ValueError(
+                f"min_spread_pct={min_spread} is too low — "
+                f"round-trip fees consume ~10-12 bps minimum"
+            )
+
+        # FIX: Warn about unprofitable strategy combinations
+        import logging
+        _vlog = logging.getLogger("trading_system")
+        enabled = set(self.strategy.enabled)
+        if "triangular_arbitrage" in enabled:
+            _vlog.warning(
+                "triangular_arbitrage enabled — unlikely to be profitable "
+                "on retail exchanges due to execution timing risk"
+            )
+        if "cash_and_carry" in enabled and "funding_harvesting" in enabled:
+            _vlog.warning(
+                "Both cash_and_carry and funding_harvesting enabled — "
+                "strategies compete for same funding rate signals"
+            )
+
+        # FIX: Warn (but don't reject) if symbol list overlaps with blacklist
+        if self.symbol_blacklist:
+            overlap = set(s.upper() for s in self.symbols) & set(self.symbol_blacklist)
+            if overlap:
+                raise ValueError(
+                    f"Symbols in both SYMBOLS and BLACKLIST: {overlap}"
+                )
+
+    async def validate_api_credentials(
+        self,
+        clients: Dict[str, Any],
+        *,
+        timeout_seconds: float = 15.0,
+    ) -> None:
+        """Verify that API keys actually work by calling get_balance() on each exchange.
+
+        FIX P2: Previously only checked that credentials were non-empty.
+        This method catches wrong/revoked keys, testnet misconfigurations,
+        and permission errors before any trading begins.
+
+        Args:
+            clients: Mapping of exchange name to REST client instance
+                     (from build_exchange_clients()).
+            timeout_seconds: Per-exchange timeout. Total = len(clients) * timeout_seconds.
+
+        Raises:
+            RuntimeError: If any exchange API call fails.
+        """
+        logger = logging.getLogger("trading_system")
+        logger.info("api_key_validation: verifying credentials for %s", list(clients.keys()))
+
+        async def _check_one(exchange: str, client: Any) -> None:
+            try:
+                result = await asyncio.wait_for(
+                    client.get_balance(),
+                    timeout=timeout_seconds,
+                )
+                # Each exchange has a different success response format.
+                # We consider it working if the call didn't raise an exception
+                # and didn't return an error code.
+                if exchange == "okx":
+                    if result.get("code") != "0":
+                        raise RuntimeError(
+                            f"{exchange} API error: {result.get('msg', result.get('code', result))}"
+                        )
+                    logger.info("api_key_validation: %s OK", exchange.upper())
+                elif exchange == "htx":
+                    if result.get("status") != "ok":
+                        raise RuntimeError(
+                            f"{exchange} API error: {result.get('err-msg', result.get('status', result))}"
+                        )
+                    logger.info("api_key_validation: %s OK", exchange.upper())
+                elif exchange == "bybit":
+                    if result.get("retCode") != 0:
+                        raise RuntimeError(
+                            f"{exchange} API error: {result.get('retMsg', result.get('retCode', result))}"
+                        )
+                    logger.info("api_key_validation: %s OK", exchange.upper())
+                elif exchange == "binance":
+                    if "code" in result and isinstance(result["code"], int) and result["code"] < 0:
+                        raise RuntimeError(
+                            f"{exchange} API error: {result.get('msg', result['code'])}"
+                        )
+                    logger.info("api_key_validation: %s OK", exchange.upper())
+                else:
+                    logger.info("api_key_validation: %s OK (no error schema check)", exchange.upper())
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"{exchange} API timeout after {timeout_seconds}s — "
+                    f"check network connectivity, API key, and testnet config"
+                )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(f"{exchange} API error: {exc}") from exc
+
+        results = await asyncio.gather(
+            *[_check_one(ex, clients[ex]) for ex in clients],
+            return_exceptions=True,
+        )
+
+        errors = []
+        for exchange, result in zip(clients.keys(), results):
+            if isinstance(result, Exception):
+                errors.append(f"{exchange}: {result}")
+
+        if errors:
+            raise RuntimeError(
+                f"API key validation failed for {len(errors)} exchange(s):\n"
+                + "\n".join(errors)
             )

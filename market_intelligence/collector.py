@@ -16,6 +16,18 @@ logger = logging.getLogger("market_intelligence")
 
 @dataclass
 class ExchangeCircuitBreaker:
+    """Data collection circuit breaker (separate from trade execution breaker).
+
+    This circuit breaker protects the market_intelligence module's REST polling
+    against exchange outages with shorter cooldowns (300s vs 600s for the
+    trading circuit breaker in arbitrage/system/circuit_breaker.py).
+
+    Different concerns:
+    - Trading breaker: prevents placing orders on unhealthy exchanges (money at risk)
+    - Data breaker: stops wasted REST polling on unhealthy exchanges (rate limit risk)
+
+    Both track the same exchanges but with independent error counts and cooldown timers.
+    """
     exchange: str
     failure_count: int = 0
     last_failure: float = 0.0

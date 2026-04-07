@@ -65,15 +65,23 @@ class MarketDataEngine:
         self._latency: Dict[str, float] = {}
 
     async def initialize(self) -> int:
-        """Fetch instruments from all exchanges, find common pairs. Returns pair count."""
+        """Fetch instruments from all exchanges, find common pairs. Returns pair count.
+
+        FIX #6: Spot instrument errors are now logged per-exchange instead of being
+        silently swallowed. Both futures and spot errors are tracked.
+        """
         tasks = {}
         for name in self.exchanges:
             tasks[name] = asyncio.ensure_future(self._fetch_instruments(name))
 
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
 
+        # FIX #6: Collect and log spot instrument errors instead of silently dropping them.
         spot_tasks = {name: asyncio.ensure_future(self._fetch_spot_instruments(name)) for name in self.exchanges}
-        await asyncio.gather(*spot_tasks.values(), return_exceptions=True)
+        spot_results = await asyncio.gather(*spot_tasks.values(), return_exceptions=True)
+        for name, result in zip(spot_tasks.keys(), spot_results):
+            if isinstance(result, Exception):
+                logger.error(f"Failed to fetch {name} spot instruments: {result}")
 
         for name, result in zip(tasks.keys(), results):
             if isinstance(result, Exception):

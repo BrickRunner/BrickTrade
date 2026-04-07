@@ -12,6 +12,24 @@ import time
 from typing import Dict, Any, Optional
 from urllib.parse import urlencode
 
+# FIX: Custom exception types so callers can differentiate errors
+class BinanceAPIError(Exception):
+    """Binance API returned an error response."""
+    def __init__(self, code: int, msg: str):
+        self.code = code
+        self.msg = msg
+        super().__init__(f"Binance API error {code}: {msg}")
+
+
+class BinanceNetworkError(Exception):
+    """Network or connection error when calling Binance API."""
+    pass
+
+
+class BinanceTimeoutError(Exception):
+    """Request timed out."""
+    pass
+
 from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, get_rate_limiter
 
 logger = get_arbitrage_logger("binance_rest")
@@ -19,7 +37,7 @@ _EXCHANGE = "binance"
 
 BASE_URL = "https://fapi.binance.com"
 SPOT_BASE_URL = "https://api.binance.com"
-RECV_WINDOW = 5000
+RECV_WINDOW = 5000  # Binance max is 5000ms; higher values cause order rejections
 
 
 class BinanceRestClient:
@@ -32,6 +50,9 @@ class BinanceRestClient:
 
         self.public_only = not self.api_key or not self.api_secret
         self.session: Optional[aiohttp.ClientSession] = None
+        # FIX CRITICAL #3: Lazy session lock — created inside _get_session() so
+        # it's bound to the running event loop, not the __init__ context.
+        self._session_lock: Optional[asyncio.Lock] = None
 
         if self.testnet:
             self.base_url = "https://testnet.binancefuture.com"
@@ -41,15 +62,20 @@ class BinanceRestClient:
     # --- Session ---
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=100,
-                limit_per_host=30,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-            )
-            self.session = aiohttp.ClientSession(connector=connector)
-        return self.session
+        # FIX CRITICAL #3: Lazy lock creation ensures asyncio.Lock is bound
+        # to the active event loop, not the __init__ context.
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=100,
+                    limit_per_host=30,
+                    ttl_dns_cache=300,
+                    enable_cleanup_closed=True,
+                )
+                self.session = aiohttp.ClientSession(connector=connector)
+            return self.session
 
     # --- Auth ---
 
@@ -93,12 +119,26 @@ class BinanceRestClient:
                         continue
                     limiter.record_success(_EXCHANGE)
                     return await resp.json(content_type=None)
+            except asyncio.TimeoutError as e:
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.error(f"Public request timeout {endpoint}: {e}")
+                    raise BinanceTimeoutError(f"Timeout on {endpoint}: {e}")
+            except aiohttp.ClientError as e:
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.error(f"Public request network error {endpoint}: {e}")
+                    raise BinanceNetworkError(f"Network error on {endpoint}: {e}")
+            except BinanceAPIError:
+                raise
             except Exception as e:
                 if attempt < 2:
                     await asyncio.sleep(0.5)
                 else:
                     logger.error(f"Public request error {endpoint}: {e}")
-                    return {}
+                    raise
 
     # --- Private Request ---
 
@@ -253,6 +293,7 @@ class BinanceRestClient:
         time_in_force: str = "",
         offset: str = "open",
         lever_rate: int = 1,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Place a futures order.
@@ -260,6 +301,7 @@ class BinanceRestClient:
         side: "buy" / "sell" (mapped to BUY/SELL)
         order_type: "limit" / "market" / "ioc"
         offset: "close" maps to reduceOnly=true
+        client_order_id: Optional idempotency key (Binance: newClientOrderId).
         """
         binance_side = side.upper()
 
@@ -281,6 +323,8 @@ class BinanceRestClient:
             "type": binance_type,
             "quantity": str(size),
         }
+        if client_order_id:
+            body["newClientOrderId"] = client_order_id[:36]
 
         if binance_type == "LIMIT" and price > 0:
             body["price"] = str(price)
@@ -299,6 +343,7 @@ class BinanceRestClient:
         order_type: str = "limit",
         price: float = 0.0,
         time_in_force: str = "",
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         binance_side = side.upper()
         binance_type = "MARKET"
@@ -318,6 +363,8 @@ class BinanceRestClient:
             "type": binance_type,
             "quantity": str(size),
         }
+        if client_order_id:
+            body["newClientOrderId"] = client_order_id[:36]
         if binance_type == "LIMIT" and price > 0:
             body["price"] = str(price)
             body["timeInForce"] = tif or "GTC"

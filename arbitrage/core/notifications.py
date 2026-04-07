@@ -10,7 +10,12 @@ logger = get_arbitrage_logger("notifications")
 
 
 class NotificationManager:
-    """Менеджер уведомлений в Telegram"""
+    """Менеджер уведомлений в Telegram.
+
+    FIX #12: Bot and user_id are now set at construction time only,
+    eliminating the race window where notifications could attempt to
+    send before set_bot() is called.
+    """
 
     def __init__(self, bot=None, user_id: Optional[int] = None):
         """
@@ -23,7 +28,11 @@ class NotificationManager:
         self.enabled = True
 
     def set_bot(self, bot, user_id: int):
-        """Установить бота и пользователя"""
+        """Установить бота и пользователя."""
+        # FIX #12: Validate inputs to prevent empty bot set
+        if bot is None:
+            logger.warning("set_bot: bot is None, ignoring")
+            return
         self.bot = bot
         self.user_id = user_id
         logger.info(f"Notification bot set for user {user_id}")

@@ -7,10 +7,13 @@ HTX (Huobi) WebSocket клиент для получения стаканов о
   Сжатие: gzip (каждое сообщение нужно декомпрессировать)
 
 Документация: https://www.htx.com/en-us/opend/newApiPages/
+
+FIX C2: Added heartbeat tracking via _last_msg_ts to detect zombie connections.
 """
 import asyncio
 import gzip
 import json
+import time
 from typing import Callable, Optional, Dict, Any
 
 import websockets
@@ -35,6 +38,8 @@ class HTXWebSocket:
         self.running = False
         self.callback: Optional[Callable] = None
         self._ping_id = 0
+        # FIX C2: heartbeat tracking
+        self._last_msg_ts: float = 0.0
 
         # HTX не имеет официального тестнета для свопов — используем основной URL
         self.ws_url = WS_URL
@@ -60,6 +65,7 @@ class HTXWebSocket:
                     close_timeout=5,
                 ) as ws:
                     self.ws = ws
+                    self._last_msg_ts = time.monotonic()  # FIX C2: heartbeat
                     logger.info("Connected to HTX WebSocket")
 
                     # Подписка на стакан (step0 = все уровни, step5 = 20 уровней)
@@ -70,15 +76,34 @@ class HTXWebSocket:
                     await ws.send(json.dumps(sub_msg))
                     logger.info(f"Subscribed to HTX orderbook: {self.htx_symbol}")
 
-                    # Обработка сообщений
-                    async for raw in ws:
-                        if not self.running:
+                    # FIX C2: Explicit recv loop with heartbeat + callback isolation
+                    while self.running:
+                        # Heartbeat check: >60s without message → reconnect
+                        if time.monotonic() - self._last_msg_ts > 60:
+                            logger.warning(
+                                "HTX WebSocket: heartbeat timeout (%.0fs), reconnecting",
+                                time.monotonic() - self._last_msg_ts,
+                            )
                             break
                         try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=30)
                             data = self._decompress(raw)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "HTX WebSocket: no message in 30s, reconnecting",
+                            )
+                            break
+                        except websockets.exceptions.ConnectionClosed:
+                            break
+                        except Exception as e:
+                            logger.error(f"Error receiving HTX message: {e}", exc_info=True)
+                            break
+
+                        # Callback isolation: exceptions in handler do NOT break recv loop
+                        try:
                             await self._handle_message(ws, data)
                         except Exception as e:
-                            logger.error(f"Error handling HTX message: {e}", exc_info=True)
+                            logger.error(f"HTX _handle_message error: {e}", exc_info=True)
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("HTX WebSocket connection closed")
@@ -99,6 +124,7 @@ class HTXWebSocket:
 
     async def _handle_message(self, ws, data: Dict[str, Any]) -> None:
         """Обработка входящего сообщения"""
+        self._last_msg_ts = time.monotonic()  # FIX C2: update heartbeat on every message
 
         # Heartbeat — HTX присылает {"ping": <ts>}, нужно ответить {"pong": <ts>}
         if "ping" in data:
@@ -151,5 +177,10 @@ class HTXWebSocket:
         logger.info("Disconnected from HTX WebSocket")
 
     def is_connected(self) -> bool:
-        """Проверка состояния подключения"""
-        return self.ws is not None and not self.ws.closed
+        """Check connection + heartbeat."""
+        if self.ws is None or self.ws.closed:
+            return False
+        # FIX C2: zombie detection — heartbeat timeout means connection is stale
+        if time.monotonic() - self._last_msg_ts > 60:
+            return False
+        return True

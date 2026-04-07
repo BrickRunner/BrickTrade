@@ -1,0 +1,10 @@
+{
+  "enabled": [
+    "futures_cross_exchange",
+    "cash_and_carry",
+    "funding_arbitrage",
+    "triangular",
+    "pairs_trading",
+    "funding_harvesting"
+  ]
+}

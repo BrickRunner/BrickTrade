@@ -31,6 +31,8 @@ class BybitRestClient:
 
         self.public_only = not self.api_key or not self.api_secret
         self.session: Optional[aiohttp.ClientSession] = None
+        # FIX CRITICAL #3: Lazy session lock — created inside _get_session()
+        self._session_lock: Optional[asyncio.Lock] = None
 
         if self.testnet:
             self.base_url = "https://api-testnet.bybit.com"
@@ -40,15 +42,19 @@ class BybitRestClient:
     # ─── Session ──────────────────────────────────────────────────────────────
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=100,
-                limit_per_host=30,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-            )
-            self.session = aiohttp.ClientSession(connector=connector)
-        return self.session
+        # FIX CRITICAL #3: Lazy lock creation for event-loop safety
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=100,
+                    limit_per_host=30,
+                    ttl_dns_cache=300,
+                    enable_cleanup_closed=True,
+                )
+                self.session = aiohttp.ClientSession(connector=connector)
+            return self.session
 
     # ─── Auth ─────────────────────────────────────────────────────────────────
 
@@ -315,6 +321,7 @@ class BybitRestClient:
         time_in_force: str = "",
         offset: str = "open",
         lever_rate: int = 1,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Разместить ордер.
@@ -322,6 +329,7 @@ class BybitRestClient:
         side: "Buy" или "Sell" (Bybit capitalize, но мы конвертируем)
         order_type: "limit" / "market" / "ioc"
         offset: "open" / "close" — close maps to reduceOnly=true
+        client_order_id: Optional idempotency key (Bybit: orderLinkId).
         """
         bybit_side = side.capitalize()  # "buy" → "Buy", "sell" → "Sell"
 
@@ -345,6 +353,8 @@ class BybitRestClient:
             "orderType": bybit_type,
             "qty": str(size),
         }
+        if client_order_id:
+            body["orderLinkId"] = client_order_id[:36]  # Bybit max 36 chars
 
         if bybit_type == "Limit" and price > 0:
             body["price"] = str(price)
@@ -365,6 +375,7 @@ class BybitRestClient:
         order_type: str = "limit",
         price: float = 0.0,
         time_in_force: str = "",
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         bybit_side = side.capitalize()
         bybit_type = "Market"
@@ -386,6 +397,8 @@ class BybitRestClient:
             "orderType": bybit_type,
             "qty": str(size),
         }
+        if client_order_id:
+            body["orderLinkId"] = client_order_id[:36]
         if bybit_type == "Limit" and price > 0:
             body["price"] = str(price)
         if time_in_force:

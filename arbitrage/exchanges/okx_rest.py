@@ -4,11 +4,11 @@ OKX REST API клиент
 import asyncio
 import aiohttp
 import json
+import time
 import hmac
 import hashlib
 import base64
-from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from arbitrage.utils import get_arbitrage_logger, ExchangeConfig, get_rate_limiter
 
@@ -31,19 +31,25 @@ class OKXRestClient:
             self.base_url = "https://www.okx.com"
 
         self.session: Optional[aiohttp.ClientSession] = None
+        # FIX CRITICAL #3: Lazy session lock — created inside _get_session()
+        self._session_lock: Optional[asyncio.Lock] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Получить или создать HTTP сессию с оптимизированным connection pooling"""
-        if self.session is None or self.session.closed:
-            # Создаем коннектор с оптимизациями для максимальной скорости
-            connector = aiohttp.TCPConnector(
-                limit=100,  # Максимум 100 соединений
-                limit_per_host=30,  # Максимум 30 соединений к одному хосту
-                ttl_dns_cache=300,  # Кэш DNS на 5 минут
-                enable_cleanup_closed=True  # Автоочистка закрытых соединений
-            )
-            self.session = aiohttp.ClientSession(connector=connector)
-        return self.session
+        # FIX CRITICAL #3: Lazy lock creation for event-loop safety
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                # Создаем коннектор с оптимизациями для максимальной скорости
+                connector = aiohttp.TCPConnector(
+                    limit=100,  # Максимум 100 соединений
+                    limit_per_host=30,  # Максимум 30 соединений к одному хосту
+                    ttl_dns_cache=300,  # Кэш DNS на 5 минут
+                    enable_cleanup_closed=True  # Автоочистка закрытых соединений
+                )
+                self.session = aiohttp.ClientSession(connector=connector)
+            return self.session
 
     def _sign(self, timestamp: str, method: str, request_path: str, body: str = "") -> str:
         """Создать подпись для запроса"""
@@ -57,13 +63,16 @@ class OKXRestClient:
 
     def _get_headers(self, method: str, request_path: str, body: str = "") -> Dict[str, str]:
         """Получить заголовки для запроса"""
-        timestamp = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
-        sign = self._sign(timestamp, method, request_path, body)
+        # FIX CRITICAL #6: Use time.time() instead of deprecated datetime.utcnow()
+        # to avoid timezone drift that can cause HMAC signature mismatches.
+        timestamp_ms = int(time.time() * 1000)
+        timestamp_str = f"{timestamp_ms}Z"
+        sign = self._sign(timestamp_str, method, request_path, body)
 
         return {
             'OK-ACCESS-KEY': self.api_key,
             'OK-ACCESS-SIGN': sign,
-            'OK-ACCESS-TIMESTAMP': timestamp,
+            'OK-ACCESS-TIMESTAMP': timestamp_str,
             'OK-ACCESS-PASSPHRASE': self.passphrase,
             'Content-Type': 'application/json'
         }
@@ -202,7 +211,7 @@ class OKXRestClient:
             "GET", "/api/v5/public/funding-rate", {"instId": inst_id}
         )
 
-    async def get_funding_rates_all(self, symbols: list[str] | None = None) -> Dict[str, Any]:
+    async def get_funding_rates_all(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Получить ставки финансирования для SWAP инструментов.
         OKX requires per-instrument /api/v5/public/funding-rate calls.
@@ -304,7 +313,8 @@ class OKXRestClient:
         size: float,
         order_type: str = "limit",
         price: Optional[float] = None,
-        time_in_force: str = "ioc"
+        time_in_force: str = "ioc",
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Разместить ордер
@@ -316,6 +326,10 @@ class OKXRestClient:
             order_type: Тип ордера (limit/market)
             price: Цена (для limit)
             time_in_force: Time in force (ioc/gtc)
+            client_order_id: Optional idempotency key (OKX: clientOrderId).
+                If a subsequent request uses the same clientOrderId and the
+                original order is still open, OKX returns the original order
+                instead of creating a duplicate.
         """
         # Форматирование символа для OKX
         if symbol.endswith("USDT"):
@@ -331,6 +345,9 @@ class OKXRestClient:
             "ordType": order_type,
             "sz": str(size)
         }
+
+        if client_order_id:
+            data["clOrdId"] = client_order_id
 
         if order_type == "limit":
             if price is None:
@@ -352,6 +369,7 @@ class OKXRestClient:
         order_type: str = "limit",
         price: Optional[float] = None,
         time_in_force: str = "ioc",
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         inst_id = symbol.replace("USDT", "-USDT") if symbol.endswith("USDT") else symbol.replace("-", "")
         data = {
@@ -361,6 +379,8 @@ class OKXRestClient:
             "ordType": order_type,
             "sz": str(size),
         }
+        if client_order_id:
+            data["clOrdId"] = client_order_id
         if order_type == "limit":
             if price is None:
                 raise ValueError("Price is required for limit orders")

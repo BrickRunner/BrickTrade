@@ -83,29 +83,56 @@ class ExchangeRateLimiter:
         """Wait until a request token is available for *exchange*.
 
         If the exchange is in 429 backoff, waits for backoff to expire first.
+        FIX CRITICAL #11: Sleep OUTSIDE the lock to avoid serializing all requests
+        to a single exchange while one task is waiting for backoff or refill.
         """
         bucket = self._get_bucket(exchange)
+
+        # Step 1: Check backoff and refill under lock (fast)
+        wait_backoff = 0.0
+        wait_refill = 0.0
         async with bucket.lock:
-            # Wait for 429 backoff if active
             now = time.monotonic()
             if bucket.backoff_until > now:
-                wait = bucket.backoff_until - now
-                logger.warning(
-                    "rate_limiter: %s in 429 backoff, waiting %.1fs",
-                    exchange, wait,
-                )
-                await asyncio.sleep(wait)
-
-            # Refill tokens
-            bucket._refill()
-
-            # If bucket is empty, wait for next token
-            if bucket.tokens < 1.0:
-                wait = (1.0 - bucket.tokens) / bucket.rate
-                await asyncio.sleep(wait)
+                wait_backoff = bucket.backoff_until - now
+            else:
                 bucket._refill()
+                if bucket.tokens < 1.0:
+                    wait_refill = (1.0 - bucket.tokens) / bucket.rate
+                else:
+                    bucket.tokens -= 1.0
 
-            bucket.tokens -= 1.0
+        # Step 2: Sleep OUTSIDE lock
+        if wait_backoff > 0:
+            logger.warning(
+                "rate_limiter: %s in 429 backoff, waiting %.1fs",
+                exchange, wait_backoff,
+            )
+            await asyncio.sleep(wait_backoff)
+            # After backoff, need to re-acquire and refill
+            async with bucket.lock:
+                bucket._refill()
+                if bucket.tokens < 1.0:
+                    wait_refill = (1.0 - bucket.tokens) / bucket.rate
+                else:
+                    bucket.tokens -= 1.0
+                    return
+            if wait_refill > 0:
+                await asyncio.sleep(wait_refill)
+            return
+
+        if wait_refill > 0:
+            await asyncio.sleep(wait_refill)
+            async with bucket.lock:
+                bucket._refill()
+                if bucket.tokens < 1.0:
+                    # Rare race: tokens got consumed by another task
+                    wait_refill = (1.0 - bucket.tokens) / bucket.rate
+                else:
+                    bucket.tokens -= 1.0
+                    return
+            if wait_refill > 0:
+                await asyncio.sleep(wait_refill)
 
     def record_429(self, exchange: str) -> float:
         """Record a 429 response. Returns the backoff duration in seconds.

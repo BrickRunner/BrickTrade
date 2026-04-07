@@ -6,6 +6,7 @@ Public WS URL: wss://stream.bybit.com/v5/public/linear
 """
 import asyncio
 import json
+import time
 from typing import Callable, Optional, Dict, Any
 
 import websockets
@@ -28,6 +29,8 @@ class BybitWebSocket:
         self.ws: Optional[WebSocketClientProtocol] = None
         self.running = False
         self.callback: Optional[Callable] = None
+        # FIX C2: heartbeat tracking
+        self._last_msg_ts: float = 0.0
 
         if testnet:
             self.ws_url = TESTNET_WS_URL
@@ -53,6 +56,7 @@ class BybitWebSocket:
                     ping_timeout=10,
                 ) as ws:
                     self.ws = ws
+                    self._last_msg_ts = time.monotonic()  # FIX C2: heartbeat
                     logger.info("Connected to Bybit WebSocket")
 
                     # Subscribe to orderbook (depth 5)
@@ -63,17 +67,38 @@ class BybitWebSocket:
                     await ws.send(json.dumps(subscribe_msg))
                     logger.info(f"Subscribed to Bybit orderbook: {self.symbol}")
 
-                    async for message in ws:
-                        if not self.running:
+                    # FIX C2: Explicit recv loop with heartbeat + callback isolation
+                    while self.running:
+                        # Heartbeat check: >60s without message → reconnect
+                        if time.monotonic() - self._last_msg_ts > 60:
+                            logger.warning(
+                                "Bybit WebSocket: heartbeat timeout (%.0fs), reconnecting",
+                                time.monotonic() - self._last_msg_ts,
+                            )
                             break
-
+                        try:
+                            message = await asyncio.wait_for(ws.recv(), timeout=30)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "Bybit WebSocket: no message in 30s, reconnecting",
+                            )
+                            break
+                        except websockets.exceptions.ConnectionClosed:
+                            break
+                        except Exception as e:
+                            logger.error(f"Error receiving Bybit message: {e}", exc_info=True)
+                            break
                         try:
                             data = json.loads(message)
-                            await self._handle_message(data)
                         except json.JSONDecodeError as e:
                             logger.error(f"Failed to decode Bybit message: {e}")
+                            continue
+
+                        # Callback isolation: exceptions in handler do NOT break recv loop
+                        try:
+                            await self._handle_message(data)
                         except Exception as e:
-                            logger.error(f"Error handling Bybit message: {e}", exc_info=True)
+                            logger.error(f"Bybit _handle_message error: {e}", exc_info=True)
 
             except websockets.exceptions.ConnectionClosed:
                 logger.warning("Bybit WebSocket connection closed")
@@ -88,6 +113,7 @@ class BybitWebSocket:
 
     async def _handle_message(self, data: Dict[str, Any]) -> None:
         """Handle incoming messages"""
+        self._last_msg_ts = time.monotonic()  # FIX C2: update heartbeat
         # Subscription confirmation
         if data.get("op") == "subscribe":
             if data.get("success"):
@@ -134,4 +160,9 @@ class BybitWebSocket:
         logger.info("Disconnected from Bybit WebSocket")
 
     def is_connected(self) -> bool:
-        return self.ws is not None and self.ws.open
+        """Check connection + heartbeat."""
+        if self.ws is None or not self.ws.open:
+            return False
+        if time.monotonic() - self._last_msg_ts > 60:
+            return False
+        return True

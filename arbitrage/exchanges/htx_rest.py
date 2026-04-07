@@ -13,6 +13,7 @@ import aiohttp
 import hmac
 import hashlib
 import base64
+import time as _htx_time
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
@@ -40,19 +41,25 @@ class HTXRestClient:
 
         self.session: Optional[aiohttp.ClientSession] = None
         self._spot_account_id: Optional[str] = None
+        # FIX CRITICAL #3: Lazy session lock — created inside _get_session()
+        self._session_lock: Optional[asyncio.Lock] = None
 
     # ─── Session ─────────────────────────────────────────────────────────────
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self.session is None or self.session.closed:
-            connector = aiohttp.TCPConnector(
-                limit=100,
-                limit_per_host=30,
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-            )
-            self.session = aiohttp.ClientSession(connector=connector)
-        return self.session
+        # FIX CRITICAL #3: Lazy lock creation for event-loop safety
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if self.session is None or self.session.closed:
+                connector = aiohttp.TCPConnector(
+                    limit=100,
+                    limit_per_host=30,
+                    ttl_dns_cache=300,
+                    enable_cleanup_closed=True,
+                )
+                self.session = aiohttp.ClientSession(connector=connector)
+            return self.session
 
     # ─── Auth Helpers ────────────────────────────────────────────────────────
 
@@ -66,8 +73,11 @@ class HTXRestClient:
         """
         Добавить подпись к параметрам запроса.
         HTX использует HMAC-SHA256 подпись query-строки.
+        FIX CRITICAL #10: Include milliseconds to prevent replay attack
+        when two requests share the same second.
         """
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        # Use time.time() for monotonicity and include milliseconds
+        timestamp = datetime.fromtimestamp(_htx_time.time(), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
         signed_params = dict(params)
         signed_params.update({
             "AccessKeyId": self.api_key,
@@ -308,6 +318,7 @@ class HTXRestClient:
         time_in_force: str = "",
         offset: str = "open",
         lever_rate: int = 1,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Разместить ордер на линейный своп.
@@ -334,6 +345,8 @@ class HTXRestClient:
             "volume": size,
             "margin_account": "USDT",
         }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
         if price > 0 and htx_order_type in ("limit", "ioc", "fok"):
             body["price"] = price
 
@@ -372,6 +385,7 @@ class HTXRestClient:
         size: float,
         order_type: str = "limit",
         price: float = 0.0,
+        client_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         account_id = await self._get_spot_account_id()
         if not account_id:
@@ -389,6 +403,8 @@ class HTXRestClient:
             "type": order_type_name,
             "amount": str(size),
         }
+        if client_order_id:
+            body["client-order-id"] = client_order_id
         if order_type_name.endswith("limit") and price > 0:
             body["price"] = str(price)
 

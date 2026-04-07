@@ -68,9 +68,13 @@ class RiskEngine:
 
         drawdowns = await self.state.drawdowns()
         if drawdowns["daily_dd"] >= self.config.max_daily_drawdown_pct:
-            await self.state.trigger_kill_switch(permanent=True)
+            # FIX #7: Daily drawdown triggers a TEMPORARY pause (cooldown).
+            # The SystemState auto-resets daily DD on midnight, so a permanent
+            # kill was contradictory.  Use temporary (cooldown) instead.
+            await self.state.trigger_kill_switch(permanent=False)
             return RiskDecision(approved=False, reason="daily_drawdown_stop", kill_switch_triggered=True)
         if drawdowns["portfolio_dd"] >= self.config.max_portfolio_drawdown_pct:
+            # Portfolio DD is more serious — keep permanent kill here.
             await self.state.trigger_kill_switch(permanent=True)
             return RiskDecision(approved=False, reason="global_drawdown_stop", kill_switch_triggered=True)
 
@@ -84,5 +88,32 @@ class RiskEngine:
         strategy_cap = allocation_plan.strategy_allocations.get(intent.strategy_id, 0.0)
         if proposed_notional > strategy_cap and not min_notional_override:
             return RiskDecision(approved=False, reason="strategy_allocation_cap")
+
+        # FIX CRITICAL #3: Position deduplication check.
+        # If the same (symbol, long_exchange, short_exchange) combo is already
+        # open, reject — prevents compounding risk on the same pair.
+        existing = await self.state.list_positions()
+        for pos in existing:
+            if (
+                pos.symbol == intent.symbol
+                and pos.long_exchange == intent.long_exchange
+                and pos.short_exchange == intent.short_exchange
+            ):
+                return RiskDecision(
+                    approved=False,
+                    reason=f"duplicate_position_{intent.symbol}_{intent.long_exchange}_{intent.short_exchange}",
+                )
+
+        # FIX AUDIT P1: Exit slippage protection — check historical exit slippage
+        # for this symbol. If the average exit slippage on this exchange pair
+        # exceeds the slippage limit, reject new entries for this symbol.
+        exit_slip = self.state.get_avg_exit_slippage(
+            intent.symbol, intent.long_exchange, intent.short_exchange
+        )
+        if exit_slip is not None and exit_slip > self.config.max_realized_slippage_bps:
+            return RiskDecision(
+                approved=False,
+                reason=f"exit_slippage_too_high: {exit_slip:.1f} bps > {self.config.max_realized_slippage_bps:.1f} bps",
+            )
 
         return RiskDecision(approved=True, reason="approved")
